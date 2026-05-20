@@ -73,6 +73,7 @@ type LogStore interface {
 
 	// MCP Tool Log methods
 	CreateMCPToolLog(ctx context.Context, entry *MCPToolLog) error
+	BatchCreateMCPToolLogsIfNotExists(ctx context.Context, entries []*MCPToolLog) error
 	FindMCPToolLog(ctx context.Context, id string) (*MCPToolLog, error)
 	UpdateMCPToolLog(ctx context.Context, id string, entry any) error
 	SearchMCPToolLogs(ctx context.Context, filters MCPToolLogSearchFilters, pagination PaginationOptions) (*MCPToolLogSearchResult, error)
@@ -135,7 +136,7 @@ func NewLogStore(ctx context.Context, config *Config, logger schemas.Logger) (Lo
 			_ = inner.Close(ctx)
 			return nil, fmt.Errorf("failed to ping object store: %w", err)
 		}
-		return newHybridLogStore(inner, objStore, config.ObjectStorage.GetPrefix(), logger), nil
+		return newHybridLogStore(inner, objStore, config.ObjectStorage.GetPrefix(), logger, config.ObjectStorageExcludeFields), nil
 	}
 	return inner, nil
 }

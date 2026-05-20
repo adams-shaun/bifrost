@@ -1,7 +1,1 @@
-- feat: add passthrough streaming accumulation
-- feat: opt-in per-request overrides for content logging and raw request/response visibility
-- feat: store and show finish reason in LLM calls
-- feat: forward `x-bf-dim-*` unified dimension headers to logs and traces
-- fix: improve streaming error handling (thanks [@loss-and-quick](https://github.com/loss-and-quick)!)
-- fix: deterministic semanticcache request hashing and `CacheDebug` propagation in streaming (thanks [@loss-and-quick](https://github.com/loss-and-quick)!)
-- chore: upgraded core to v1.5.6 and framework to v1.3.6
+- chore: upgraded core to v1.5.10 and framework to v1.3.10

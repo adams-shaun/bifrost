@@ -1,5 +1,1 @@
-- perf: cache routing rules per scope upfront and add model-catalog routing engine label and icon
-- fix: allow self-looping chain rules to continue evaluating subsequent rules instead of halting
-- chore: guardrails helm chart upgrade
-- chore: bedrock cli compatibility changes
-- chore: upgraded core to v1.5.6 and framework to v1.3.6
+- chore: upgraded core to v1.5.10 and framework to v1.3.10

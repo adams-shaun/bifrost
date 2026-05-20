@@ -21,6 +21,45 @@ type PostgresConfig struct {
 	SSLMode      *schemas.EnvVar `json:"ssl_mode"`
 	MaxIdleConns int             `json:"max_idle_conns"`
 	MaxOpenConns int             `json:"max_open_conns"`
+	// MatViewRefreshInterval controls how often the materialized views backing
+	// /api/logs/stats and the dashboard histograms are refreshed. Accepts any
+	// Go duration string ("30s", "5m", "1h"). Empty / unset uses the default
+	// (defaultMatViewRefreshInterval). Raise this when refresh CPU cost is
+	// material on the database instance — the matview path already has
+	// activity-gated short-circuiting (see matViewRefreshGate), so the longer
+	// interval mostly affects how quickly idle clusters notice the rolling
+	// 30-day filter window has aged.
+	MatViewRefreshInterval string `json:"matview_refresh_interval,omitempty"`
+}
+
+// defaultMatViewRefreshInterval is used when MatViewRefreshInterval is unset
+// or unparseable. Matches the prior hardcoded value so existing deployments
+// see no behavior change.
+const defaultMatViewRefreshInterval = 30 * time.Second
+
+// minMatViewRefreshInterval is a floor to prevent pathological configs that
+// would refresh more often than the refresh itself takes — anything below
+// this is clamped up. The activity-gate skip would mostly absorb the damage,
+// but the floor stops misconfig from becoming a foot-gun.
+const minMatViewRefreshInterval = 5 * time.Second
+
+// resolveMatViewRefreshInterval parses the configured duration string with
+// fallback + clamp. Logs a warning on a bad string so misconfig is noticed.
+func resolveMatViewRefreshInterval(raw string, logger schemas.Logger) time.Duration {
+	if raw == "" {
+		return defaultMatViewRefreshInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("logstore: invalid matview_refresh_interval %q (%s); using default %s", raw, err, defaultMatViewRefreshInterval))
+		return defaultMatViewRefreshInterval
+	}
+	if d < minMatViewRefreshInterval {
+		logger.Warn(fmt.Sprintf("logstore: matview_refresh_interval %s is below floor %s; clamping to %s", d, minMatViewRefreshInterval, minMatViewRefreshInterval))
+		return minMatViewRefreshInterval
+	}
+	logger.Info(fmt.Sprintf("logstore: matview refresh interval set to %s", d))
+	return d
 }
 
 // newPostgresLogStore creates a new Postgres log store.
@@ -56,8 +95,15 @@ func newPostgresLogStore(ctx context.Context, config *PostgresConfig, logger sch
 	}
 	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s", config.Host.GetValue(), config.Port.GetValue(), config.User.GetValue(), config.Password.GetValue(), config.DBName.GetValue(), config.SSLMode.GetValue())
 
-	openPool := func() (*gorm.DB, error) {
-		return gorm.Open(postgres.New(postgres.Config{DSN: dsn}), &gorm.Config{
+	// Migration-only DSN. Forces pgx into simple-query protocol on the throwaway
+	// migration pool so no statement plan is ever cached server-side; that makes
+	// SQLSTATE 0A000 ("cached plan must not change result type") structurally
+	// impossible when a migration mixes DDL with subsequent SELECTs against the
+	// same table. Runtime pool keeps the default cache-statement mode.
+	migrationDSN := dsn + " default_query_exec_mode=simple_protocol"
+
+	openPool := func(connDSN string) (*gorm.DB, error) {
+		return gorm.Open(postgres.New(postgres.Config{DSN: connDSN}), &gorm.Config{
 			Logger: newGormLogger(logger),
 		})
 	}
@@ -78,7 +124,7 @@ func newPostgresLogStore(ctx context.Context, config *PostgresConfig, logger sch
 
 	// Throwaway pool for the version gate and schema migrations. Closing it
 	// before the runtime pool opens guarantees no cached plan survives DDL.
-	mDb, err := openPool()
+	mDb, err := openPool(migrationDSN)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +150,7 @@ func newPostgresLogStore(ctx context.Context, config *PostgresConfig, logger sch
 	}
 
 	// Runtime pool. Opens against post-migration schema.
-	db, err := openPool()
+	db, err := openPool(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +228,7 @@ func newPostgresLogStore(ctx context.Context, config *PostgresConfig, logger sch
 			// canUseMatView() returns false so all queries use raw tables.
 			d.matViewsReady.Store(true)
 		}
-		startMatViewRefresher(context.Background(), db, 30*time.Second, logger, &d.matViewsReady)
+		startMatViewRefresher(context.Background(), db, resolveMatViewRefreshInterval(config.MatViewRefreshInterval, logger), logger, &d.matViewsReady)
 	}()
 
 	return d, nil

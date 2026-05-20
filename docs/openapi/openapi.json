@@ -32196,7 +32196,7 @@
       "put": {
         "operationId": "editMCPClient",
         "summary": "Edit MCP client",
-        "description": "Updates an existing MCP client's configuration.\nUnlike client creation, tool_pricing can be included to set per-tool execution costs since tools are already fetched.\nOptionally provide vk_configs to manage which virtual keys have access to this MCP server and with which tools. When provided, this fully replaces all existing VK assignments in a single atomic transaction.\n",
+        "description": "Updates an existing MCP client's configuration.\nUnlike client creation, tool_pricing can be included to set per-tool execution costs since tools are already fetched.\nOptionally provide vk_configs to manage which virtual keys have access to this MCP server and with which tools. When provided, this fully replaces all existing VK assignments in a single atomic transaction.\nSet disabled: true to shut down the client's connection and workers without removing it. Set disabled: false to reconnect a previously disabled client.\n",
         "tags": [
           "MCP"
         ],
@@ -32316,6 +32316,11 @@
                     "type": "boolean",
                     "default": false,
                     "description": "When true, this MCP client's tools are accessible to all virtual keys without requiring\nexplicit per-key assignment. All tools are allowed by default. If a virtual key has an\nexplicit MCP config for this client, that config takes precedence and overrides this behaviour.\n"
+                  },
+                  "disabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, the client's connection, health monitor, and tool syncer are shut down.\nThe client entry is preserved so it can be re-enabled later by sending disabled: false.\nDisabled clients do not expose tools to inference requests.\n"
                   },
                   "vk_configs": {
                     "type": "array",
@@ -32717,7 +32722,7 @@
       "post": {
         "operationId": "registerPerUserOAuthClient",
         "summary": "Register OAuth client (RFC 7591)",
-        "description": "Dynamic Client Registration per RFC 7591. MCP clients (Claude Code, Cursor, etc.)\ncall this endpoint to obtain a `client_id` before initiating the authorization flow.\n\nThis endpoint is only available when at least one MCP client is configured with\n`auth_type: per_user_oauth`. Returns `404` otherwise.\n\nAuthentication is not required — this is part of the unauthenticated OAuth bootstrap flow.\n",
+        "description": "Dynamic Client Registration per RFC 7591. MCP clients (Claude Code, Cursor, etc.)\ncall this endpoint to obtain a `client_id` before initiating the authorization flow.\n\nThis endpoint is only available when at least one MCP client is configured with\n`auth_type: per_user_oauth`. Returns `404` otherwise.\n\nAuthentication is not required - this is part of the unauthenticated OAuth bootstrap flow.\n",
         "tags": [
           "OAuth",
           "Per-User OAuth"
@@ -32892,7 +32897,7 @@
       "get": {
         "operationId": "authorizePerUserOAuth",
         "summary": "Authorization endpoint (OAuth 2.1)",
-        "description": "OAuth 2.1 authorization endpoint. Validates the request parameters, creates a\nbrowser-bound `PendingFlow` record (15-minute TTL), and redirects the user to\nthe Bifrost consent screen at `/oauth/consent?flow_id=xxx`.\n\n**PKCE is required** — `code_challenge` and `code_challenge_method=S256` must\nbe provided. Plain code challenges are not supported.\n\nA `__bifrost_flow_secret` HttpOnly SameSite=Lax cookie is set on redirect to\nbind the consent flow to the initiating browser session (CSRF protection).\n\nAuthentication is not required — this is part of the unauthenticated OAuth bootstrap flow.\n",
+        "description": "OAuth 2.1 authorization endpoint. Validates the request parameters, creates a\nbrowser-bound `PendingFlow` record (15-minute TTL), and redirects the user to\nthe Bifrost consent screen at `/oauth/consent?flow_id=xxx`.\n\n**PKCE is required** - `code_challenge` and `code_challenge_method=S256` must\nbe provided. Plain code challenges are not supported.\n\nA `__bifrost_flow_secret` HttpOnly SameSite=Lax cookie is set on redirect to\nbind the consent flow to the initiating browser session (CSRF protection).\n\nAuthentication is not required - this is part of the unauthenticated OAuth bootstrap flow.\n",
         "tags": [
           "OAuth",
           "Per-User OAuth"
@@ -33014,7 +33019,7 @@
       "post": {
         "operationId": "exchangePerUserOAuthToken",
         "summary": "Token endpoint (OAuth 2.1)",
-        "description": "OAuth 2.1 token endpoint. Exchanges a single-use authorization code (5-minute TTL)\nfor a Bifrost-issued access token (24-hour TTL) using PKCE verification.\n\nThe request body must be `application/x-www-form-urlencoded`.\n\nThe returned `access_token` is the Bearer token to use on subsequent `/mcp` requests.\nIt carries the user's upstream service tokens (Notion, GitHub, etc.) linked to their\nidentity (Virtual Key or User ID) from the consent flow.\n\nAuthentication is not required — this is part of the unauthenticated OAuth bootstrap flow.\n",
+        "description": "OAuth 2.1 token endpoint. Exchanges a single-use authorization code (5-minute TTL)\nfor a Bifrost-issued access token (24-hour TTL) using PKCE verification.\n\nThe request body must be `application/x-www-form-urlencoded`.\n\nThe returned `access_token` is the Bearer token to use on subsequent `/mcp` requests.\nIt carries the user's upstream service tokens (Notion, GitHub, etc.) linked to their\nidentity (Virtual Key or User ID) from the consent flow.\n\nAuthentication is not required - this is part of the unauthenticated OAuth bootstrap flow.\n",
         "tags": [
           "OAuth",
           "Per-User OAuth"
@@ -33048,11 +33053,11 @@
                   },
                   "client_id": {
                     "type": "string",
-                    "description": "Client ID (optional — code is already bound to the client)"
+                    "description": "Client ID (optional - code is already bound to the client)"
                   },
                   "code_verifier": {
                     "type": "string",
-                    "description": "PKCE code verifier — the raw secret whose SHA-256 matches the code_challenge"
+                    "description": "PKCE code verifier - the raw secret whose SHA-256 matches the code_challenge"
                   }
                 }
               }
@@ -33157,8 +33162,8 @@
     "/api/oauth/per-user/upstream/authorize": {
       "get": {
         "operationId": "authorizeUpstreamPerUserOAuth",
-        "summary": "Upstream OAuth proxy — authorize with upstream service",
-        "description": "Initiates an OAuth flow with an upstream MCP service (Notion, GitHub, etc.)\non behalf of the current user. Used during the consent flow (via \"Connect\" buttons\non the MCPs page) and at runtime when a tool call is made to an unauthenticated service.\n\n**Consent flow** — provide `flow_id` (from the pending consent flow). The browser-binding\ncookie (`__bifrost_flow_secret`) is validated.\n\n**Runtime flow** — provide `session` (the Bifrost session ID from the token endpoint).\nUsed when a service was skipped during consent and needs to be connected later.\n\nOn success, redirects the user to the upstream provider's authorize URL. After the user\ngrants access, the upstream callback lands at `/api/oauth/callback`, stores the upstream\ntoken against the user's identity, and redirects back to the consent screen (consent flow)\nor returns an authorization success page (runtime flow).\n\nAuthentication is not required — cookie/session validation is performed instead.\n",
+        "summary": "Upstream OAuth proxy - authorize with upstream service",
+        "description": "Initiates an OAuth flow with an upstream MCP service (Notion, GitHub, etc.)\non behalf of the current user. Used during the consent flow (via \"Connect\" buttons\non the MCPs page) and at runtime when a tool call is made to an unauthenticated service.\n\n**Consent flow** - provide `flow_id` (from the pending consent flow). The browser-binding\ncookie (`__bifrost_flow_secret`) is validated.\n\n**Runtime flow** - provide `session` (the Bifrost session ID from the token endpoint).\nUsed when a service was skipped during consent and needs to be connected later.\n\nOn success, redirects the user to the upstream provider's authorize URL. After the user\ngrants access, the upstream callback lands at `/api/oauth/callback`, stores the upstream\ntoken against the user's identity, and redirects back to the consent screen (consent flow)\nor returns an authorization success page (runtime flow).\n\nAuthentication is not required - cookie/session validation is performed instead.\n",
         "tags": [
           "OAuth",
           "Per-User OAuth"
@@ -33261,7 +33266,7 @@
       "get": {
         "operationId": "getConsentIdentityPage",
         "summary": "Consent identity selection page",
-        "description": "Renders the identity selection screen where the user chooses how to identify\nthemselves for the session: Virtual Key, User ID, or Skip (session-only auth).\n\nThe `__bifrost_flow_secret` HttpOnly cookie set during `/api/oauth/per-user/authorize`\nmust be present — it binds the consent flow to the initiating browser.\n\nThe Skip option is only shown when `enforce_auth_on_inference` is `false` in config.\n",
+        "description": "Renders the identity selection screen where the user chooses how to identify\nthemselves for the session: Virtual Key, User ID, or Skip (session-only auth).\n\nThe `__bifrost_flow_secret` HttpOnly cookie set during `/api/oauth/per-user/authorize`\nmust be present - it binds the consent flow to the initiating browser.\n\nThe Skip option is only shown when `enforce_auth_on_inference` is `false` in config.\n",
         "tags": [
           "Per-User OAuth",
           "Consent Flow"
@@ -33425,7 +33430,7 @@
       "post": {
         "operationId": "submitConsentUserID",
         "summary": "Submit User ID identity",
-        "description": "Links a self-declared User ID to the pending flow as the user's identity.\nOn success, redirects to the MCPs page.\n\nThe User ID is self-declared with no server-side verification — it matches\nthe trust model of the `X-Bf-User-Id` header in the LLM Gateway path.\n\nRequest body is `application/x-www-form-urlencoded` (browser form submission).\n",
+        "description": "Links a self-declared User ID to the pending flow as the user's identity.\nOn success, redirects to the MCPs page.\n\nThe User ID is self-declared with no server-side verification - it matches\nthe trust model of the `X-Bf-User-Id` header in the LLM Gateway path.\n\nRequest body is `application/x-www-form-urlencoded` (browser form submission).\n",
         "tags": [
           "Per-User OAuth",
           "Consent Flow"
@@ -33911,7 +33916,7 @@
       "get": {
         "operationId": "getVirtualKeyQuota",
         "summary": "Get virtual key quota",
-        "description": "Returns the budget and rate limit quota for the authenticated virtual key.\nThis is a self-service endpoint — no admin authentication required.\nThe virtual key value itself (provided via header) is the credential.\n",
+        "description": "Returns the budget and rate limit quota for the authenticated virtual key.\nThis is a self-service endpoint - no admin authentication required.\nThe virtual key value itself (provided via header) is the credential.\n",
         "tags": [
           "Governance"
         ],
@@ -38665,6 +38670,146 @@
         }
       }
     },
+    "/api/mcp-logs/{id}": {
+      "get": {
+        "operationId": "getMCPLogById",
+        "summary": "Get MCP tool log by ID",
+        "description": "Retrieves a single MCP tool execution log by ID, including hydrated object-storage payloads when configured.",
+        "tags": [
+          "Logging"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "MCP tool log ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MCP tool log found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "MCP tool execution log entry",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Unique identifier for the log entry"
+                    },
+                    "llm_request_id": {
+                      "type": "string",
+                      "description": "Links to the LLM request that triggered this tool call"
+                    },
+                    "timestamp": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the tool execution started"
+                    },
+                    "tool_name": {
+                      "type": "string",
+                      "description": "Name of the MCP tool that was executed"
+                    },
+                    "server_label": {
+                      "type": "string",
+                      "description": "Label of the MCP server that provided the tool"
+                    },
+                    "virtual_key_id": {
+                      "type": "string",
+                      "description": "ID of the virtual key used for this tool execution"
+                    },
+                    "virtual_key_name": {
+                      "type": "string",
+                      "description": "Name of the virtual key used for this tool execution"
+                    },
+                    "arguments": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Tool execution arguments"
+                    },
+                    "result": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Tool execution result"
+                    },
+                    "error_details": {
+                      "$ref": "#/components/schemas/BifrostError"
+                    },
+                    "latency": {
+                      "type": "number",
+                      "description": "Execution time in milliseconds"
+                    },
+                    "cost": {
+                      "type": "number",
+                      "description": "Cost in dollars for this tool execution"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "processing",
+                        "success",
+                        "error"
+                      ],
+                      "description": "Execution status"
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Custom metadata captured from request headers (configured via logging_headers or x-bf-lh-* prefix)"
+                    },
+                    "created_at": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the log entry was created"
+                    },
+                    "virtual_key": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Full virtual key object (populated when virtual_key_id is set)"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mcp-logs/stats": {
       "get": {
         "operationId": "getMCPLogsStats",
@@ -42514,6 +42659,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "normalized_name": {
+            "type": "string",
+            "description": "Human-readable name derived from the Bifrost datasheet base model (e.g. \"Claude Sonnet 4.5\"). Only present when the model has a matching entry in the Bifrost pricing catalog."
           },
           "deployment": {
             "type": "string"
@@ -52517,10 +52666,6 @@
                 "deprecated": true,
                 "description": "Deprecated: use enforce_auth_on_inference instead"
               },
-              "allow_direct_keys": {
-                "type": "boolean",
-                "description": "Whether to allow direct API keys"
-              },
               "max_request_body_size_mb": {
                 "type": "integer",
                 "description": "Maximum request body size in MB"
@@ -52785,10 +52930,6 @@
                 "type": "boolean",
                 "deprecated": true,
                 "description": "Deprecated: use enforce_auth_on_inference instead"
-              },
-              "allow_direct_keys": {
-                "type": "boolean",
-                "description": "Whether to allow direct API keys"
               },
               "max_request_body_size_mb": {
                 "type": "integer",
@@ -53519,7 +53660,7 @@
               "type": "string",
               "minLength": 1
             },
-            "description": "Model alias mappings — maps a user-facing model name to a provider-specific identifier (deployment name, inference profile ID, fine-tuned model ID, etc.)"
+            "description": "Model alias mappings - maps a user-facing model name to a provider-specific identifier (deployment name, inference profile ID, fine-tuned model ID, etc.)"
           },
           "azure_key_config": {
             "type": "object",
@@ -54163,9 +54304,11 @@
             "enum": [
               "connected",
               "disconnected",
-              "error"
+              "error",
+              "pending_tools",
+              "disabled"
             ],
-            "description": "Connection state of an MCP client"
+            "description": "Connection state of an MCP client:\n- connected: Client is connected and ready to use\n- disconnected: Client is not connected (will be auto-recovered by health monitor)\n- error: Client is in an unrecoverable error state\n- pending_tools: Connected but tools not yet populated (per-user OAuth clients)\n- disabled: Client has been intentionally disabled; no connection or workers are active\n"
           },
           "vk_configs": {
             "type": "array",
@@ -54295,6 +54438,11 @@
             "type": "boolean",
             "default": false,
             "description": "When true, this MCP client's tools are accessible to all virtual keys without requiring\nexplicit per-key assignment. All tools are allowed by default. If a virtual key has an\nexplicit MCP config for this client, that config takes precedence and overrides this behaviour.\n"
+          },
+          "disabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether the client is intentionally disabled.\nWhen true, the client has no active connection or workers and its tools are not available for inference.\n"
           }
         }
       },
@@ -56083,7 +56231,7 @@
       },
       "PricingOverrideRequestType": {
         "type": "string",
-        "description": "Request type for pricing override filtering. Stream variants are treated identically to their base type — specifying `chat_completion` covers both streaming and non-streaming chat requests.\n",
+        "description": "Request type for pricing override filtering. Stream variants are treated identically to their base type - specifying `chat_completion` covers both streaming and non-streaming chat requests.\n",
         "enum": [
           "chat_completion",
           "text_completion",
@@ -56419,7 +56567,7 @@
       },
       "UpdatePricingOverrideRequest": {
         "type": "object",
-        "description": "Request body for updating a pricing override. All fields are optional — omitted fields are merged from the existing record. The `patch` field is always replaced in full when provided.\n",
+        "description": "Request body for updating a pricing override. All fields are optional - omitted fields are merged from the existing record. The `patch` field is always replaced in full when provided.\n",
         "properties": {
           "name": {
             "type": "string",

@@ -275,6 +275,7 @@ func clearCtxForFallback(ctx *schemas.BifrostContext) {
 	ctx.ClearValue(schemas.BifrostContextKeyChangeRequestType)
 	ctx.ClearValue(schemas.BifrostContextKeyAttemptTrail)
 	ctx.ClearValue(schemas.BifrostContextKeyStreamEndIndicator)
+	ctx.ClearValue(schemas.BifrostContextKeySupportsAssistantPrefill)
 }
 
 var supportedBaseProvidersSet = func() map[schemas.ModelProvider]struct{} {
@@ -331,6 +332,13 @@ func isBatchRequestType(reqType schemas.RequestType) bool {
 // isFileRequestType returns true if the given request type is a file API operation.
 func isFileRequestType(reqType schemas.RequestType) bool {
 	return reqType == schemas.FileUploadRequest || reqType == schemas.FileListRequest || reqType == schemas.FileRetrieveRequest || reqType == schemas.FileDeleteRequest || reqType == schemas.FileContentRequest
+}
+
+// isCachedContentRequestType returns true if the given request type is a cached content lifecycle operation.
+func isCachedContentRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.CachedContentCreateRequest || reqType == schemas.CachedContentListRequest ||
+		reqType == schemas.CachedContentRetrieveRequest || reqType == schemas.CachedContentUpdateRequest ||
+		reqType == schemas.CachedContentDeleteRequest
 }
 
 // isContainerRequestType returns true if the given request type is a container API operation.
@@ -402,43 +410,9 @@ func MarshalUnsafe(v any) string {
 	return strings.TrimSpace(buf.String())
 }
 
+// // [Deprecated] use err.GetErrorString() instead. Will be removed in a future release.
 func GetErrorMessage(err *schemas.BifrostError) string {
-	if err == nil {
-		return ""
-	}
-	if err.Error != nil && err.Error.Message != "" {
-		return err.Error.Message
-	} else if err.StatusCode != nil {
-		switch *err.StatusCode {
-		case 401:
-			return "unauthorized"
-		case 403:
-			return "forbidden"
-		case 404:
-			return "endpoint not found"
-		case 405:
-			return "method not allowed"
-		case 429:
-			return "rate limit exceeded"
-		case 500:
-			return "internal server error"
-		case 502:
-			return "bad gateway"
-		case 503:
-			return "service unavailable"
-		case 504:
-			return "gateway timeout"
-		default:
-			if err.Error != nil && err.Error.Message != "" {
-				return err.Error.Message
-			}
-			return fmt.Sprintf("HTTP %d error", *err.StatusCode)
-		}
-	} else if err.Type != nil {
-		return *err.Type
-	} else {
-		return "unknown error"
-	}
+	return err.GetErrorString()
 }
 
 // GetStringFromContext safely extracts a string value from context

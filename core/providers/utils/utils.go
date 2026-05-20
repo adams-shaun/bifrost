@@ -109,34 +109,37 @@ var UnsupportedSpeechStreamModels = []string{"tts-1", "tts-1-hd"}
 // noop is a reusable no-op function returned by MakeRequestWithContext on the normal path.
 var noop = func() {}
 
-// MakeRequestWithContext makes a request with a context and returns the latency, error, and a
-// wait function. The wait function MUST be called (typically via defer) before releasing the
-// request or response objects. On the normal path it is a no-op. On the context-cancellation
-// path it blocks until the background client.Do goroutine finishes, preventing a data race
-// between the still-running goroutine and the caller's release of req/resp.
+// makeRequestWithDoFunc is the shared core behind MakeRequestWithContext and
+// MakeRequestWithContextFollowRedirects. It runs do() in a goroutine and handles
+// context cancellation, latency tracking, and error classification uniformly.
 //
 // IMPORTANT: This function does NOT truly cancel the underlying fasthttp network request if the
 // context is done. The fasthttp client call will continue in its goroutine until it completes
 // or times out based on its own settings. This function merely stops *waiting* for the
 // fasthttp call and returns an error related to the context.
-func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) (time.Duration, *schemas.BifrostError, func()) {
+//
+// The wait function MUST be called (typically via defer) before releasing the request or
+// response objects. On the normal path it is a no-op. On the context-cancellation path it
+// blocks until the background goroutine finishes, preventing a data race between the
+// still-running goroutine and the caller's release of req/resp.
+func makeRequestWithDoFunc(ctx context.Context, do func() error) (time.Duration, *schemas.BifrostError, func()) {
 	startTime := time.Now()
 	errChan := make(chan error, 1)
 
 	go func() {
-		// client.Do is a blocking call.
+		// do is a blocking call.
 		// It will send an error (or nil for success) to errChan when it completes.
-		errChan <- client.Do(req, resp)
+		errChan <- do()
 	}()
 
 	select {
 	case <-ctx.Done():
 		// Context was cancelled (e.g., deadline exceeded or manual cancellation).
-		// Calculate latency even for cancelled requests
+		// Calculate latency even for cancelled requests.
 		latency := time.Since(startTime)
 		// Return a wait function that blocks until the background goroutine finishes.
 		// The caller MUST invoke this (via defer) before releasing req/resp to avoid
-		// a data race with the still-running client.Do goroutine.
+		// a data race with the still-running goroutine.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			statusCode := 504
 			errorType := schemas.RequestTimedOut
@@ -162,8 +165,8 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 			},
 		}, func() { <-errChan }
 	case err := <-errChan:
-		// The fasthttp.Do call completed.
-		// Calculate latency for both successful and failed requests
+		// The do() call completed.
+		// Calculate latency for both successful and failed requests.
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -176,16 +179,16 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 					},
 				}, noop
 			}
-			// Check for timeout errors first before checking net.OpError to avoid misclassification
+			// Check for timeout errors first before checking net.OpError to avoid misclassification.
 			if errors.Is(err, fasthttp.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 				return latency, NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), noop
 			}
-			// Check if error implements net.Error and has Timeout() == true
+			// Check if error implements net.Error and has Timeout() == true.
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				return latency, NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), noop
 			}
-			// Check for DNS lookup and network errors after timeout checks
+			// Check for DNS lookup and network errors after timeout checks.
 			var opErr *net.OpError
 			var dnsErr *net.DNSError
 			if errors.As(err, &opErr) || errors.As(err, &dnsErr) {
@@ -210,6 +213,21 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 		// The caller should check resp.StatusCode() for HTTP-level errors (4xx, 5xx).
 		return latency, nil, noop
 	}
+}
+
+// MakeRequestWithContext makes a request with a context and returns the latency, error, and a
+// wait function. The wait function MUST be called (typically via defer) before releasing the
+// request or response objects. On the normal path it is a no-op. On the context-cancellation
+// path it blocks until the background client.Do goroutine finishes, preventing a data race
+// between the still-running goroutine and the caller's release of req/resp.
+func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) (time.Duration, *schemas.BifrostError, func()) {
+	return makeRequestWithDoFunc(ctx, func() error { return client.Do(req, resp) })
+}
+
+// MakeRequestWithContextFollowRedirects is like MakeRequestWithContext but follows up to
+// maxRedirects HTTP redirects automatically (equivalent to curl's -L flag).
+func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) (time.Duration, *schemas.BifrostError, func()) {
+	return makeRequestWithDoFunc(ctx, func() error { return client.DoRedirects(req, resp, maxRedirects) })
 }
 
 // Deprecated: ConfigureRetry is now handled internally by ConfigureDialer.
@@ -1433,6 +1451,17 @@ func ParseAndSetRawRequestIfJSON(fasthttpReq *fasthttp.Request, extraFields *sch
 	}
 }
 
+// PassthroughJSONBody returns body only when the passthrough request carries a
+// JSON Content-Type. Pass the return value into HandleStreamCancellation /
+// HandleStreamTimeout so non-JSON passthrough payloads (multipart, binary, etc.)
+// are not wrapped as json.RawMessage in error responses.
+func PassthroughJSONBody(fasthttpReq *fasthttp.Request, body []byte) []byte {
+	if strings.Contains(strings.ToLower(string(fasthttpReq.Header.ContentType())), "application/json") {
+		return body
+	}
+	return nil
+}
+
 // NewUnsupportedOperationError creates a standardized error for unsupported operations.
 // This helper reduces code duplication across providers that don't support certain operations.
 func NewUnsupportedOperationError(requestType schemas.RequestType, providerName schemas.ModelProvider) *schemas.BifrostError {
@@ -1441,6 +1470,10 @@ func NewUnsupportedOperationError(requestType schemas.RequestType, providerName 
 		Error: &schemas.ErrorField{
 			Message: fmt.Sprintf("%s is not supported by %s provider", requestType, providerName),
 			Code:    schemas.Ptr("unsupported_operation"),
+		},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			Provider:    providerName,
+			RequestType: requestType,
 		},
 	}
 }
@@ -2127,6 +2160,7 @@ func HandleStreamCancellation(
 	responseChan chan *schemas.BifrostStreamChunk,
 	logger schemas.Logger,
 	postHookSpanFinalizer func(context.Context),
+	jsonBody []byte,
 ) {
 	// Check if already handled (StreamEndIndicator already set)
 	if indicator := ctx.GetAndSetValue(schemas.BifrostContextKeyStreamEndIndicator, true); indicator != nil {
@@ -2141,6 +2175,10 @@ func HandleStreamCancellation(
 			Message: "Request cancelled: client disconnected",
 			Type:    schemas.Ptr(schemas.RequestCancelled),
 		},
+	}
+
+	if ShouldSendBackRawRequest(ctx, false) && len(jsonBody) > 0 {
+		cancelErr.ExtraFields.RawRequest = compactRawJSON(jsonBody)
 	}
 
 	// Send through PostHook chain - this updates the log to "error" status
@@ -2161,6 +2199,7 @@ func HandleStreamTimeout(
 	responseChan chan *schemas.BifrostStreamChunk,
 	logger schemas.Logger,
 	postHookSpanFinalizer func(context.Context),
+	jsonBody []byte,
 ) {
 	// Check if already handled (StreamEndIndicator already set)
 	if indicator := ctx.GetAndSetValue(schemas.BifrostContextKeyStreamEndIndicator, true); indicator != nil {
@@ -2175,6 +2214,10 @@ func HandleStreamTimeout(
 			Message: "Request timed out: deadline exceeded",
 			Type:    schemas.Ptr(schemas.RequestTimedOut),
 		},
+	}
+
+	if ShouldSendBackRawRequest(ctx, false) && len(jsonBody) > 0 {
+		timeoutErr.ExtraFields.RawRequest = compactRawJSON(jsonBody)
 	}
 
 	// Send through PostHook chain - this updates the log to "error" status
@@ -2782,11 +2825,11 @@ func completeDeferredSpan(ctx *schemas.BifrostContext, result *schemas.BifrostRe
 
 // CheckAndSetDefaultProvider checks if the default provider should be used based on the context.
 // It returns the default provider if it should be used, otherwise it returns an empty string.
-// Checks if the direct key is set in the context, or if key selection is skipped.
-// Or if the available providers are set in the context and the default provider is in the list.
+// Checks if key selection is skipped, or if the available providers are set in the context
+// and the default provider is in the list.
 func CheckAndSetDefaultProvider(ctx *schemas.BifrostContext, defaultProvider schemas.ModelProvider) schemas.ModelProvider {
 	if ctx != nil {
-		if ctx.Value(schemas.BifrostContextKeyDirectKey) != nil || ctx.Value(schemas.BifrostContextKeySkipKeySelection) != nil {
+		if skip, ok := ctx.Value(schemas.BifrostContextKeySkipKeySelection).(bool); ok && skip {
 			return defaultProvider
 		}
 		if ctx.Value(schemas.BifrostContextKeyAvailableProviders) != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"hash"
 	"maps"
+	"math"
 	"sort"
 	"strconv"
 
@@ -43,6 +44,25 @@ type CompatConfig struct {
 	ShouldConvertParams    bool `json:"should_convert_params"`
 }
 
+// UnmarshalJSON defaults all bool fields to true when absent from JSON.
+func (c *CompatConfig) UnmarshalJSON(data []byte) error {
+	type compatConfig struct {
+		ConvertTextToChat      *bool `json:"convert_text_to_chat"`
+		ConvertChatToResponses *bool `json:"convert_chat_to_responses"`
+		ShouldDropParams       *bool `json:"should_drop_params"`
+		ShouldConvertParams    *bool `json:"should_convert_params"`
+	}
+	var s compatConfig
+	if err := sonic.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	c.ConvertTextToChat = s.ConvertTextToChat == nil || *s.ConvertTextToChat
+	c.ConvertChatToResponses = s.ConvertChatToResponses == nil || *s.ConvertChatToResponses
+	c.ShouldDropParams = s.ShouldDropParams == nil || *s.ShouldDropParams
+	c.ShouldConvertParams = s.ShouldConvertParams == nil || *s.ShouldConvertParams
+	return nil
+}
+
 // ClientConfig represents the core configuration for Bifrost HTTP transport and the Bifrost Client.
 // It includes settings for excess request handling, Prometheus metrics, and initial pool size.
 type ClientConfig struct {
@@ -58,7 +78,6 @@ type ClientConfig struct {
 	EnforceAuthOnInference                bool                             `json:"enforce_auth_on_inference"`            // Require auth (VK, API key, or user token) on inference endpoints
 	EnforceGovernanceHeader               bool                             `json:"enforce_governance_header,omitempty"`  // Deprecated: use EnforceAuthOnInference
 	EnforceSCIMAuth                       bool                             `json:"enforce_scim_auth,omitempty"`          // Deprecated: use EnforceAuthOnInference
-	AllowDirectKeys                       bool                             `json:"allow_direct_keys"`                    // Allow direct keys to be used for requests
 	AllowedOrigins                        []string                         `json:"allowed_origins,omitempty"`            // Additional allowed origins for CORS and WebSocket (localhost is always allowed)
 	AllowedHeaders                        []string                         `json:"allowed_headers,omitempty"`            // Additional allowed headers for CORS and WebSocket
 	MaxRequestBodySizeMB                  int                              `json:"max_request_body_size_mb"`             // The maximum request body size in MB
@@ -75,8 +94,27 @@ type ClientConfig struct {
 	WhitelistedRoutes                     []string                         `json:"whitelisted_routes,omitempty"`         // Routes that bypass auth middleware
 	HideDeletedVirtualKeysInFilters       bool                             `json:"hide_deleted_virtual_keys_in_filters"` // Hide deleted virtual keys from logs/MCP filter data
 	RoutingChainMaxDepth                  int                              `json:"routing_chain_max_depth"`              // Maximum depth for routing rule chain evaluation (default: 10)
-	MCPExternalBaseURL                    *schemas.EnvVar                  `json:"mcp_external_base_url,omitempty"`      // Public base URL for OAuth callbacks/discovery when behind a reverse proxy; supports env var syntax ("env.MY_VAR")
+	MCPExternalServerURL                  *schemas.EnvVar                  `json:"mcp_external_server_url,omitempty"`    // Public base URL advertised in OAuth server metadata (.well-known, WWW-Authenticate). Supports env var syntax ("env.MY_VAR")
+	MCPExternalClientURL                  *schemas.EnvVar                  `json:"mcp_external_client_url,omitempty"`    // Public base URL used as redirect_uri when Bifrost acts as an OAuth client to upstream MCP servers. Supports env var syntax ("env.MY_VAR")
 	ConfigHash                            string                           `json:"-"`                                    // Config hash for reconciliation (not serialized)
+}
+
+// UnmarshalJSON defaults all bool fields to true when absent from JSON.
+func (c *ClientConfig) UnmarshalJSON(data []byte) error {
+	type ClientConfigAlias ClientConfig
+	alias := ClientConfigAlias{
+		Compat: CompatConfig{
+			ConvertTextToChat:      true,
+			ConvertChatToResponses: true,
+			ShouldDropParams:       true,
+			ShouldConvertParams:    true,
+		},
+	}
+	if err := sonic.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*c = ClientConfig(alias)
+	return nil
 }
 
 // GenerateClientConfigHash generates a SHA256 hash of the client configuration.
@@ -114,12 +152,6 @@ func (c *ClientConfig) GenerateClientConfigHash() (string, error) {
 		hash.Write([]byte("enforceAuthOnInference:true"))
 	} else {
 		hash.Write([]byte("enforceAuthOnInference:false"))
-	}
-
-	if c.AllowDirectKeys {
-		hash.Write([]byte("allowDirectKeys:true"))
-	} else {
-		hash.Write([]byte("allowDirectKeys:false"))
 	}
 
 	if c.Compat.ConvertTextToChat {
@@ -314,22 +346,54 @@ func (c *ClientConfig) GenerateClientConfigHash() (string, error) {
 		}
 	}
 
-	if c.MCPExternalBaseURL.IsSet() {
-		if c.MCPExternalBaseURL.IsFromEnv() {
-			hash.Write([]byte("externalBaseURL:env:" + c.MCPExternalBaseURL.EnvVar))
+	if c.MCPExternalServerURL.IsSet() {
+		if c.MCPExternalServerURL.IsFromEnv() {
+			hash.Write([]byte("externalServerURL:env:" + c.MCPExternalServerURL.EnvVar))
 		} else {
-			hash.Write([]byte("externalBaseURL:val:" + c.MCPExternalBaseURL.GetValue()))
+			hash.Write([]byte("externalServerURL:val:" + c.MCPExternalServerURL.GetValue()))
+		}
+	}
+
+	if c.MCPExternalClientURL.IsSet() {
+		if c.MCPExternalClientURL.IsFromEnv() {
+			hash.Write([]byte("externalClientURL:env:" + c.MCPExternalClientURL.EnvVar))
+		} else {
+			hash.Write([]byte("externalClientURL:val:" + c.MCPExternalClientURL.GetValue()))
 		}
 	}
 
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+// GenerateClientConfigHashWithToolManager extends GenerateClientConfigHash to also cover
+// the mcp.tool_manager_config file section. When tm is nil it returns the same value as
+// GenerateClientConfigHash, so it is safe to call unconditionally.
+func (c *ClientConfig) GenerateClientConfigHashWithToolManager(tm *schemas.MCPToolManagerConfig) (string, error) {
+	base, err := c.GenerateClientConfigHash()
+	if err != nil || tm == nil {
+		return base, err
+	}
+	h := sha256.New()
+	h.Write([]byte(base))
+	h.Write([]byte("toolMgrAgentDepth:" + strconv.Itoa(tm.MaxAgentDepth)))
+	h.Write([]byte("toolMgrTimeout:" + strconv.FormatInt(int64(math.Ceil(tm.ToolExecutionTimeout.D().Seconds())), 10)))
+	h.Write([]byte("toolMgrCodeMode:" + string(tm.CodeModeBindingLevel)))
+	if tm.DisableAutoToolInject {
+		h.Write([]byte("toolMgrDisableAutoInject:true"))
+	} else {
+		h.Write([]byte("toolMgrDisableAutoInject:false"))
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // Redacted returns a copy of ClientConfig with any env-backed EnvVar fields masked.
 func (c *ClientConfig) Redacted() ClientConfig {
 	out := *c
-	if c.MCPExternalBaseURL != nil && c.MCPExternalBaseURL.IsFromEnv() {
-		out.MCPExternalBaseURL = c.MCPExternalBaseURL.Redacted()
+	if c.MCPExternalServerURL != nil && c.MCPExternalServerURL.IsFromEnv() {
+		out.MCPExternalServerURL = c.MCPExternalServerURL.Redacted()
+	}
+	if c.MCPExternalClientURL != nil && c.MCPExternalClientURL.IsFromEnv() {
+		out.MCPExternalClientURL = c.MCPExternalClientURL.Redacted()
 	}
 	return out
 }
@@ -741,8 +805,8 @@ func GenerateVirtualKeyHash(vk tables.TableVirtualKey) (string, error) {
 	hash.Write([]byte(vk.Description))
 	// Hash Value
 	hash.Write([]byte(vk.Value))
-	// Hash IsActive
-	if vk.IsActive {
+	// Hash IsActive (nil treated as DB default true)
+	if vk.IsActiveValue() {
 		hash.Write([]byte("isActive:true"))
 	} else {
 		hash.Write([]byte("isActive:false"))
@@ -1069,8 +1133,8 @@ func GenerateRoutingRuleHash(r tables.TableRoutingRule) (string, error) {
 	// Hash Description
 	hash.Write([]byte(r.Description))
 
-	// Hash Enabled
-	if r.Enabled {
+	// Hash Enabled (nil treated as DB default true)
+	if r.EnabledValue() {
 		hash.Write([]byte("enabled:true"))
 	} else {
 		hash.Write([]byte("enabled:false"))
@@ -1227,6 +1291,9 @@ func GenerateMCPClientHash(m tables.TableMCPClient) (string, error) {
 			}
 		}
 	}
+
+	// will enable it in the future with a migration
+	// hash.Write([]byte("disabled:" + strconv.FormatBool(m.Disabled)))
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 

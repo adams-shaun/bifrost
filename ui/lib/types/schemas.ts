@@ -746,7 +746,6 @@ export const coreConfigSchema = z.object({
   enable_logging: z.boolean().default(true),
   disable_content_logging: z.boolean().default(false),
   enforce_auth_on_inference: z.boolean().default(false),
-  allow_direct_keys: z.boolean().default(false),
   hide_deleted_virtual_keys_in_filters: z.boolean().default(false),
   allowed_origins: z.array(z.string()).default(["*"]),
   max_request_body_size_mb: z.number().min(1).default(100),
@@ -1024,21 +1023,21 @@ export const prometheusConfigSchema = z
     }
   });
 
-// Prometheus form schema for the PrometheusFormFragment
+// Prometheus form schema for the PrometheusFormFragment.
 export const prometheusFormSchema = z
   .object({
-    enabled: z.boolean().default(true),
+    metrics_enabled: z.boolean().default(true),
+    push_gateway_enabled: z.boolean().default(false),
     prometheus_config: prometheusConfigSchema,
   })
   .superRefine((data, ctx) => {
-    // When enabled, push_gateway_url is required
-    if (data.enabled) {
+    if (data.push_gateway_enabled) {
       const url = (data.prometheus_config.push_gateway_url || "").trim();
       if (!url) {
         ctx.addIssue({
           code: "custom",
           path: ["prometheus_config", "push_gateway_url"],
-          message: "Push Gateway URL is required when enabled",
+          message: "Push Gateway URL is required when the push gateway is enabled",
         });
       }
     }
@@ -1049,6 +1048,7 @@ export const mcpClientUpdateSchema = z.object({
   is_code_mode_client: z.boolean().optional(),
   is_ping_available: z.boolean().optional(),
   allow_on_all_virtual_keys: z.boolean().optional(),
+  disabled: z.boolean().optional(),
   name: z
     .string()
     .min(1, "Name is required")
@@ -1113,6 +1113,12 @@ export const mcpClientUpdateSchema = z.object({
       },
       { message: "Wildcard '*' cannot be combined with specific header names" },
     ),
+  oauth_config: z
+    .object({
+      client_id: envVarSchema.optional(),
+      client_secret: envVarSchema.optional(),
+    })
+    .optional(),
 });
 
 // Global proxy type schema

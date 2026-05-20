@@ -25,11 +25,16 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 	oauthConfigId,
 	isPerUserOauth,
 }) => {
-	const [status, setStatus] = useState<"confirm" | "pending" | "polling" | "success" | "failed">(isPerUserOauth ? "confirm" : "pending");
+	const [status, setStatus] = useState<"confirm" | "pending" | "blocked" | "polling" | "success" | "failed">(
+		isPerUserOauth ? "confirm" : "pending",
+	);
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const popupRef = useRef<Window | null>(null);
 	const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 	const isCompletingRef = useRef(false);
+	// Set to true when the user cancels so in-flight async callbacks do not
+	// invoke onSuccess / onError / onClose after the dialog is dismissed.
+	const cancelledRef = useRef(false);
 
 	// RTK Query hooks
 	const [getOAuthStatus] = useLazyGetOAuthConfigStatusQuery();
@@ -45,6 +50,7 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 
 	// Handle successful OAuth completion
 	const handleOAuthComplete = useCallback(async () => {
+		if (cancelledRef.current) return;
 		// Guard against concurrent calls (race between postMessage and polling)
 		if (isCompletingRef.current) return;
 		isCompletingRef.current = true;
@@ -58,18 +64,17 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 		// Use oauthConfigId instead of mcpClientId for multi-instance support
 		try {
 			await completeOAuth(oauthConfigId).unwrap();
+			if (cancelledRef.current) return;
 			setStatus("success");
 			onSuccess();
-			setTimeout(() => {
-				onClose();
-			}, 1000);
 		} catch (error) {
+			if (cancelledRef.current) return;
 			const errMsg = getErrorMessage(error);
 			setStatus("failed");
 			setErrorMessage(errMsg);
 			onError(errMsg);
 		}
-	}, [oauthConfigId, completeOAuth, onSuccess, onClose, onError]);
+	}, [oauthConfigId, completeOAuth, onSuccess, onError]);
 
 	// Handle OAuth failure
 	const handleOAuthFailed = useCallback(
@@ -78,6 +83,7 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 			if (popupRef.current && !popupRef.current.closed) {
 				popupRef.current.close();
 			}
+			if (cancelledRef.current) return;
 			setStatus("failed");
 			setErrorMessage(reason);
 			onError(reason);
@@ -87,8 +93,10 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 
 	// Check OAuth status (called by postMessage or polling)
 	const checkOAuthStatus = useCallback(async () => {
+		if (cancelledRef.current) return;
 		try {
 			const result = await getOAuthStatus(oauthConfigId).unwrap();
+			if (cancelledRef.current) return;
 
 			if (result.status === "authorized") {
 				stopPolling();
@@ -131,12 +139,13 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 
 			await checkOAuthStatus();
 		}, 2000); // Poll every 2 seconds
-	}, [checkOAuthStatus, handleOAuthFailed]);
+	}, [checkOAuthStatus, getOAuthStatus, handleOAuthComplete, handleOAuthFailed, oauthConfigId, stopPolling]);
 
 	// Open popup and start polling
 	const openPopup = useCallback(() => {
-		// Reset completion guard for each fresh OAuth attempt
+		// Reset completion and cancelled guards for each fresh OAuth attempt
 		isCompletingRef.current = false;
+		cancelledRef.current = false;
 
 		// Close any existing popup
 		if (popupRef.current && !popupRef.current.closed) {
@@ -149,12 +158,19 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 		const left = window.screen.width / 2 - width / 2;
 		const top = window.screen.height / 2 - height / 2;
 
-		popupRef.current = window.open(
+		const popup = window.open(
 			authorizeUrl,
 			"oauth_popup",
 			`width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`,
 		);
 
+		if (!popup || popup.closed) {
+			popupRef.current = null;
+			setStatus("blocked");
+			return;
+		}
+
+		popupRef.current = popup;
 		setStatus("polling");
 
 		// Start polling OAuth status
@@ -179,16 +195,8 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 		};
 	}, [checkOAuthStatus]);
 
-	// Open popup when dialog opens (skip if waiting for user confirmation)
-	useEffect(() => {
-		if (open && status === "pending") {
-			openPopup();
-		}
-	}, [open, status, openPopup]);
-
 	// Handle user confirming per-user OAuth test
 	const handleConfirmPerUserOAuth = () => {
-		setStatus("pending");
 		openPopup();
 	};
 
@@ -208,12 +216,12 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 		if (isPerUserOauth) {
 			setStatus("confirm");
 		} else {
-			setStatus("pending");
 			openPopup();
 		}
 	};
 
 	const handleCancel = () => {
+		cancelledRef.current = true;
 		stopPolling();
 		isCompletingRef.current = false;
 		if (popupRef.current && !popupRef.current.closed) {
@@ -223,13 +231,31 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 	};
 
 	return (
-		<Dialog open={open}>
-			<DialogContent className="sm:max-w-md" onPointerDownOutside={(e) => e.preventDefault()} onEscapeKeyDown={(e) => e.preventDefault()}>
+		<Dialog
+			open={open}
+			onOpenChange={(nextOpen) => {
+				if (!nextOpen) {
+					handleCancel();
+				}
+			}}
+		>
+			<DialogContent
+				className="sm:max-w-md"
+				onPointerDownOutside={(e) => {
+					e.preventDefault();
+					handleCancel();
+				}}
+				onEscapeKeyDown={(e) => {
+					e.preventDefault();
+					handleCancel();
+				}}
+			>
 				<DialogHeader>
 					<DialogTitle>{status === "confirm" ? "Test OAuth Configuration" : "OAuth Authorization"}</DialogTitle>
 					<DialogDescription>
 						{status === "confirm" && "A one-time login is needed to verify your OAuth setup."}
-						{status === "pending" && "Opening authorization window..."}
+						{status === "pending" && "Open the authorization window to continue"}
+						{status === "blocked" && "Authorization window was blocked"}
 						{status === "polling" && "Waiting for authorization..."}
 						{status === "success" && "Authorization successful!"}
 						{status === "failed" && "Authorization failed"}
@@ -259,6 +285,22 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 							</div>
 						</>
 					)}
+
+				{(status === "pending" || status === "blocked") && (
+					<>
+						<p className="text-muted-foreground text-sm">
+							{status === "blocked"
+								? "Your browser blocked the authorization window. Open it manually to continue."
+								: "Open the authorization window to sign in and complete the connection."}
+						</p>
+						<div className="flex w-full justify-end space-x-2">
+							<Button onClick={handleCancel} variant="outline" data-testid="oauth-pending-cancel-btn">
+								Cancel
+							</Button>
+							<Button onClick={openPopup} data-testid="oauth-open-window-btn">Open Authorization Window</Button>
+						</div>
+					</>
+				)}
 
 					{status === "polling" && (
 						<>

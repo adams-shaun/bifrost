@@ -1,2 +1,3 @@
-- feat: forward `x-bf-dim-*` unified dimension headers to Prometheus metrics
-- chore: upgraded core to v1.5.6 and framework to v1.3.6
+- feat: supports toggling push-based and pull-based separately and fixes hot-reload of plugin (#3433)
+- fix: otel metric fixes (#3439)
+- chore: upgraded core to v1.5.10 and framework to v1.3.10

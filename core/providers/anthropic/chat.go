@@ -100,7 +100,7 @@ func convertFunctionToolToAnthropic(tool schemas.ChatTool) AnthropicTool {
 //
 // bash_*, memory_*, code_execution_*, and tool_search_* carry no variant
 // config — their Type + Name alone are enough, handled in the default branch.
-func convertServerToolToAnthropic(tool schemas.ChatTool) (AnthropicTool, bool) {
+func convertServerToolToAnthropic(tool schemas.ChatTool, model string) (AnthropicTool, bool) {
 	typeStr := string(tool.Type)
 	if typeStr == "" {
 		return AnthropicTool{}, false
@@ -125,13 +125,29 @@ func convertServerToolToAnthropic(tool schemas.ChatTool) (AnthropicTool, bool) {
 
 	// Remaining server tools (web_search, web_fetch, computer, text_editor, etc.)
 	// identify themselves via Name.
-	if tool.Name == "" {
+	toolName := tool.Name
+	// Normalize computer-use family (computer / text_editor / bash) to the
+	// canonical {type, name} pair for the model's generation. Keeps callers
+	// from having to memorize Anthropic's per-generation tool naming matrix.
+	if baseTool := computerUseBaseTool(typeStr); baseTool != "" {
+		generation := ComputerUseGeneration(model)
+		if baseTool == "text_editor" {
+			generation = TextEditorGeneration(model)
+		}
+		if wantType, wantName := NormalizedToolSpec(generation, baseTool); wantType != "" {
+			typeStr = wantType
+			if toolName == "" || toolName != wantName {
+				toolName = wantName
+			}
+		}
+	}
+	if toolName == "" {
 		return AnthropicTool{}, false
 	}
 
 	atype := AnthropicToolType(typeStr)
 	anthropicTool := AnthropicTool{
-		Name:                tool.Name,
+		Name:                toolName,
 		Type:                &atype,
 		CacheControl:        tool.CacheControl,
 		DeferLoading:        tool.DeferLoading,
@@ -244,6 +260,14 @@ func ToAnthropicChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bif
 	}
 
 	messages := bifrostReq.Input
+	if ctx.Value(schemas.BifrostContextKeySupportsAssistantPrefill) == false {
+		trimmed := len(messages)
+		for trimmed > 0 && messages[trimmed-1].Role == schemas.ChatMessageRoleAssistant {
+			trimmed--
+		}
+		messages = messages[:trimmed]
+	}
+
 	anthropicReq := &AnthropicMessageRequest{
 		Model:     bifrostReq.Model,
 		MaxTokens: providerUtils.GetMaxOutputTokensOrDefault(bifrostReq.Model, AnthropicDefaultMaxTokens),
@@ -425,7 +449,7 @@ func ToAnthropicChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bif
 					continue
 				}
 				// Non-function tool: attempt server-tool reconstruction.
-				if converted, ok := convertServerToolToAnthropic(tool); ok {
+				if converted, ok := convertServerToolToAnthropic(tool, bifrostReq.Model); ok {
 					tools = append(tools, converted)
 				}
 			}
@@ -529,10 +553,14 @@ func ToAnthropicChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bif
 			// nothing to display", per the extended-thinking doc). We attach
 			// on non-disabled modes and let the upstream provider enforce
 			// model-level support.
-			if bifrostReq.Params.Reasoning.Display != nil &&
-				anthropicReq.Thinking != nil &&
-				anthropicReq.Thinking.Type != "disabled" {
-				anthropicReq.Thinking.Display = bifrostReq.Params.Reasoning.Display
+			// Opus 4.7+ omits reasoning text by default; default to "summarized"
+			// so the text is visible unless the caller explicitly requests "omitted".
+			if anthropicReq.Thinking != nil && anthropicReq.Thinking.Type != "disabled" {
+				if bifrostReq.Params.Reasoning.Display != nil {
+					anthropicReq.Thinking.Display = bifrostReq.Params.Reasoning.Display
+				} else if IsOpus47(bifrostReq.Model) {
+					anthropicReq.Thinking.Display = schemas.Ptr("summarized")
+				}
 			}
 		}
 
@@ -549,7 +577,7 @@ func ToAnthropicChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bif
 		msg := messages[i]
 
 		switch msg.Role {
-		case schemas.ChatMessageRoleSystem:
+		case schemas.ChatMessageRoleSystem, schemas.ChatMessageRoleDeveloper:
 			// Handle system message separately
 			if msg.Content != nil {
 				if msg.Content.ContentStr != nil && *msg.Content.ContentStr != "" {
@@ -568,6 +596,17 @@ func ToAnthropicChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bif
 					if len(blocks) > 0 {
 						systemContent = &AnthropicContent{ContentBlocks: blocks}
 					}
+				}
+			}
+			// If only a single system message is present, convert it user message (since openai allows it)
+			if len(messages) == 1 && (messages[0].Role == schemas.ChatMessageRoleSystem || messages[0].Role == schemas.ChatMessageRoleDeveloper) {
+				if systemContent != nil {
+					content := systemContent
+					systemContent = nil
+					anthropicMessages = append(anthropicMessages, AnthropicMessage{
+						Role:    AnthropicMessageRoleUser,
+						Content: *content,
+					})
 				}
 			}
 			i++

@@ -54,11 +54,19 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		telConfig := &telemetry.Config{
 			CustomLabels: bifrostConfig.ClientConfig.PrometheusLabels,
 		}
-		// Merge push gateway config if provided (e.g., from config file or UI update)
+		// Merge persisted config if provided.
 		if pluginConfig != nil {
 			extraConfig, err := MarshalPluginConfig[telemetry.Config](pluginConfig)
-			if err == nil && extraConfig != nil && extraConfig.PushGateway != nil {
-				telConfig.PushGateway = extraConfig.PushGateway
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal telemetry plugin config: %w", err)
+			}
+			if extraConfig != nil {
+				if extraConfig.PushGateway != nil {
+					telConfig.PushGateway = extraConfig.PushGateway
+				}
+				if extraConfig.MetricsEnabled != nil {
+					telConfig.MetricsEnabled = extraConfig.MetricsEnabled
+				}
 			}
 		}
 		return telemetry.Init(telConfig, bifrostConfig.ModelCatalog, logger)
@@ -157,9 +165,18 @@ func (s *BifrostHTTPServer) getPluginConfig(name string) *schemas.PluginConfig {
 func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	builtinPlacement := schemas.Ptr(schemas.PluginPlacementBuiltin)
 
-	// 1. Telemetry (always first - tracks everything)
-	if err := s.registerPluginWithStatus(ctx, telemetry.PluginName, nil, nil, true); err != nil {
-		return err
+	// 1. Telemetry (always first - tracks everything).
+	// Default-on: absent PluginConfig entry is treated as enabled, matching pre-#3269 behavior
+	// so upgraders don't silently lose /metrics. Only an explicit Enabled=false disables it.
+	telemetryPluginConfig := s.getPluginConfig(telemetry.PluginName)
+	var pluginConfig any
+	if telemetryPluginConfig != nil {
+		pluginConfig = telemetryPluginConfig.Config
+	}
+	if telemetryPluginConfig == nil || telemetryPluginConfig.Enabled {
+		s.registerPluginWithStatus(ctx, telemetry.PluginName, nil, pluginConfig, false)
+	} else {
+		s.markPluginDisabled(telemetry.PluginName)
 	}
 	s.Config.SetPluginOrderInfo(telemetry.PluginName, builtinPlacement, schemas.Ptr(1))
 

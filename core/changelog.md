@@ -1,19 +1,6 @@
-- feat: add passthrough streaming accumulation
-- feat: add `x-bf-dim-*` unified dimension headers forwarded to logs, traces, Prometheus, and Maxim tags
-- feat: add `schemas.Duration` type with Go duration string support for MCP, Redis, Weaviate, and mocker duration fields
-- feat: add audio base64 encoding for OpenAI realtime provider (thanks [@Mahmoud-Khater](https://github.com/Mahmoud-Khater)!)
-- feat: auto-resolve provider when no provider prefix is given on inference and integration routes
-- feat: add opt-in per-request overrides for content logging and raw request/response visibility
-- feat: add finish reasons to root spans with correct model and provider names in OTEL
-- fix: fix cost info in OTEL calls and response tools
-- fix: remove `MarshalJSON` auto-redaction; apply explicit redaction for env-backed fields in `ProxyConfig`, `ClientConfig`, and `AzureKeyConfig`
-- fix: strip `google/` prefix from Vertex model IDs across all request types
-- fix: snapshot `RequestType` before closure to prevent pool-reuse corruption in streaming
-- fix: fallback to network config if key config url is not set for ollama and sgl
-- fix: route vertex multi-region-only models to multi-region endpoints when key is single-region
-- fix: make OAuth token `expires_at` nullable and guard refresh/reconnect on nil expiry
-- fix: preserve responses tool fields in openai (thanks [@princepal9120](https://github.com/princepal9120)!)
-- fix: deterministic semanticcache request hashing and `CacheDebug` propagation in streaming (thanks [@loss-and-quick](https://github.com/loss-and-quick)!)
-- chore: env var updates and bedrock cli compatibility changes
-- chore: add ollama and vllm key configs in llmtests
-- test: add roundtrip test for `input_audio_buffer.append` audio serialization
+- fix: include mcp.tool_manager_config in client config hash (#3432)
+- fix: gemini fallback propagation in GenAI integration (#3338) (thanks [@Javtor](https://github.com/Javtor)!)
+- fix: drops messages with empty text or signature and adds conversion of thinking block for openai bedrock models (#3221)
+- fix: drops last assistant messages for anthropic models and converts unsupported reasoning effort values for mistral (#3203)
+- fix: converts role system to role user if only system message is present for non-openai models (#3200)
+- fix: fixes model passthrough prefix stripping in advisor tool for anthropic (#3420)

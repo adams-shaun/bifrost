@@ -157,7 +157,7 @@ func (h *ConfigHandler) getConfig(ctx *fasthttp.RequestCtx) {
 				"admin_username":            &schemas.EnvVar{Val: "", EnvVar: "", FromEnv: false},
 				"admin_password":            &schemas.EnvVar{Val: "", EnvVar: "", FromEnv: false},
 				"is_enabled":                false,
-				"disable_auth_on_inference": false,
+				"disable_auth_on_inference": true,
 			}
 		}
 	} else {
@@ -165,7 +165,7 @@ func (h *ConfigHandler) getConfig(ctx *fasthttp.RequestCtx) {
 			"admin_username":            &schemas.EnvVar{Val: "", EnvVar: "", FromEnv: false},
 			"admin_password":            &schemas.EnvVar{Val: "", EnvVar: "", FromEnv: false},
 			"is_enabled":                false,
-			"disable_auth_on_inference": false,
+			"disable_auth_on_inference": true,
 		}
 	}
 	mapConfig["is_db_connected"] = h.store.ConfigStore != nil
@@ -211,6 +211,19 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 
 	if err := json.Unmarshal(ctx.PostBody(), &payload); err != nil {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid request format: %v", err))
+		return
+	}
+
+	// Validate MCP external URL overrides up front — the rest of this handler
+	// applies live mutations (drop-excess flag, MCP tool-manager reload, compat
+	// plugin reload, in-memory MCP config) before persisting, so a late
+	// rejection would leave the process in a partially-updated state.
+	if err := lib.ValidateBaseURL(payload.ClientConfig.MCPExternalServerURL.GetValue()); err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("mcp_external_server_url %v", err))
+		return
+	}
+	if err := lib.ValidateBaseURL(payload.ClientConfig.MCPExternalClientURL.GetValue()); err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("mcp_external_client_url %v", err))
 		return
 	}
 
@@ -342,7 +355,6 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 	// and ReloadClientConfigFromConfigStore mutates the struct in place so the next request picks up the new value.
 	updatedConfig.DisableContentLogging = payload.ClientConfig.DisableContentLogging
 	updatedConfig.DisableDBPingsInHealth = payload.ClientConfig.DisableDBPingsInHealth
-	updatedConfig.AllowDirectKeys = payload.ClientConfig.AllowDirectKeys
 
 	updatedConfig.EnforceAuthOnInference = payload.ClientConfig.EnforceAuthOnInference
 	// Sync deprecated columns to match new field so they stay consistent in the DB
@@ -428,8 +440,10 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 		updatedConfig.RoutingChainMaxDepth = payload.ClientConfig.RoutingChainMaxDepth
 	}
 
-	// Update external base URL for OAuth callbacks/discovery (nil clears the override).
-	updatedConfig.MCPExternalBaseURL = payload.ClientConfig.MCPExternalBaseURL
+	// Update external base URLs for OAuth server metadata and client redirect_uri (nil clears each override).
+	// Validation is performed up front in this handler so a failure here cannot leave the process in a partial state.
+	updatedConfig.MCPExternalServerURL = payload.ClientConfig.MCPExternalServerURL
+	updatedConfig.MCPExternalClientURL = payload.ClientConfig.MCPExternalClientURL
 
 	// Handle HeaderFilterConfig changes
 	if !headerFilterConfigEqual(payload.ClientConfig.HeaderFilterConfig, currentConfig.HeaderFilterConfig) {

@@ -20,6 +20,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
+	"github.com/maximhq/bifrost/framework/encrypt"
 	"github.com/maximhq/bifrost/framework/logstore"
 	dynamicPlugins "github.com/maximhq/bifrost/framework/plugins"
 	"github.com/maximhq/bifrost/framework/tracing"
@@ -32,7 +33,9 @@ import (
 	"github.com/maximhq/bifrost/transports/bifrost-http/integrations"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	bfws "github.com/maximhq/bifrost/transports/bifrost-http/websocket"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
@@ -91,12 +94,16 @@ type ServerCallbacks interface {
 	AddMCPClient(ctx context.Context, clientConfig *schemas.MCPClientConfig) error
 	RemoveMCPClient(ctx context.Context, id string) error
 	UpdateMCPClient(ctx context.Context, id string, updatedConfig *schemas.MCPClientConfig) error
+	// UpdateMCPClientConnection reconnects an existing MCP client using updated headers
+	UpdateMCPClientConnection(ctx context.Context, id string, newConfig *schemas.MCPClientConfig) error
 	UpdateMCPToolManagerConfig(ctx context.Context, maxAgentDepth int, toolExecutionTimeoutInSeconds int, codeModeBindingLevel string, disableAutoToolInject bool) error
 	// VerifyPerUserOAuthConnection verifies an MCP server using a temporary token and discovers tools.
 	VerifyPerUserOAuthConnection(ctx context.Context, config *schemas.MCPClientConfig, accessToken string) (map[string]schemas.ChatTool, map[string]string, error)
 	// SetClientTools updates the tool map for an existing client.
 	SetClientTools(clientID string, tools map[string]schemas.ChatTool, toolNameMapping map[string]string)
 	ReconnectMCPClient(ctx context.Context, id string) error
+	DisableMCPClient(ctx context.Context, id string) error
+	EnableMCPClient(ctx context.Context, id string) error
 }
 
 // BifrostHTTPServer represents a HTTP server instance.
@@ -218,6 +225,17 @@ func (s *BifrostHTTPServer) UpdateMCPClient(ctx context.Context, id string, upda
 	return nil
 }
 
+// UpdateMCPClientConnection reconnects an existing MCP client using updated headers
+func (s *BifrostHTTPServer) UpdateMCPClientConnection(ctx context.Context, id string, newConfig *schemas.MCPClientConfig) error {
+	if err := s.Config.UpdateMCPClientConnection(ctx, id, newConfig); err != nil {
+		return err
+	}
+	if err := s.MCPServerHandler.SyncAllMCPServers(ctx); err != nil {
+		logger.Warn("failed to sync MCP servers after updating client connection: %v", err)
+	}
+	return nil
+}
+
 // RemoveMCPClient removes an MCP client from the in-memory store
 func (s *BifrostHTTPServer) RemoveMCPClient(ctx context.Context, id string) error {
 	if err := s.Config.RemoveMCPClient(ctx, id); err != nil {
@@ -225,6 +243,28 @@ func (s *BifrostHTTPServer) RemoveMCPClient(ctx context.Context, id string) erro
 	}
 	if err := s.MCPServerHandler.SyncAllMCPServers(ctx); err != nil {
 		logger.Warn("failed to sync MCP servers after removing client: %v", err)
+	}
+	return nil
+}
+
+// DisableMCPClient shuts down an MCP client's connection and workers without removing it.
+func (s *BifrostHTTPServer) DisableMCPClient(ctx context.Context, id string) error {
+	if err := s.Config.DisableMCPClient(ctx, id); err != nil {
+		return err
+	}
+	if err := s.MCPServerHandler.SyncAllMCPServers(ctx); err != nil {
+		logger.Warn("failed to sync MCP servers after disabling client: %v", err)
+	}
+	return nil
+}
+
+// EnableMCPClient reconnects a disabled MCP client and restarts its health monitor and tool syncer.
+func (s *BifrostHTTPServer) EnableMCPClient(ctx context.Context, id string) error {
+	if err := s.Config.EnableMCPClient(ctx, id); err != nil {
+		return err
+	}
+	if err := s.MCPServerHandler.SyncAllMCPServers(ctx); err != nil {
+		logger.Warn("failed to sync MCP servers after enabling client: %v", err)
 	}
 	return nil
 }
@@ -713,6 +753,14 @@ func (s *BifrostHTTPServer) ReloadClientConfigFromConfigStore(ctx context.Contex
 			MCPConfig:          mcpConfig,
 			Logger:             logger,
 		})
+		if err := s.Client.UpdateToolManagerConfig(
+			s.Config.ClientConfig.MCPAgentDepth,
+			s.Config.ClientConfig.MCPToolExecutionTimeout,
+			s.Config.ClientConfig.MCPCodeModeBindingLevel,
+			s.Config.ClientConfig.MCPDisableAutoToolInject,
+		); err != nil {
+			logger.Warn("failed to sync MCP tool manager config during client config reload: %v", err)
+		}
 	}
 	return nil
 }
@@ -1132,15 +1180,23 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 		s.devPprofHandler = handlers.NewDevPprofHandler()
 		s.devPprofHandler.RegisterRoutes(s.Router, middlewares...)
 	}
-	// Add Prometheus /metrics endpoint
-	prometheusPlugin, err := lib.FindPluginAs[*telemetry.PrometheusPlugin](s.Config, telemetry.PluginName)
-	if err == nil && prometheusPlugin.GetRegistry() != nil {
-		// Use the plugin's dedicated registry if available
-		metricsHandler := fasthttpadaptor.NewFastHTTPHandler(promhttp.HandlerFor(prometheusPlugin.GetRegistry(), promhttp.HandlerOpts{}))
-		s.Router.GET("/metrics", lib.ChainMiddlewares(metricsHandler, middlewares...))
-	} else {
-		logger.Warn("prometheus plugin not found or registry is nil, skipping metrics endpoint")
+	metricsGatherer := prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) {
+		plugin, err := lib.FindPluginAs[*telemetry.PrometheusPlugin](s.Config, telemetry.PluginName)
+		if err != nil || plugin == nil {
+			return nil, nil
+		}
+		return plugin.GetMetricsGatherer().Gather()
+	})
+	metricsAdapter := fasthttpadaptor.NewFastHTTPHandler(promhttp.HandlerFor(metricsGatherer, promhttp.HandlerOpts{}))
+	metricsHandler := func(ctx *fasthttp.RequestCtx) {
+		plugin, err := lib.FindPluginAs[*telemetry.PrometheusPlugin](s.Config, telemetry.PluginName)
+		if err != nil || plugin == nil || !plugin.IsMetricsEnabled() {
+			handlers.SendError(ctx, fasthttp.StatusNotFound, "Route not found: "+string(ctx.Path()))
+			return
+		}
+		metricsAdapter(ctx)
 	}
+	s.Router.GET("/metrics", lib.ChainMiddlewares(metricsHandler, middlewares...))
 	// 404 handler
 	s.Router.NotFound = func(ctx *fasthttp.RequestCtx) {
 		handlers.SendError(ctx, fasthttp.StatusNotFound, "Route not found: "+string(ctx.Path()))
@@ -1386,7 +1442,10 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	if s.Config.ConfigStore == nil {
 		logger.Error("auth middleware requires config store, skipping auth middleware initialization")
 	} else {
-		s.WSTicketStore = handlers.NewWSTicketStore()
+		// Use a signed (stateless) ticket store when an encryption key is configured
+		// so tickets are verifiable across nodes; otherwise fall back to in-memory.
+		// NewSignedWSTicketStore handles empty key by degrading to in-memory mode.
+		s.WSTicketStore = handlers.NewSignedWSTicketStore(encrypt.Key())
 		s.AuthMiddleware, err = handlers.InitAuthMiddleware(s.Config.ConfigStore, s.WSTicketStore)
 		if err != nil {
 			s.WSTicketStore.Stop()

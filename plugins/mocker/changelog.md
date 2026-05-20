@@ -1,2 +1,1 @@
-- feat: add Go duration string support for mocker duration fields via `schemas.Duration`
-- chore: upgraded core to v1.5.6 and framework to v1.3.6
+- chore: upgraded core to v1.5.10 and framework to v1.3.10

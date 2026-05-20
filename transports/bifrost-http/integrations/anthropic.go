@@ -100,7 +100,8 @@ func createAnthropicMessagesRouteConfig(pathPrefix string, logger schemas.Logger
 				return nil, errors.New("invalid request type")
 			},
 			ResponsesResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostResponsesResponse) (interface{}, error) {
-				if isClaudeModel(resp.ExtraFields.OriginalModelRequested, resp.ExtraFields.ResolvedModelUsed, string(resp.ExtraFields.Provider)) {
+				soToolName, _ := ctx.Value(schemas.BifrostContextKeyStructuredOutputToolName).(string)
+				if soToolName == "" && isClaudeModel(resp.ExtraFields.OriginalModelRequested, resp.ExtraFields.ResolvedModelUsed, string(resp.ExtraFields.Provider)) {
 					if resp.ExtraFields.RawResponse != nil {
 						return resp.ExtraFields.RawResponse, nil
 					}
@@ -128,7 +129,8 @@ func createAnthropicMessagesRouteConfig(pathPrefix string, logger schemas.Logger
 			},
 			StreamConfig: &StreamConfig{
 				ResponsesStreamResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostResponsesStreamResponse) (string, interface{}, error) {
-					if shouldUsePassthrough(ctx, resp.ExtraFields.Provider, resp.ExtraFields.OriginalModelRequested, resp.ExtraFields.ResolvedModelUsed) {
+					soToolName, _ := ctx.Value(schemas.BifrostContextKeyStructuredOutputToolName).(string)
+					if soToolName == "" && shouldUsePassthrough(ctx, resp.ExtraFields.Provider, resp.ExtraFields.OriginalModelRequested, resp.ExtraFields.ResolvedModelUsed) {
 						// Skip passthrough for ContentPartAdded: it's a synthetic bifrost event whose
 						// RawResponse carries the parent content_block_start already emitted by OutputItemAdded.
 						// Passing through here would produce a duplicate content_block_start that causes
@@ -217,6 +219,18 @@ func hasFastModeBetaHeader(headers map[string][]string) bool {
 	return false
 }
 
+// hasOutputConfigFormat reports whether the parsed request contains output_config.format
+func hasOutputConfigFormat(req any) bool {
+	r, ok := req.(*anthropic.AnthropicMessageRequest)
+	if !ok {
+		return false
+	}
+	if r.OutputConfig != nil && len(r.OutputConfig.Format) > 0 {
+		return true
+	}
+	return len(r.OutputFormat) > 0
+}
+
 // extractPassthroughHeaders filters headers to only include those in the safe whitelist.
 // Header matching is case-insensitive. Provider-aware beta-header filtering happens
 // downstream at each provider's wire layer (e.g. anthropic.go, vertex.go), where
@@ -297,7 +311,7 @@ func hydrateAnthropicRequestFromLargePayloadMetadata(bifrostCtx *schemas.Bifrost
 // checkAnthropicPassthrough pre-callback checks if the request is for a claude model.
 // If it is, it attaches the raw request body for direct use by the provider.
 // It also checks for anthropic oauth headers and sets the bifrost context.
-func checkAnthropicPassthrough(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, req interface{}) error {
+func checkAnthropicPassthrough(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, req any) error {
 	hydrateAnthropicRequestFromLargePayloadMetadata(bifrostCtx, req)
 
 	var provider schemas.ModelProvider
@@ -308,6 +322,7 @@ func checkAnthropicPassthrough(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.Bif
 		provider, model = schemas.ParseModelString(r.Model, "")
 		// Check if model parameter explicitly has `anthropic/` prefix
 		if provider == schemas.Anthropic {
+			bifrostCtx.SetValue(schemas.BifrostContextKeySkipModelCatalogProviderSelection, true)
 			r.Model = model
 		}
 
@@ -315,6 +330,7 @@ func checkAnthropicPassthrough(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.Bif
 		provider, model = schemas.ParseModelString(r.Model, "")
 		// Check if model parameter explicitly has `anthropic/` prefix
 		if provider == schemas.Anthropic {
+			bifrostCtx.SetValue(schemas.BifrostContextKeySkipModelCatalogProviderSelection, true)
 			r.Model = model
 		}
 	}
@@ -324,6 +340,7 @@ func checkAnthropicPassthrough(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.Bif
 
 	// Check if anthropic oauth headers are present
 	if shouldUsePassthrough(bifrostCtx, provider, model, "") {
+		bifrostCtx.SetValue(schemas.BifrostContextKeyPassthroughOverridesPresent, true)
 		bifrostCtx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, true)
 		bifrostCtx.SetValue(schemas.BifrostContextKeySendBackRawResponse, true)
 		if !isAnthropicAPIKeyAuth(ctx) && (provider == schemas.Anthropic || provider == "") {
@@ -343,7 +360,7 @@ func checkAnthropicPassthrough(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.Bif
 				bifrostCtx.SetValue(schemas.BifrostContextKeyExtraHeaders, passthroughHeaders)
 			}
 		}
-		if provider == schemas.Vertex && (hasPromptCachingScopeBetaHeader(headers) || hasFastModeBetaHeader(headers)) {
+		if provider == schemas.Vertex && (hasPromptCachingScopeBetaHeader(headers) || hasFastModeBetaHeader(headers) || hasOutputConfigFormat(req)) {
 			bifrostCtx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, false)
 			return nil
 		}

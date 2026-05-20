@@ -1,3 +1,1 @@
-- feat: forward `x-bf-dim-*` unified dimension headers as Maxim tags
-- fix: deterministic request hashing for cache (thanks [@loss-and-quick](https://github.com/loss-and-quick)!)
-- chore: upgraded core to v1.5.6 and framework to v1.3.6
+- chore: upgraded core to v1.5.10 and framework to v1.3.10

@@ -149,13 +149,11 @@ func ParseSessionIDFromBaggage(header string) string {
 //	// session stickiness, and extra headers
 
 func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*schemas.BifrostContext, context.CancelFunc) {
-	allowDirectKeys := false
 	var matcher *HeaderMatcher
 	mcpHeaderCombinedAllowlist := schemas.WhiteList{}
 	allowPerRequestStorageOverride := false
 	allowPerRequestRawOverride := false
 	if store != nil {
-		allowDirectKeys = store.ShouldAllowDirectKeys()
 		matcher = store.GetHeaderMatcher()
 		mcpHeaderCombinedAllowlist = store.GetMCPHeaderCombinedAllowlist()
 		allowPerRequestStorageOverride = store.ShouldAllowPerRequestStorageOverride()
@@ -607,63 +605,38 @@ func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*sch
 		bifrostCtx.SetValue(schemas.BifrostContextKeyMCPUserID, mcpUserID)
 	}
 
-	// Build and set OAuth redirect URI for per-user OAuth flows
-	var externalBaseURL string
+	// Build and set OAuth redirect URI for per-user OAuth flows. Bifrost is acting as
+	// the OAuth client to upstream MCP servers here, so use the client-side override.
+	var externalClientURL string
 	if store != nil {
-		externalBaseURL = store.GetMCPExternalBaseURL()
+		externalClientURL = store.GetMCPExternalClientURL()
 	}
-	baseURL := BuildBaseURL(ctx, externalBaseURL)
+	baseURL := BuildBaseURL(ctx, externalClientURL)
 	if baseURL != "" {
 		bifrostCtx.SetValue(schemas.BifrostContextKeyOAuthRedirectURI, baseURL+"/api/oauth/callback")
 	}
 
-	if allowDirectKeys {
-		// Extract API key from Authorization header (Bearer format), x-api-key, or x-goog-api-key header
-		var apiKey string
-
-		// TODO: fix plugin data leak
-		// Check Authorization header (Bearer format only - OpenAI style)
-		authHeader := string(ctx.Request.Header.Peek("Authorization"))
-		if authHeader != "" {
-			// Only accept Bearer token format: "Bearer ..."
-			if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-				authHeaderValue := strings.TrimSpace(authHeader[7:]) // Remove "Bearer " prefix
-				if authHeaderValue != "" && !strings.HasPrefix(strings.ToLower(authHeaderValue), governance.VirtualKeyPrefix) {
-					apiKey = authHeaderValue
-				}
-			} else {
-				apiKey = authHeader
-			}
-		}
-
-		if apiKey == "" {
-			// Check x-api-key (Anthropic style) header if no valid Authorization header found
-			xAPIKey := string(ctx.Request.Header.Peek("x-api-key"))
-			if xAPIKey != "" && !strings.HasPrefix(strings.ToLower(xAPIKey), governance.VirtualKeyPrefix) {
-				apiKey = strings.TrimSpace(xAPIKey)
-			} else {
-				// Check x-goog-api-key (Google Gemini style) header if no valid Authorization header found
-				xGoogleAPIKey := string(ctx.Request.Header.Peek("x-goog-api-key"))
-				if xGoogleAPIKey != "" && !strings.HasPrefix(strings.ToLower(xGoogleAPIKey), governance.VirtualKeyPrefix) {
-					apiKey = strings.TrimSpace(xGoogleAPIKey)
-				}
-			}
-		}
-
-		// If we found an API key, create a Key object and store it in context
-		if apiKey != "" {
-			key := schemas.Key{
-				ID:     "header-provided", // Identifier for header-provided keys
-				Value:  *schemas.NewEnvVar(apiKey),
-				Models: schemas.WhiteList{"*"}, // Allow all models
-				Weight: 1.0,                    // Default weight
-			}
-			bifrostCtx.SetValue(schemas.BifrostContextKeyDirectKey, key)
-		}
-	}
 	bifrostCtx.SetValue(schemas.BifrostContextKeyAllowPerRequestStorageOverride, allowPerRequestStorageOverride)
 	bifrostCtx.SetValue(schemas.BifrostContextKeyAllowPerRequestRawOverride, allowPerRequestRawOverride)
 	return bifrostCtx, cancel
+}
+
+// ValidateBaseURL checks that a URL is parseable with both scheme and host —
+// the same gate BuildBaseURL applies before honoring an override. Empty values
+// are accepted (caller decides whether absence is allowed). Logging is the
+// caller's responsibility. The error intentionally omits the offending value:
+// callers may pass URLs resolved from env vars (e.g. `env.MY_SECRET_URL`), so
+// echoing the value back in API responses or logs would let an attacker probe
+// process env state by feeding malformed env-var references.
+func ValidateBaseURL(val string) error {
+	if val == "" {
+		return nil
+	}
+	parsed, err := url.Parse(val)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("must be a fully-qualified URL with scheme and host (e.g. https://proxy.example.com)")
+	}
+	return nil
 }
 
 // BuildBaseURL returns the effective base URL for OAuth callbacks and metadata discovery.
