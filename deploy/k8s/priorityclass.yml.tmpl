@@ -1,0 +1,9 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: bifrost-aigw-priority
+value: 900000
+globalDefault: false
+description: "Priority class for bifrost-aigw AI gateway service pods."
+
+# vim: syntax=yaml

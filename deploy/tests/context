@@ -1,0 +1,13 @@
+# Test context for RE cluster deployment validation.
+# Used by `make test` in deploy/ to verify templates render cleanly.
+bifrost_aigw_image: "volterra.azurecr.io/ves.io/bifrost-aigw:latest"
+bifrost_aigw_namespace: ves-system
+bifrost_aigw_cluster_type: re
+bifrost_aigw_memory_limit: 512Mi
+bifrost_aigw_memory_request: 128Mi
+bifrost_aigw_cpu_request: 100m
+bifrost_aigw_cpu_limit: 500m
+bifrost_aigw_debug: "true"
+bifrost_aigw_wingman_endpoint: https://identity.ves-system.svc.cluster.local:9095
+bifrost_aigw_blindfold_endpoint: https://blindfold.ves-system.svc.cluster.local:9098
+bifrost_aigw_env_vars: '{"STDLIB_ENABLE_WINGMAN_UNIX_DOMAIN_SOCKET":"true"}'

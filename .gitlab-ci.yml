@@ -1,0 +1,87 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+include:
+- project: f5/volterra/ves.io/sre/cicd-deployment
+  ref: master
+  file:
+  - pipelines/general-ci-include.yml
+  - pipelines/build.yml
+  - pipelines/upload-template.yml
+  - pipelines/manifests.yml
+  - pipelines/release.yml
+- project: f5/volterra/security/security-config/cicd-includes
+  ref: main
+  file: security-scanning/security-scan-all.yml
+  inputs:
+    checkmarx-zip-pattern: '\.git/.*,go.mod,go.sum,README.md,docs/.*,tests/.*,examples/.*,.*_test\.go,ui/node_modules/.*'
+
+
+variables:
+  IS_PUBLIC: "true"
+  GO_BUILDER_IMAGE: volterra.azurecr.io/ves.io/go-builder:v2.6.0
+  GOTOOLCHAIN: auto
+  REGISTRY_SERVER: volterra.azurecr.io
+  APP_TEMPLATE: bifrost-aigw
+
+default:
+  interruptible: true
+
+stages:
+- prepare
+- test
+- publish
+- upload
+- release
+- vuln-scan
+
+render-manifests:
+  stage: prepare
+  extends: .render-manifests
+
+validate-tmpl-images:
+  stage: test
+  extends: .validate-tmpl-images
+
+test-manifests:
+  stage: test
+  extends: .test-manifests
+  dependencies:
+    - render-manifests
+
+#### Docker build and Release tags
+# bifrost-aigw
+build-bifrost-aigw:
+  stage: test
+  extends: .build
+  script:
+
+  # Install SQLite development headers for CGO static build
+  - yum install -y sqlite-devel
+  - make cmd-build-bifrost-aigw BUILD_VERSION="${CI_COMMIT_REF_SLUG}" BUILD_SHA="${CI_COMMIT_SHA}"
+    BUILD_COMMENT="$(date -Iseconds) ${GITLAB_USER_LOGIN} ${CI_JOB_ID}"
+  # Verify SHA is embedded in the binary
+  - strings build_out/bifrost-aigw | grep "${CI_COMMIT_SHA}"
+
+container-bifrost-aigw:
+  variables:
+    APP_NAME: bifrost-aigw
+    TEMPLATE_UPLOAD: "true"
+  stage: publish
+  extends: .container
+  dependencies:
+  - build-bifrost-aigw
+  before_script:
+    - echo "Copying Dockerfile from $CI_PROJECT_DIR/docker/bifrost-aigw/Dockerfile to $CI_PROJECT_DIR/"
+    - cp $CI_PROJECT_DIR/docker/bifrost-aigw/Dockerfile $CI_PROJECT_DIR/
+
+# Render and validate deploy templates in CI
+release-bifrost-aigw:
+  variables:
+    SERVICE_NAME: bifrost-aigw
+  stage: release
+  extends: .release-job

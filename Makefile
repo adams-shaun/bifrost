@@ -2002,3 +2002,67 @@ run-provider-harness-test: $(if $(HELP),,install-newman) ## Run the Bifrost prov
 	fi; \
 	if [ "$$NEWMAN_EXIT" -ne 0 ]; then exit $$NEWMAN_EXIT; fi; \
 	exit $$STREAM_CANCEL_EXIT
+# ============================================================
+# Enterprise CI/CD Build Targets
+# These targets mirror vega/vegacfgd patterns for integration
+# with the shared cicd-deployment pipeline templates.
+# ============================================================
+
+# Enterprise build identification
+BUILD_SHA ?= $(shell git rev-parse HEAD)
+BUILD_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
+BUILD_COMMENT ?= $(shell date -Iseconds)
+GOBIN_OUT := $(PWD)/build_out
+
+cmd-build-ui-enterprise: ## Build UI for enterprise container (requires Node.js)
+# 	@$(ECHO) "$(GREEN)Building enterprise UI...$(NC)"
+# 	@which node > /dev/null || ($(ECHO) "$(RED)Error: Node.js not found. Install Node.js first.$(NC)" && exit 1)
+# 	@cd ui && npm ci && npm run build-enterprise
+# 	@rm -rf transports/bifrost-http/ui
+# 	@mkdir -p transports/bifrost-http/ui
+# 	@cp -r ui/out/* transports/bifrost-http/ui/
+# 	@$(ECHO) "$(GREEN)Enterprise UI built and copied to transports/bifrost-http/ui/$(NC)"
+
+cmd-setup-workspace-ci: ## Set up Go workspace for CI builds (resolves local module dependencies)
+	@$(ECHO) "$(GREEN)Setting up Go workspace for CI build...$(NC)"
+	@rm -f go.work go.work.sum || true
+	@go work init ./cli ./core ./framework ./transports
+	@for plugin_dir in ./plugins/*/; do \
+		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
+			go work use "$$plugin_dir"; \
+		fi; \
+	done
+	@go work sync
+	@$(ECHO) "$(GREEN)Go workspace ready$(NC)"
+
+cmd-build-bifrost-aigw: cmd-setup-workspace-ci ## Build bifrost-aigw binary for enterprise CI
+	@$(ECHO) "$(GREEN)Building bifrost-aigw binary...$(NC)"
+	@mkdir -p transports/bifrost-http/ui && echo '<!-- placeholder -->' > transports/bifrost-http/ui/.keep
+	@mkdir -p "$(GOBIN_OUT)"
+	cd transports/bifrost-http && CGO_ENABLED=1 go build \
+		-ldflags "-s -w -X \"main.Version=v$(BUILD_VERSION)-$(BUILD_SHA)\" " \
+		-a -trimpath \
+		-tags "sqlite_static" \
+		-installsuffix cgo \
+		-o $(GOBIN_OUT)/bifrost-aigw \
+		.
+	@$(ECHO) "$(GREEN)Built: $(GOBIN_OUT)/bifrost-aigw$(NC)"
+
+#To-do ak - remove this, .container builds instead.
+cmd-build-bifrost-aigw-container: ## Build enterprise container image
+	@$(ECHO) "$(GREEN)Building enterprise container image...$(NC)"
+	echo "$(BUILD_VERSION) $(BUILD_SHA)" > VERSION
+	podman build \
+		--format docker \
+		--label service="bifrost-aigw" \
+		--label version="$(BUILD_VERSION)" \
+		--label comment="$(BUILD_COMMENT)" \
+		--label commit-sha="$(BUILD_SHA)" \
+		--tag $(DOCKER_REG)/ves.io/bifrost-aigw:$(ARTIFACT_TAG) \
+		--file docker/bifrost-aigw/Dockerfile .
+	rm -v VERSION
+	@$(ECHO) "$(GREEN)Container image built: $(DOCKER_REG)/ves.io/bifrost-aigw:$(ARTIFACT_TAG)$(NC)"
+
+# Enterprise variables (override via CI or env)
+DOCKER_REG ?= volterra.azurecr.io
+ARTIFACT_TAG ?= latest

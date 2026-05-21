@@ -1,0 +1,19 @@
+# Service for bifrost-aigw AI gateway.
+kind: Service
+apiVersion: v1
+metadata:
+  name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}
+  namespace: {{ if .bifrost_aigw_namespace }}{{ .bifrost_aigw_namespace }}{{ else }}{{ if .namespace }}{{ .namespace }}{{ else }}ves-system{{ end }}{{ end }}
+spec:
+  type: ClusterIP
+  selector:
+    app: bifrost-aigw
+    name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}
+  ports:
+    # Primary HTTP port — AI gateway proxy traffic
+    - protocol: TCP
+      name: http
+      port: {{ coalesce .bifrost_aigw_port "8080" }}
+      targetPort: {{ coalesce .bifrost_aigw_port "8080" }}
+
+# vim: syntax=yaml

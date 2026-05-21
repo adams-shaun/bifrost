@@ -1,0 +1,210 @@
+{{- $featureFlagsStr := default "none" .bifrost_aigw_featureflags }}
+{{- $featureFlags := splitList " " $featureFlagsStr }}
+{{- $bifrostAigwWingmanUnixDomainSocket := getBoolEnv .bifrost_aigw_env_vars "STDLIB_ENABLE_WINGMAN_UNIX_DOMAIN_SOCKET" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}
+  namespace: {{ if .bifrost_aigw_namespace }}{{ .bifrost_aigw_namespace }}{{ else }}{{ if .namespace }}{{ .namespace }}{{ else }}ves-system{{ end }}{{ end }}
+  annotations:
+    {{- if .bifrost_aigw_stage }}
+    # Stage annotation controls deployment ordering during version rollouts
+    ves.io/stage: "{{ .bifrost_aigw_stage }}"
+    {{- end }}
+    # Prepull annotation — VPM uses this to pre-pull images before applying the manifest,
+    # reducing pod startup latency on CE/RE nodes
+    ves.io/prepull: |
+      {{ if .bifrost_aigw_wingman_image }}{{ .bifrost_aigw_wingman_image }}{{ else }}volterra.azurecr.io/ves.io/wingman:{{ if .bifrost_aigw_wingman_version }}{{ .bifrost_aigw_wingman_version }}{{ else }}latest{{ end }}{{ end }}
+      {{ if .bifrost_aigw_image }}{{ .bifrost_aigw_image }}{{ else }}gcr.io/volterraio/bifrost-aigw:{{ if .bifrost_aigw_version }}{{ .bifrost_aigw_version }}{{ else }}latest{{ end }}{{ end }}
+spec:
+# To-Do ak - removed replicas spec
+#  replicas: {{ if .bifrost_aigw_replicas }}{{ .bifrost_aigw_replicas }}{{ else }}1{{ end }}
+  selector:
+    matchLabels:
+      name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}
+        app: bifrost-aigw
+#To-Do ak - Pod annotations
+      #annotations:
+      #  {{- if .sha256_configmap }}
+      #  # Forces pod restart when configmap content changes (hash of configmap template)
+      #  checksum/config: {{ .sha256_configmap }}
+      #  {{- end }}
+      #  # Prometheus scraping — bifrost-aigw exposes metrics on its service port
+      #  prometheus.ves.io/scrape: "true"
+      #  prometheus.ves.io/port: "{{ coalesce .bifrost_aigw_metrics_port "8080" }}"
+      #  fluentbit.io/parser-wingman: serviceframework
+      #  fluentbit.io/parser-bifrost-aigw: json
+      #  fluentbit.io/exclude-wingman: "true"
+    spec:
+      priorityClassName: bifrost-aigw-priority
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1001
+        fsGroup: 1001
+        runAsNonRoot: true
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+#To-Do ak - hostNetwork? affinity? serviceAccount?
+#hostNetwork is needed currently for ves-system
+#      dnsPolicy: ClusterFirstWithHostNet
+#      hostNetwork: true
+#      affinity:
+#        nodeAffinity:
+#          requiredDuringSchedulingIgnoredDuringExecution:
+#            nodeSelectorTerms:
+#            - matchExpressions:
+#              - key: kubernetes.io/os
+#                operator: In
+#                values:
+#                - "linux"
+#              - key: ves.io/ver
+#                operator: In
+#                values:
+#                - "true"
+#      serviceAccountName: ver
+      containers:
+      - name: wingman
+        image: {{ if .bifrost_aigw_wingman_image }}{{ .bifrost_aigw_wingman_image }}{{ else }}volterra.azurecr.io/ves.io/wingman:{{ if .bifrost_aigw_wingman_version }}{{ .bifrost_aigw_wingman_version }}{{ else }}latest{{ end }}{{ end }}
+        imagePullPolicy: IfNotPresent
+        command: ["wingmand", "--config", "/etc/ves/config/wingman.yml"]
+        resources:
+          limits:
+            memory: {{ coalesce .bifrost_aigw_wingman_memory_limit "128Mi" }}
+          requests:
+            memory: {{ coalesce .bifrost_aigw_wingman_memory_request "64Mi" }}
+        volumeMounts:
+        - mountPath: /volterra/secrets/identity
+          name: certs-volume
+        - mountPath: /etc/ves/config/wingman.yml
+          name: config
+          subPath: wingman_config.yaml
+        env:
+        - name: serviceNames
+          value: {{ if .bifrost_aigw_fqdn }}{{ .bifrost_aigw_fqdn }},{{ end }}{{ default "bifrost-aigw" .bifrost_aigw_app_name }}.{{ if .bifrost_aigw_namespace }}{{ .bifrost_aigw_namespace }}{{ else }}{{ if .namespace }}{{ .namespace }}{{ else }}ves-system{{ end }}{{ end }}.svc.cluster.local
+#To-do ak - wingman port?
+        - name: WINGMAN_PORT
+          value: "65440"
+        - name: STDLIB_ENABLE_WINGMAN_UNIX_DOMAIN_SOCKET
+          value: "{{ $bifrostAigwWingmanUnixDomainSocket }}"
+        {{- if .bifrost_aigw_http_proxy }}
+        - name: HTTP_PROXY
+          value: {{ .bifrost_aigw_http_proxy }}
+        {{- end }}
+        {{- if .bifrost_aigw_https_proxy }}
+        - name: HTTPS_PROXY
+          value: {{ .bifrost_aigw_https_proxy }}
+        {{- end }}
+        {{- if .bifrost_aigw_no_proxy }}
+        - name: NO_PROXY
+          value: {{ .bifrost_aigw_no_proxy }}
+        {{- end }}
+        {{- if .bifrost_aigw_proxy_cacert_url }}
+        - name: PROXY_CACERT_URL
+          value: {{ .bifrost_aigw_proxy_cacert_url }}
+        {{- end }}
+      - name: bifrost-aigw
+        image: {{ if .bifrost_aigw_image }}{{ .bifrost_aigw_image }}{{ else }}gcr.io/volterraio/bifrost-aigw:{{ if .bifrost_aigw_version }}{{ .bifrost_aigw_version }}{{ else }}latest{{ end }}{{ end }}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: {{ coalesce .bifrost_aigw_port "8080" }}
+          name: http
+          protocol: TCP
+        # --- Health Probes ---
+        # /health is the built-in health check endpoint (see Dockerfile HEALTHCHECK)
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ coalesce .bifrost_aigw_port "8080" }}
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 2
+          failureThreshold: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: {{ coalesce .bifrost_aigw_port "8080" }}
+          initialDelaySeconds: 15
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        env:
+        {{- if eq .bifrost_aigw_cluster_type "re" }}
+        - name: CLUSTER_TYPE
+          value: "re"
+        {{- else }}
+        - name: CLUSTER_TYPE
+          value: "ce"
+        {{- end }}
+        - name: APP_PORT
+          value: "{{ coalesce .bifrost_aigw_port "8080" }}"
+        # Wingman connection for mTLS credential access
+        - name: STDLIB_ENABLE_WINGMAN_UNIX_DOMAIN_SOCKET
+          value: "{{ $bifrostAigwWingmanUnixDomainSocket }}"
+        {{- if .bifrost_aigw_debug }}
+        - name: DEBUG
+          value: "1"
+        {{- end }}
+        {{- if .bifrost_aigw_http_proxy }}
+        - name: HTTP_PROXY
+          value: {{ .bifrost_aigw_http_proxy }}
+        {{- end }}
+        {{- if .bifrost_aigw_https_proxy }}
+        - name: HTTPS_PROXY
+          value: {{ .bifrost_aigw_https_proxy }}
+        {{- end }}
+        {{- if .bifrost_aigw_no_proxy }}
+        - name: NO_PROXY
+          value: {{ .bifrost_aigw_no_proxy }}
+        {{- end }}
+        {{- if .bifrost_aigw_proxy_cacert_url }}
+        - name: PROXY_CACERT_URL
+          value: {{ .bifrost_aigw_proxy_cacert_url }}
+        {{- end }}
+        {{- if .bifrost_aigw_env_vars }}
+        {{- $Envs := handleEnvVars .bifrost_aigw_env_vars -}}
+        {{ range $key, $value := $Envs }}
+        - name: {{ $key }}
+          value: "{{ $value }}"
+        {{- end }}
+        {{- end }}
+#To-do ak - resource requests/limits configuration
+        resources:
+          requests:
+            cpu: {{ coalesce .bifrost_aigw_cpu_request "100m" }}
+            memory: {{ coalesce .bifrost_aigw_memory_request "128Mi" }}
+          limits:
+            cpu: {{ coalesce .bifrost_aigw_cpu_limit "500m" }}
+            memory: {{ coalesce .bifrost_aigw_memory_limit "512Mi" }}
+        volumeMounts:
+        # Certs from wingman sidecar (shared emptyDir)
+        - mountPath: /volterra/secrets/identity
+          name: certs-volume
+          readOnly: true
+        # Persistent app data directory
+        - mountPath: /app/data
+          name: app-data
+      volumes:
+      - configMap:
+          name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}-config
+        name: config
+      # use certificates provided by wingman
+      - name: certs-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "5M"
+      # App data volume — uses hostPath for persistence across restarts on the node
+      - name: app-data
+        hostPath:
+          path: /var/run/bifrost-aigw
+          type: DirectoryOrCreate
+
+# vim: syntax=yaml
