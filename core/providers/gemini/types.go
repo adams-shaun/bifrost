@@ -111,13 +111,15 @@ type GeminiGenerationRequest struct {
 	ToolConfig        *ToolConfig              `json:"toolConfig,omitempty"`
 	Labels            map[string]string        `json:"labels,omitempty"`
 	CachedContent     string                   `json:"cachedContent,omitempty"`
-	Stream            bool                     `json:"-"` // Internal field to track streaming requests
-	IsEmbedding       bool                     `json:"-"` // Internal field to track if this is an embedding request
-	IsTranscription   bool                     `json:"-"` // Internal field to track if this is a transcription request
-	IsSpeech          bool                     `json:"-"` // Internal field to track if this is a speech request
-	IsImageGeneration bool                     `json:"-"` // Internal field to track if this is an image generation request
-	IsImageEdit       bool                     `json:"-"` // Internal field to track if this is an image edit request
-	IsCountTokens     bool                     `json:"-"` // Internal field to track if this is a count tokens request
+	// Optional. The service tier to use for the request. For example, ServiceTier.FLEX.
+	ServiceTier       ServiceTier `json:"serviceTier,omitempty"`
+	Stream            bool        `json:"-"` // Internal field to track streaming requests
+	IsEmbedding       bool        `json:"-"` // Internal field to track if this is an embedding request
+	IsTranscription   bool        `json:"-"` // Internal field to track if this is a transcription request
+	IsSpeech          bool        `json:"-"` // Internal field to track if this is a speech request
+	IsImageGeneration bool        `json:"-"` // Internal field to track if this is an image generation request
+	IsImageEdit       bool        `json:"-"` // Internal field to track if this is an image edit request
+	IsCountTokens     bool        `json:"-"` // Internal field to track if this is a count tokens request
 
 	// Imagen-specific fields for :predict endpoint
 	Instances  []ImagenInstance        `json:"instances,omitempty"`
@@ -811,6 +813,20 @@ func (t *Tool) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Pricing and performance service tier.
+type ServiceTier string
+
+const (
+	// Default service tier, which is standard.
+	ServiceTierUnspecified ServiceTier = "unspecified"
+	// Flex service tier.
+	ServiceTierFlex ServiceTier = "flex"
+	// Standard service tier.
+	ServiceTierStandard ServiceTier = "standard"
+	// Priority service tier.
+	ServiceTierPriority ServiceTier = "priority"
+)
+
 // GenerationConfig represents generation configuration. You can find API default values and more details at https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference#generationconfig
 // and https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/content-generation-parameters.
 type GenerationConfig struct {
@@ -1166,6 +1182,7 @@ type GeminiEmbeddingRequest struct {
 	Title                *string                `json:"title,omitempty"`
 	OutputDimensionality *int                   `json:"outputDimensionality,omitempty"`
 	Model                string                 `json:"model,omitempty"`
+	Fallbacks            []string               `json:"fallbacks,omitempty"`
 	ExtraParams          map[string]interface{} `json:"-"` // Optional: Extra parameters
 }
 
@@ -1457,6 +1474,11 @@ type FunctionResponse struct {
 type GeminiEmbeddingResponse struct {
 	Embeddings []GeminiEmbedding     `json:"embeddings"`
 	Metadata   *EmbedContentMetadata `json:"metadata,omitempty"`
+}
+
+// GeminiEmbedContentResponse is the wire format for a single :embedContent response.
+type GeminiEmbedContentResponse struct {
+	Embedding GeminiEmbedding `json:"embedding"`
 }
 
 // GeminiEmbedding represents a single embedding in the response
@@ -1899,6 +1921,8 @@ type GenerateContentResponseUsageMetadata struct {
 	// Output only. Traffic type. This shows whether a request consumes Pay-As-You-Go or
 	// Provisioned Throughput quota.
 	TrafficType string `json:"trafficType,omitempty"`
+	// Output only. The service tier used to serve the request.
+	ServiceTier ServiceTier `json:"serviceTier,omitempty"`
 }
 
 // GenerateContentResponse represents response message for PredictionService.GenerateContent.
@@ -2308,7 +2332,8 @@ type GeminiVideoGenerationRequest struct {
 	Model       string                          `json:"model,omitempty"` // Model field for explicit model specification
 	Instances   []GeminiVideoGenerationInstance `json:"instances"`
 	Parameters  *VideoGenerationParameters      `json:"parameters,omitempty"` // Optional parameters including reference images
-	ExtraParams map[string]interface{}          `json:"-"`                    // Optional: Extra parameters
+	Fallbacks   []string                        `json:"fallbacks,omitempty"`
+	ExtraParams map[string]interface{}          `json:"-"` // Optional: Extra parameters
 }
 
 func (r *GeminiVideoGenerationRequest) GetExtraParams() map[string]interface{} {

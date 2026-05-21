@@ -1,2 +1,3 @@
-- fix: otel metric fixes (#3439)
-- chore: upgraded core to v1.5.10 and framework to v1.3.10
+- feat: custom selection of plugins for OTEL trace-span exports (#3382)
+- fix: handle context cancel before read errors in streaming (#3522)
+- chore: dependency and AWS SDK security updates (#3461)

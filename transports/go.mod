@@ -12,16 +12,16 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.2
 	github.com/mark3labs/mcp-go v0.43.2
-	github.com/maximhq/bifrost/core v1.5.9
-	github.com/maximhq/bifrost/framework v1.3.9
-	github.com/maximhq/bifrost/plugins/compat v0.1.8
-	github.com/maximhq/bifrost/plugins/governance v1.5.9
-	github.com/maximhq/bifrost/plugins/logging v1.5.9
-	github.com/maximhq/bifrost/plugins/maxim v1.6.9
-	github.com/maximhq/bifrost/plugins/otel v1.2.9
-	github.com/maximhq/bifrost/plugins/prompts v1.0.9
-	github.com/maximhq/bifrost/plugins/semanticcache v1.5.9
-	github.com/maximhq/bifrost/plugins/telemetry v1.5.9
+	github.com/maximhq/bifrost/core v1.5.11
+	github.com/maximhq/bifrost/framework v1.3.11
+	github.com/maximhq/bifrost/plugins/compat v0.1.10
+	github.com/maximhq/bifrost/plugins/governance v1.5.11
+	github.com/maximhq/bifrost/plugins/logging v1.5.11
+	github.com/maximhq/bifrost/plugins/maxim v1.6.11
+	github.com/maximhq/bifrost/plugins/otel v1.2.11
+	github.com/maximhq/bifrost/plugins/prompts v1.0.11
+	github.com/maximhq/bifrost/plugins/semanticcache v1.5.11
+	github.com/maximhq/bifrost/plugins/telemetry v1.5.11
 	github.com/pion/rtcp v1.2.16
 	github.com/pion/webrtc/v4 v4.2.9
 	github.com/prometheus/client_golang v1.23.2
@@ -54,12 +54,12 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.41.5 // indirect
+	github.com/aws/aws-sdk-go-v2 v1.41.7 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.32.11 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.21 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.21 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.5 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.22 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.7 // indirect
@@ -132,7 +132,7 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-sqlite3 v1.14.32 // indirect
-	github.com/maximhq/bifrost/plugins/mocker v1.5.9 // indirect
+	github.com/maximhq/bifrost/plugins/mocker v1.5.11 // indirect
 	github.com/maximhq/maxim-go v0.2.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/oapi-codegen/runtime v1.1.1 // indirect

@@ -1,3 +1,2 @@
-- feat: supports toggling push-based and pull-based separately and fixes hot-reload of plugin (#3433)
-- fix: otel metric fixes (#3439)
-- chore: upgraded core to v1.5.10 and framework to v1.3.10
+- chore: upgraded core to v1.5.11 and framework to v1.3.11
+- chore: dependency and AWS SDK security updates (#3461)
