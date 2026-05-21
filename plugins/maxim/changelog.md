@@ -1,1 +1,2 @@
-- chore: upgraded core to v1.5.10 and framework to v1.3.10
+- fix: VK and provider-key level pricing overrides for streaming (#3421)
+- chore: dependency and AWS SDK security updates (#3461)
