@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ if .bifrost_aigw_namespace }}{{ .bifrost_aigw_namespace }}{{ else }}{{ if .namespace }}{{ .namespace }}{{ else }}ves-system{{ end }}{{ end }}
+  annotations:
+  {{- if .bifrost_aigw_app_id }}
+    ves.io/app_id: {{ .bifrost_aigw_app_id }}
+  {{- end }}
+
+# vim: syntax=yaml

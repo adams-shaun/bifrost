@@ -1,0 +1,25 @@
+# ConfigMap for bifrost-aigw.
+# Provides wingman identity/auth config and bifrost-aigw runtime configuration.
+# Wingman handles mTLS certificate management for secure service-to-service communication.
+{{- $featureFlagsStr := default "none" .bifrost_aigw_featureflags }}
+{{- $featureFlags := splitList " " $featureFlagsStr }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ default "bifrost-aigw" .bifrost_aigw_app_name }}-config
+  namespace: {{ if .bifrost_aigw_namespace }}{{ .bifrost_aigw_namespace }}{{ else }}{{ if .namespace }}{{ .namespace }}{{ else }}ves-system{{ end }}{{ end }}
+  annotations:
+  {{- if .bifrost_aigw_app_id }}
+    ves.io/app_id: {{ .bifrost_aigw_app_id }}
+  {{- end }}
+data:
+  # Wingman sidecar configuration — endpoints for identity auth and blindfold encryption
+  wingman_config.yaml: |
+    IdentityAuthURL:
+      url: {{ .bifrost_aigw_wingman_endpoint }}
+      ctype: 0
+    BlindfoldURL:
+      url: {{ .bifrost_aigw_blindfold_endpoint }}
+      ctype: 0
+
+# vim: syntax=yaml

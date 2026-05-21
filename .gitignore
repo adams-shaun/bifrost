@@ -33,6 +33,7 @@ tmp-*
 private
 **/bin
 build/
+build_out/
 target/
 
 # Go workspaces (local only)
