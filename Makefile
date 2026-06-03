@@ -9,6 +9,17 @@ LOG_STYLE ?= json
 LOG_LEVEL ?= info
 TEST_REPORTS_DIR ?= test-reports
 GOTESTSUM_FORMAT ?= standard-verbose
+COVERAGE_DIR ?= coverage_out
+# Go module roots covered by `make cmd-unittest` (mirrors the test-all scope):
+# core, framework, every plugins/* module, the bifrost-http transport, and the CLI.
+GO_COVER_MODULES ?= core framework $(patsubst %/,%,$(dir $(wildcard plugins/*/go.mod))) transports/bifrost-http cli
+# Packages EXCLUDED from `make cmd-unittest`: live-integration suites that need
+# provider API keys or running services (Redis/Weaviate/Qdrant/MCP servers).
+# The CI test stage runs without those secrets; run them locally via the
+# `make test-*` targets with $(EXPOSE_ENV). The transports/bifrost-http ROOT
+# package is excluded for its service-dependent TestMain; its /handlers and /lib
+# subpackages (including the F5XC patch tests) still run.
+GO_COVER_EXCLUDE ?= /core/providers/|/core/internal/llmtests|/core/internal/mcptests|/framework/vectorstore|/transports/bifrost-http$$
 FLOW ?=
 VERSION ?= dev-build
 LOCAL ?=
@@ -66,7 +77,7 @@ define EXPOSE_ENV
 	fi
 endef
 
-.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches
+.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches cmd-unittest coverage-all-bl
 
 all: help
 
@@ -2067,6 +2078,45 @@ cmd-setup-workspace-ci: ## Set up Go workspace for CI builds (resolves local mod
 	done
 	@go work sync
 	@$(ECHO) "$(GREEN)Go workspace ready$(NC)"
+
+cmd-unittest: cmd-setup-workspace-ci apply-patches install-gotestsum ## Run deterministic (no-network) Go unit tests against the F5XC-patched tree (go.work); writes per-module coverage_out/coverage-<mod>-bl profiles + JUnit. Pair with `coverage-all-bl`.
+	@mkdir -p $(TEST_REPORTS_DIR) $(COVERAGE_DIR)
+	@# Patches are applied (apply-patches) and the workspace is set up
+	@# (cmd-setup-workspace-ci) so each module resolves the local, patched
+	@# sibling modules. We deliberately do NOT set GOWORK=off here: the patched
+	@# governance/transports code depends on the patched local framework
+	@# (e.g. TableUser), which only resolves through go.work.
+	@# Per module we test only the packages that survive GO_COVER_EXCLUDE, i.e.
+	@# we drop the live-integration suites that need credentials/services (see the
+	@# GO_COVER_EXCLUDE comment). Those are run locally via `make test-*`.
+	@# `go list -e` tolerates load errors so one bad package doesn't blank the
+	@# whole module list -- notably the bifrost-http ROOT package, whose
+	@# `//go:embed all:ui` fails until the UI is built; we exclude that root
+	@# anyway and still test /handlers (the patch tests), /lib, etc.
+	@# Each module's profile lands at coverage_out/coverage-<mod>-bl ("bl" =
+	@# business logic); `make coverage-all-bl` gocovmerges them into one report.
+	@fail=0; \
+	for mod in $(GO_COVER_MODULES); do \
+		name=$$(echo $$mod | sed 's#/#-#g'); \
+		pkgs=$$(cd $$mod && go list -e ./... 2>/dev/null | grep -vE "$(GO_COVER_EXCLUDE)"); \
+		if [ -z "$$pkgs" ]; then $(ECHO) "$(YELLOW)>>> $$mod: no unit packages after exclude, skipping$(NC)"; continue; fi; \
+		$(ECHO) "$(GREEN)>>> unittest: $$mod$(NC)"; \
+		( cd $$mod && gotestsum --format=$(GOTESTSUM_FORMAT) \
+			--junitfile=$(CURDIR)/$(TEST_REPORTS_DIR)/coverage-$$name.xml \
+			-- -covermode=atomic -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/coverage-$$name-bl $$pkgs ) || fail=1; \
+	done; \
+	exit $$fail
+
+coverage-all-bl: ## Merge cmd-unittest per-module profiles -> coverage_out/coverage.html + Cobertura + total %
+	@command -v gocovmerge >/dev/null 2>&1 || go install github.com/wadey/gocovmerge@latest
+	@command -v gocover-cobertura >/dev/null 2>&1 || go install github.com/boumenot/gocover-cobertura@latest
+	@$(ECHO) "$(GREEN)>>> Merge coverage for all packages >>>$(NC)"
+	@ls -ltr $(COVERAGE_DIR)/*-bl 2>/dev/null || { $(ECHO) "$(RED)no -bl coverage profiles in $(COVERAGE_DIR)/ (run cmd-unittest first)$(NC)"; exit 1; }
+	gocovmerge $(COVERAGE_DIR)/*-bl > $(COVERAGE_DIR)/cover-all-bl
+	go tool cover -html=$(COVERAGE_DIR)/cover-all-bl -o $(COVERAGE_DIR)/coverage.html
+	gocover-cobertura < $(COVERAGE_DIR)/cover-all-bl > $(COVERAGE_DIR)/coverage.cobertura.xml || $(ECHO) "$(YELLOW)cobertura generation skipped$(NC)"
+	go tool cover -func $(COVERAGE_DIR)/cover-all-bl | tail -1
+
 
 cmd-build-bifrost-aigw: cmd-setup-workspace-ci apply-patches ## Build bifrost-aigw binary for CI (applies F5XC patches in-place)
 	@$(ECHO) "$(GREEN)Building bifrost-aigw binary...$(NC)"

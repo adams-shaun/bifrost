@@ -41,6 +41,7 @@
   },
   "overrides": {
     "uuid": "^14.0.0",
-    "fast-xml-parser": "^5.3.5"
+    "fast-xml-parser": "^5.3.5",
+    "flatted": "3.4.2"
   }
 }

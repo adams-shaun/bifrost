@@ -53,3 +53,18 @@ matching `security/` and trying to run a non-existent `apply.sh`.
   -39834 / -42508 / -46595), `golang.org/x/net` v0.52.0 → v0.55.0 (closes
   CVE-2026-39821), and `vitest` (with `@vitest/coverage-v8` and `@vitest/ui`)
   2.1.0 → 2.1.9 (closes CVE-2025-24964).
+- `0002-security-bump-x-sys-axios-vitest-yaml.patch` — bumps
+  `golang.org/x/sys` v0.42.0 → v0.45.0, `axios` 1.15.2 → 1.16.1, `vitest`
+  (with `@vitest/coverage-v8` and `@vitest/ui`) 2.1.9/4.0.18 → 4.1.0 (closes
+  CVE-2026-47429), and `yaml` 2.6.0 → 2.8.3.
+- `0003-security-add-vitejs-plugin-react-to-ui-vitest-config.patch` — wires
+  `@vitejs/plugin-react` into `ui/vitest.config.ts`. Required companion to the
+  `0002` vitest 4.1.0 bump: vitest 4.1.x honors tsconfig `jsx: "preserve"` and
+  stops transforming JSX, which breaks the UI vitest suite (`columns.test.ts`)
+  without it. Not a dependency bump — a test-config fix kept here so the
+  vitest-4.1.x story stays in one place.
+- `0004-security-pin-flatted-3.4.0-3.4.2-in-tests-integratio.patch` — pins
+  `flatted` 3.4.0 → 3.4.2 in `tests/integrations/typescript` via an npm
+  `overrides` entry (closes CVE-2026-33228, prototype pollution via `parse()`).
+  `flatted` is pulled transitively by `@vitest/ui`; the override dedupes the
+  nested 3.4.0 copy to the patched 3.4.2.

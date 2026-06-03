@@ -95,6 +95,7 @@ videos/
 
 # Coverage
 coverage/
+coverage_out/
 
 # Build output
 dist/

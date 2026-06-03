@@ -85,3 +85,88 @@ release-bifrost-aigw:
     SERVICE_NAME: bifrost-aigw
   stage: release
   extends: .release-job
+
+# =============================================================================
+# Unit / component tests + coverage (against the F5XC-patched tree)
+#
+# - test-go: applies the f5xc-patches overlay and sets up the Go workspace
+#   (via `make cmd-unittest`, which depends on apply-patches +
+#   cmd-setup-workspace-ci), then runs the DETERMINISTIC unit packages across
+#   core, framework, all plugins, the bifrost-http transport and CLI -- INCLUDING
+#   the tests the patchz-tests series adds (governance + handlers). Live-
+#   integration suites that need provider keys or running services
+#   (Redis/Weaviate/Qdrant/MCP) are excluded via GO_COVER_EXCLUDE; run those
+#   locally with `make test-*` + $(EXPOSE_ENV). Emits per-module JUnit + a merged
+#   total coverage % (coverage regex) + a Cobertura report for the MR diff.
+# - test-ui: the React UI vitest suite (JUnit only; UI coverage intentionally dropped).
+#
+# Integration / e2e suites (Python + TS integration, Playwright, provider/CLI
+# harnesses) are NOT wired here: they need live provider credentials and a
+# running gateway. Add them as credential-gated jobs when those secrets exist.
+# =============================================================================
+.unit-test-rules: &unit-test-rules
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+    when: never
+  - if: $CI_COMMIT_BRANCH
+
+test-go:
+  stage: test
+  # Internal kubernetes runner: it can pull the private volterra.azurecr.io
+  # go-builder image and authenticate module fetches. The public SaaS
+  # docker+machine runner cannot reach the ACR.
+  tags: [kubernetes]
+  image: $GO_BUILDER_IMAGE
+  interruptible: true
+  variables:
+    # framework/configstore tests use gorm's sqlite driver (mattn/go-sqlite3 -> cgo)
+    CGO_ENABLED: "1"
+    GOTOOLCHAIN: auto
+    GOPRIVATE: gopkg.volterra.us
+  before_script:
+    # Authenticate go module fetches against gitlab.com (private deps) via the CI job token.
+    - echo "machine gitlab.com login gitlab-ci-token password ${CI_JOB_TOKEN}" > ~/.netrc
+    - yum install -y sqlite-devel
+    - export PATH="$PATH:$(go env GOPATH)/bin"
+  script:
+    # cmd-unittest applies the patch overlay + sets up go.work, then runs all
+    # module tests (incl. patchz-tests) against the patched tree, writing
+    # per-module coverage_out/*-bl profiles. coverage-all-bl merges them into
+    # coverage_out/{coverage.html,cover-all-bl,coverage.cobertura.xml} and prints
+    # the total %. We always build the report (even on test failure) but exit
+    # with the test result so a failing test still reds the job.
+    - |
+      make cmd-unittest || UNIT_FAILED=1
+      make coverage-all-bl
+      test -z "$UNIT_FAILED"
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - test-reports/
+      - coverage_out/
+    reports:
+      junit: test-reports/*.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage_out/coverage.cobertura.xml
+  rules: *unit-test-rules
+
+test-ui:
+  stage: test
+  image: node:22
+  interruptible: true
+  before_script:
+    - cd ui
+    - npm ci
+  script:
+    - npx vitest run --reporter=default --reporter=junit --outputFile=../test-reports/ui.xml
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - test-reports/ui.xml
+    reports:
+      junit: test-reports/ui.xml
+  rules: *unit-test-rules
