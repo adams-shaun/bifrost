@@ -9,6 +9,17 @@ LOG_STYLE ?= json
 LOG_LEVEL ?= info
 TEST_REPORTS_DIR ?= test-reports
 GOTESTSUM_FORMAT ?= standard-verbose
+COVERAGE_DIR ?= coverage_out
+# Go module roots covered by `make cmd-unittest` (mirrors the test-all scope):
+# core, framework, every plugins/* module, the bifrost-http transport, and the CLI.
+GO_COVER_MODULES ?= core framework $(patsubst %/,%,$(dir $(wildcard plugins/*/go.mod))) transports/bifrost-http cli
+# Packages EXCLUDED from `make cmd-unittest`: live-integration suites that need
+# provider API keys or running services (Redis/Weaviate/Qdrant/MCP servers).
+# The CI test stage runs without those secrets; run them locally via the
+# `make test-*` targets with $(EXPOSE_ENV). The transports/bifrost-http ROOT
+# package is excluded for its service-dependent TestMain; its /handlers and /lib
+# subpackages (including the F5XC patch tests) still run.
+GO_COVER_EXCLUDE ?= /core/providers/|/core/internal/llmtests|/core/internal/mcptests|/framework/vectorstore|/transports/bifrost-http$$
 FLOW ?=
 VERSION ?= dev-build
 LOCAL ?=
@@ -66,7 +77,7 @@ define EXPOSE_ENV
 	fi
 endef
 
-.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner
+.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches cmd-unittest coverage-all-bl
 
 all: help
 
@@ -305,7 +316,40 @@ build-ui: install-ui ## Build ui
 	@rm -rf ui/.next
 	@$(USE_NODE); cd ui && npm run build && npm run copy-build
 
-build: build-ui ## Build bifrost-http binary
+# Patch series live at f5xc-patches/<patchN>/<series>/.
+# The patchN/ wrapper dir gives explicit ordering (patch1 before patch2);
+# each patchN holds exactly one series with its own apply.sh.
+#
+# Glob anchors on apply.sh so directories that intentionally do NOT carry
+# one (e.g. f5xc-patches/security/, which holds always-on base-source
+# reference patches that must NOT be applied at build time) are skipped.
+F5XC_PATCH_SERIES := $(sort $(dir $(wildcard f5xc-patches/*/*/apply.sh)))
+F5XC_PATCH_MARKER := f5xc-patches/.applied
+
+apply-patches: $(F5XC_PATCH_MARKER) ## Apply F5XC patch overlays onto vendored bifrost source
+
+$(F5XC_PATCH_MARKER):
+	@$(ECHO) "$(GREEN)╔═══════════════════════════════════════════════╗$(NC)"
+	@$(ECHO) "$(GREEN)║  Applying F5XC patch overlays...              ║$(NC)"
+	@$(ECHO) "$(GREEN)╚═══════════════════════════════════════════════╝$(NC)"
+	@set -e; for d in $(F5XC_PATCH_SERIES); do \
+		echo "==> $$d"; \
+		bash $${d}apply.sh; \
+	done
+	@touch $(F5XC_PATCH_MARKER)
+
+clean-patches: ## Reverse F5XC patch overlays (restore vanilla source)
+	@if [ -f $(F5XC_PATCH_MARKER) ]; then \
+		set -e; for d in $$(ls -r -d $(F5XC_PATCH_SERIES)); do \
+			for p in $$(ls -r $${d}patches/*.patch); do \
+				echo "    - Reversing $$(basename $$p)"; \
+				git apply -R --whitespace=nowarn $$p; \
+			done; \
+		done; \
+		rm -f $(F5XC_PATCH_MARKER); \
+	fi
+
+build: apply-patches build-ui ## Build bifrost-http binary
 	@if [ -n "$(LOCAL)" ]; then \
 		$(ECHO) "$(GREEN)╔═══════════════════════════════════════════════╗$(NC)"; \
 		$(ECHO) "$(GREEN)║  Building bifrost-http with local go.work...  ║$(NC)"; \
@@ -459,7 +503,7 @@ run-cli: build-cli ## Run bifrost CLI (Usage: make run-cli [ARGS="--config ~/.bi
 	@$(ECHO) "$(GREEN)Running bifrost CLI...$(NC)"
 	@./tmp/bifrost $(ARGS)
 
-clean: ## Clean build artifacts and temporary files
+clean: clean-patches ## Clean build artifacts and temporary files (also reverses F5XC patch overlays)
 	@$(ECHO) "$(YELLOW)Cleaning build artifacts...$(NC)"
 	@rm -rf tmp/
 	@rm -f transports/bifrost-http/build-errors.log
@@ -494,10 +538,10 @@ generate-html-reports: ## Convert existing XML reports to HTML
 	@$(ECHO) "$(CYAN)View reports:$(NC)"
 	@ls -1 $(TEST_REPORTS_DIR)/*.html 2>/dev/null | sed 's|$(TEST_REPORTS_DIR)/|  open $(TEST_REPORTS_DIR)/|' || true
 
-test: install-gotestsum ## Run tests for bifrost-http
+test: apply-patches install-gotestsum ## Run tests for bifrost-http
 	@$(ECHO) "$(GREEN)Running bifrost-http tests...$(NC)"
 	@mkdir -p $(TEST_REPORTS_DIR)
-	@cd transports/bifrost-http && GOWORK=off gotestsum \
+	@cd transports/bifrost-http && $(if $(LOCAL),,GOWORK=off) gotestsum \
 		--format=$(GOTESTSUM_FORMAT) \
 		--junitfile=../../$(TEST_REPORTS_DIR)/bifrost-http.xml \
 		-- -v ./...
@@ -522,7 +566,7 @@ test: install-gotestsum ## Run tests for bifrost-http
 		$(ECHO) "$(CYAN)JUnit XML report: $(TEST_REPORTS_DIR)/bifrost-http.xml$(NC)"; \
 	fi
 
-test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usage: make test-core PROVIDER=openai TESTCASE=TestName or PATTERN=substring, DEBUG=1 for debugger)
+test-core: apply-patches install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usage: make test-core PROVIDER=openai TESTCASE=TestName or PATTERN=substring, DEBUG=1 for debugger)
 	@$(EXPOSE_ENV); \
 	$(ECHO) "$(GREEN)Running core tests...$(NC)"; \
 	mkdir -p $(TEST_REPORTS_DIR); \
@@ -556,9 +600,9 @@ test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usa
 			$(ECHO) "$(CYAN)Running Test$${PROVIDER_TEST_NAME}/$${PROVIDER_TEST_NAME}Tests/$$CLEAN_TESTCASE...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/core-$(PROVIDER)-$$(echo $$CLEAN_TESTCASE | sed 's|/|_|g').xml"; \
 			if [ -n "$(DEBUG)" ]; then \
-				cd core/providers/$(PROVIDER) && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^Test$${PROVIDER_TEST_NAME}$$/.*Tests/$$CLEAN_TESTCASE$$" || TEST_FAILED=1; \
+				cd core/providers/$(PROVIDER) && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^Test$${PROVIDER_TEST_NAME}$$/.*Tests/$$CLEAN_TESTCASE$$" || TEST_FAILED=1; \
 			else \
-				cd core/providers/$(PROVIDER) && GOWORK=off gotestsum \
+				cd core/providers/$(PROVIDER) && $(if $(LOCAL),,GOWORK=off) gotestsum \
 					--format=$(GOTESTSUM_FORMAT) \
 					--junitfile=../../../$$REPORT_FILE \
 					-- -v -timeout 20m -run "^Test$${PROVIDER_TEST_NAME}$$/.*Tests/$$CLEAN_TESTCASE$$" || TEST_FAILED=1; \
@@ -584,9 +628,9 @@ test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usa
 			$(ECHO) "$(CYAN)Running tests matching '$(PATTERN)' for $${PROVIDER_TEST_NAME}...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/core-$(PROVIDER)-$(PATTERN).xml"; \
 			if [ -n "$(DEBUG)" ]; then \
-				cd core/providers/$(PROVIDER) && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
+				cd core/providers/$(PROVIDER) && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
 			else \
-				cd core/providers/$(PROVIDER) && GOWORK=off gotestsum \
+				cd core/providers/$(PROVIDER) && $(if $(LOCAL),,GOWORK=off) gotestsum \
 					--format=$(GOTESTSUM_FORMAT) \
 					--junitfile=../../../$$REPORT_FILE \
 					-- -v -timeout 20m -run ".*$(PATTERN).*" || TEST_FAILED=1; \
@@ -612,9 +656,9 @@ test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usa
 			$(ECHO) "$(CYAN)Running Test$${PROVIDER_TEST_NAME}...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/core-$(PROVIDER).xml"; \
 			if [ -n "$(DEBUG)" ]; then \
-				cd core/providers/$(PROVIDER) && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^Test$${PROVIDER_TEST_NAME}$$" || TEST_FAILED=1; \
+				cd core/providers/$(PROVIDER) && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^Test$${PROVIDER_TEST_NAME}$$" || TEST_FAILED=1; \
 			else \
-				cd core/providers/$(PROVIDER) && GOWORK=off gotestsum \
+				cd core/providers/$(PROVIDER) && $(if $(LOCAL),,GOWORK=off) gotestsum \
 					--format=$(GOTESTSUM_FORMAT) \
 					--junitfile=../../../$$REPORT_FILE \
 					-- -v -timeout 20m -run "^Test$${PROVIDER_TEST_NAME}$$" || TEST_FAILED=1; \
@@ -647,9 +691,9 @@ test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usa
 			$(ECHO) "$(CYAN)Running tests matching '$(PATTERN)' across all providers...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/core-all-$(PATTERN).xml"; \
 			if [ -n "$(DEBUG)" ]; then \
-				cd core && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 ./providers/... -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
+				cd core && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 ./providers/... -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
 			else \
-				cd core && GOWORK=off gotestsum \
+				cd core && $(if $(LOCAL),,GOWORK=off) gotestsum \
 					--format=$(GOTESTSUM_FORMAT) \
 					--junitfile=../$$REPORT_FILE \
 					-- -v -timeout 20m -run ".*$(PATTERN).*" ./providers/... || TEST_FAILED=1; \
@@ -657,9 +701,9 @@ test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usa
 		else \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/core-all.xml"; \
 			if [ -n "$(DEBUG)" ]; then \
-				cd core && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 ./providers/... -- -test.v || TEST_FAILED=1; \
+				cd core && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 ./providers/... -- -test.v || TEST_FAILED=1; \
 			else \
-				cd core && GOWORK=off gotestsum \
+				cd core && $(if $(LOCAL),,GOWORK=off) gotestsum \
 					--format=$(GOTESTSUM_FORMAT) \
 					--junitfile=../$$REPORT_FILE \
 					-- -v ./providers/... || TEST_FAILED=1; \
@@ -748,7 +792,7 @@ cleanup-junit-xml: ## Internal: Clean up JUnit XML to remove parent test cases w
 		fi; \
 	fi
 
-test-plugins: install-gotestsum ## Run plugin tests
+test-plugins: apply-patches install-gotestsum ## Run plugin tests
 	@$(EXPOSE_ENV); \
 	$(ECHO) "$(GREEN)Running plugin tests...$(NC)"; \
 	mkdir -p $(TEST_REPORTS_DIR); \
@@ -756,10 +800,10 @@ test-plugins: install-gotestsum ## Run plugin tests
 		for dir in $$(find . -name "*_test.go" -exec dirname {} \; | sort -u); do \
 			plugin_name=$$(echo $$dir | sed 's|^\./||' | sed 's|/|-|g'); \
 			$(ECHO) "Testing $$dir..."; \
-			cd $$dir && gotestsum \
+			( cd $$dir && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../$(TEST_REPORTS_DIR)/plugin-$$plugin_name.xml \
-				-- -v ./... && cd - > /dev/null; \
+				-- -v ./... ) || true; \
 			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
 				if which junit-viewer > /dev/null 2>&1; then \
 					$(ECHO) "$(YELLOW)Generating HTML report for $$plugin_name...$(NC)"; \
@@ -774,7 +818,7 @@ test-plugins: install-gotestsum ## Run plugin tests
 		$(ECHO) "$(CYAN)JUnit XML reports saved to $(TEST_REPORTS_DIR)/plugin-*.xml$(NC)"; \
 	fi
 
-test-framework: install-gotestsum ## Run framework tests
+test-framework: apply-patches install-gotestsum ## Run framework tests
 	@$(EXPOSE_ENV); \
 	$(ECHO) "$(GREEN)Running framework tests...$(NC)"; \
 	mkdir -p $(TEST_REPORTS_DIR); \
@@ -800,7 +844,7 @@ test-framework: install-gotestsum ## Run framework tests
 		$(ECHO) "$(CYAN)JUnit XML reports saved to $(TEST_REPORTS_DIR)/framework-*.xml$(NC)"; \
 	fi
 
-test-http-transport: install-gotestsum ## Run HTTP transport tests
+test-http-transport: apply-patches install-gotestsum ## Run HTTP transport tests
 	@$(EXPOSE_ENV); \
 	$(ECHO) "$(GREEN)Running HTTP transport tests...$(NC)"; \
 	mkdir -p $(TEST_REPORTS_DIR); \
@@ -826,7 +870,7 @@ test-http-transport: install-gotestsum ## Run HTTP transport tests
 		$(ECHO) "$(CYAN)JUnit XML reports saved to $(TEST_REPORTS_DIR)/http-transport-*.xml$(NC)"; \
 	fi
 
-test-governance: install-gotestsum $(if $(DEBUG),install-delve) ## Run governance tests (Usage: make test-governance TESTCASE=TestName or PATTERN=substring, DEBUG=1 for debugger)
+test-governance: apply-patches install-gotestsum $(if $(DEBUG),install-delve) ## Run governance tests (Usage: make test-governance TESTCASE=TestName or PATTERN=substring, DEBUG=1 for debugger)
 	@$(EXPOSE_ENV); \
 	$(ECHO) "$(GREEN)Running governance tests...$(NC)"; \
 	mkdir -p $(TEST_REPORTS_DIR); \
@@ -849,9 +893,9 @@ test-governance: install-gotestsum $(if $(DEBUG),install-delve) ## Run governanc
 		$(ECHO) "$(CYAN)Running test case: $(TESTCASE)$(NC)"; \
 		REPORT_FILE="$(TEST_REPORTS_DIR)/governance-$$(echo $(TESTCASE) | sed 's|/|_|g').xml"; \
 		if [ -n "$(DEBUG)" ]; then \
-			cd tests/governance && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^$(TESTCASE)$$" || TEST_FAILED=1; \
+			cd tests/governance && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^$(TESTCASE)$$" || TEST_FAILED=1; \
 		else \
-			cd tests/governance && GOWORK=off gotestsum \
+			cd tests/governance && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../$$REPORT_FILE \
 				-- -v -run "^$(TESTCASE)$$" || TEST_FAILED=1; \
@@ -877,9 +921,9 @@ test-governance: install-gotestsum $(if $(DEBUG),install-delve) ## Run governanc
 		$(ECHO) "$(CYAN)Running tests matching '$(PATTERN)'...$(NC)"; \
 		REPORT_FILE="$(TEST_REPORTS_DIR)/governance-$(PATTERN).xml"; \
 		if [ -n "$(DEBUG)" ]; then \
-			cd tests/governance && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
+			cd tests/governance && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
 		else \
-			cd tests/governance && GOWORK=off gotestsum \
+			cd tests/governance && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../$$REPORT_FILE \
 				-- -v -run ".*$(PATTERN).*" || TEST_FAILED=1; \
@@ -905,9 +949,9 @@ test-governance: install-gotestsum $(if $(DEBUG),install-delve) ## Run governanc
 		$(ECHO) "$(CYAN)Running all governance tests...$(NC)"; \
 		REPORT_FILE="$(TEST_REPORTS_DIR)/governance-all.xml"; \
 		if [ -n "$(DEBUG)" ]; then \
-			cd tests/governance && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v || TEST_FAILED=1; \
+			cd tests/governance && $(if $(LOCAL),,GOWORK=off) dlv test --headless --listen=:2345 --api-version=2 -- -test.v || TEST_FAILED=1; \
 		else \
-			cd tests/governance && GOWORK=off gotestsum \
+			cd tests/governance && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../$$REPORT_FILE \
 				-- -v || TEST_FAILED=1; \
@@ -1031,7 +1075,7 @@ test-mcp: install-gotestsum setup-mcp-tests ## Run MCP tests (Usage: make test-m
 			$(ECHO) "$(CYAN)Running $(TYPE) test: $(TESTCASE)...$(NC)"; \
 			SAFE_TESTCASE=$$($(ECHO) "$(TESTCASE)" | sed 's|/|_|g'); \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-$(TYPE)-$$SAFE_TESTCASE.xml"; \
-			cd core/internal/mcptests && GOWORK=off gotestsum \
+			cd core/internal/mcptests && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../../$$REPORT_FILE \
 				-- -v -race -run "^$(TESTCASE)$$" . || TEST_FAILED=1; \
@@ -1039,14 +1083,14 @@ test-mcp: install-gotestsum setup-mcp-tests ## Run MCP tests (Usage: make test-m
 			$(ECHO) "$(CYAN)Running $(TYPE) tests matching '$(PATTERN)'...$(NC)"; \
 			SAFE_PATTERN=$$($(ECHO) "$(PATTERN)" | sed 's|/|_|g'); \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-$(TYPE)-$$SAFE_PATTERN.xml"; \
-			cd core/internal/mcptests && GOWORK=off gotestsum \
+			cd core/internal/mcptests && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../../$$REPORT_FILE \
 				-- -v -race -run ".*$(PATTERN).*" . || TEST_FAILED=1; \
 		else \
 			$(ECHO) "$(CYAN)Running all $(TYPE) tests (pattern: $$TEST_PATTERN)...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-$(TYPE).xml"; \
-			cd core/internal/mcptests && GOWORK=off gotestsum \
+			cd core/internal/mcptests && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../../$$REPORT_FILE \
 				-- -v -race -run "$$TEST_PATTERN" . || TEST_FAILED=1; \
@@ -1071,21 +1115,21 @@ test-mcp: install-gotestsum setup-mcp-tests ## Run MCP tests (Usage: make test-m
 		if [ -n "$(TESTCASE)" ]; then \
 			$(ECHO) "$(CYAN)Running test case: $(TESTCASE) across all MCP tests...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-all-$(TESTCASE).xml"; \
-			cd core/internal/mcptests && GOWORK=off gotestsum \
+			cd core/internal/mcptests && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../../$$REPORT_FILE \
 				-- -v -race -run "^$(TESTCASE)$$" || TEST_FAILED=1; \
 		elif [ -n "$(PATTERN)" ]; then \
 			$(ECHO) "$(CYAN)Running tests matching '$(PATTERN)' across all MCP tests...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-all-$(PATTERN).xml"; \
-			cd core/internal/mcptests && GOWORK=off gotestsum \
+			cd core/internal/mcptests && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../../$$REPORT_FILE \
 				-- -v -race -run ".*$(PATTERN).*" || TEST_FAILED=1; \
 		else \
 			$(ECHO) "$(CYAN)Running all MCP tests...$(NC)"; \
 			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-all.xml"; \
-			cd core/internal/mcptests && GOWORK=off gotestsum \
+			cd core/internal/mcptests && $(if $(LOCAL),,GOWORK=off) gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
 				--junitfile=../../../$$REPORT_FILE \
 				-- -v -race || TEST_FAILED=1; \
@@ -1620,10 +1664,10 @@ mod-tidy: ## Run go mod tidy on modules (Usage: make mod-tidy [MODULE=all|cli|co
 	@$(ECHO) ""
 	@$(ECHO) "$(GREEN)✓ go mod tidy complete$(NC)"
 
-test-cli: install-gotestsum ## Run CLI tests
+test-cli: apply-patches install-gotestsum ## Run CLI tests
 	@$(ECHO) "$(GREEN)Running CLI tests...$(NC)"
 	@mkdir -p $(TEST_REPORTS_DIR)
-	@cd cli && GOWORK=off gotestsum \
+	@cd cli && $(if $(LOCAL),,GOWORK=off) gotestsum \
 		--format=$(GOTESTSUM_FORMAT) \
 		--junitfile=../$(TEST_REPORTS_DIR)/cli.xml \
 		-- ./...
@@ -2035,7 +2079,46 @@ cmd-setup-workspace-ci: ## Set up Go workspace for CI builds (resolves local mod
 	@go work sync
 	@$(ECHO) "$(GREEN)Go workspace ready$(NC)"
 
-cmd-build-bifrost-aigw: cmd-setup-workspace-ci ## Build bifrost-aigw binary for enterprise CI
+cmd-unittest: cmd-setup-workspace-ci apply-patches install-gotestsum ## Run deterministic (no-network) Go unit tests against the F5XC-patched tree (go.work); writes per-module coverage_out/coverage-<mod>-bl profiles + JUnit. Pair with `coverage-all-bl`.
+	@mkdir -p $(TEST_REPORTS_DIR) $(COVERAGE_DIR)
+	@# Patches are applied (apply-patches) and the workspace is set up
+	@# (cmd-setup-workspace-ci) so each module resolves the local, patched
+	@# sibling modules. We deliberately do NOT set GOWORK=off here: the patched
+	@# governance/transports code depends on the patched local framework
+	@# (e.g. TableUser), which only resolves through go.work.
+	@# Per module we test only the packages that survive GO_COVER_EXCLUDE, i.e.
+	@# we drop the live-integration suites that need credentials/services (see the
+	@# GO_COVER_EXCLUDE comment). Those are run locally via `make test-*`.
+	@# `go list -e` tolerates load errors so one bad package doesn't blank the
+	@# whole module list -- notably the bifrost-http ROOT package, whose
+	@# `//go:embed all:ui` fails until the UI is built; we exclude that root
+	@# anyway and still test /handlers (the patch tests), /lib, etc.
+	@# Each module's profile lands at coverage_out/coverage-<mod>-bl ("bl" =
+	@# business logic); `make coverage-all-bl` gocovmerges them into one report.
+	@fail=0; \
+	for mod in $(GO_COVER_MODULES); do \
+		name=$$(echo $$mod | sed 's#/#-#g'); \
+		pkgs=$$(cd $$mod && go list -e ./... 2>/dev/null | grep -vE "$(GO_COVER_EXCLUDE)"); \
+		if [ -z "$$pkgs" ]; then $(ECHO) "$(YELLOW)>>> $$mod: no unit packages after exclude, skipping$(NC)"; continue; fi; \
+		$(ECHO) "$(GREEN)>>> unittest: $$mod$(NC)"; \
+		( cd $$mod && gotestsum --format=$(GOTESTSUM_FORMAT) \
+			--junitfile=$(CURDIR)/$(TEST_REPORTS_DIR)/coverage-$$name.xml \
+			-- -covermode=atomic -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/coverage-$$name-bl $$pkgs ) || fail=1; \
+	done; \
+	exit $$fail
+
+coverage-all-bl: ## Merge cmd-unittest per-module profiles -> coverage_out/coverage.html + Cobertura + total %
+	@command -v gocovmerge >/dev/null 2>&1 || go install github.com/wadey/gocovmerge@latest
+	@command -v gocover-cobertura >/dev/null 2>&1 || go install github.com/boumenot/gocover-cobertura@latest
+	@$(ECHO) "$(GREEN)>>> Merge coverage for all packages >>>$(NC)"
+	@ls -ltr $(COVERAGE_DIR)/*-bl 2>/dev/null || { $(ECHO) "$(RED)no -bl coverage profiles in $(COVERAGE_DIR)/ (run cmd-unittest first)$(NC)"; exit 1; }
+	gocovmerge $(COVERAGE_DIR)/*-bl > $(COVERAGE_DIR)/cover-all-bl
+	go tool cover -html=$(COVERAGE_DIR)/cover-all-bl -o $(COVERAGE_DIR)/coverage.html
+	gocover-cobertura < $(COVERAGE_DIR)/cover-all-bl > $(COVERAGE_DIR)/coverage.cobertura.xml || $(ECHO) "$(YELLOW)cobertura generation skipped$(NC)"
+	go tool cover -func $(COVERAGE_DIR)/cover-all-bl | tail -1
+
+
+cmd-build-bifrost-aigw: cmd-setup-workspace-ci apply-patches ## Build bifrost-aigw binary for CI (applies F5XC patches in-place)
 	@$(ECHO) "$(GREEN)Building bifrost-aigw binary...$(NC)"
 	@mkdir -p transports/bifrost-http/ui && echo '<!-- placeholder -->' > transports/bifrost-http/ui/.keep
 	@mkdir -p "$(GOBIN_OUT)"
