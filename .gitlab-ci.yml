@@ -101,8 +101,6 @@ k8s-test-api-sanity:
   - echo "${GLOBAL_PRIVATE_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PRIVATE_REGISTRY_USERNAME}" --password-stdin "${GLOBAL_PRIVATE_REGISTRY_SERVER}"
   - go version && docker version
   - docker ps --filter "ancestor=kindest/node" --format "{{.Names}} {{.Ports}}" || true
-  # Pre-fetch the pinned SDK so go.sum is complete for the (readonly) test build.
-  - (cd tests/k8s && GOWORK=off GOFLAGS=-mod=mod go mod download)
   script:
   # `make test` builds the patched image, deploys deps + serelib-rendered
   # bifrost, and runs TestAPISanity. The serelib render image is pulled from
