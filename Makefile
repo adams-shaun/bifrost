@@ -2164,7 +2164,7 @@ K8S_IMAGE_TAG  ?= local-test
 test-k8s-image: ## Build bifrost:local-test for the k8s e2e fixtures (from F5XC-patched source)
 	@$(ECHO) "$(BLUE)Building $(K8S_IMAGE_REPO):$(K8S_IMAGE_TAG) from transports/Dockerfile.local (F5XC-patched source)$(NC)"
 	@if [ -f $(F5XC_PATCH_MARKER) ]; then APPLIED_BY_ME=0; else APPLIED_BY_ME=1; $(MAKE) apply-patches; fi; \
-	DOCKER_BUILDKIT=1 docker build -f transports/Dockerfile.local \
+	DOCKER_BUILDKIT=0 docker build -f transports/Dockerfile.local \
 		-t $(K8S_IMAGE_REPO):$(K8S_IMAGE_TAG) \
 		--build-arg VERSION=$(K8S_IMAGE_TAG) . ; \
 	rc=$$?; \
