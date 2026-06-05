@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-mcp
+  labels:
+    app: mock-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-mcp
+  template:
+    metadata:
+      labels:
+        app: mock-mcp
+    spec:
+      containers:
+        - name: mock-mcp
+          image: {{ .Values.mockmcp.image | quote }}
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: mock-mcp
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http

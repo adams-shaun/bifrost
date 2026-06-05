@@ -68,7 +68,7 @@ func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	// 0. Images: bifrost (patched, local), mock-llm (local), postgres base.
+	// 0. Images: bifrost (patched, local), mock-llm + mock-mcp (local), postgres base.
 	bifrostRef := BuildLocalImage(t, defaultImageRepo, defaultImageTag)
 	c.LoadImage(t, bifrostRef)
 	mockRef, err := buildMockLLMImage(t)
@@ -76,6 +76,11 @@ func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
 		t.Fatalf("build mock-llm: %v", err)
 	}
 	c.LoadImage(t, mockRef)
+	mcpRef, err := buildMockMCPImage(t)
+	if err != nil {
+		t.Fatalf("build mock-mcp: %v", err)
+	}
+	c.LoadImage(t, mcpRef)
 	c.LoadExternalImagesParallel(t, []string{"postgres:16-alpine"})
 
 	if err := bf.ensureNamespace(ctx); err != nil {

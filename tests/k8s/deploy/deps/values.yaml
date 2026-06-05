@@ -10,3 +10,6 @@ postgres:
 mockllm:
   # Built locally (tests/k8s/fixtures/mockllm) and kind-loaded; never pulled.
   image: bifrost-mockllm:local-test
+mockmcp:
+  # Streamable-HTTP mock MCP server (tests/k8s/fixtures/mockmcp); kind-loaded.
+  image: bifrost-mockmcp:local-test
