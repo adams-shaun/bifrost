@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bifrost-config
+data:
+  config.json: |
+    {
+      "$schema": "https://www.getbifrost.ai/schema",
+      "client": {
+        "allowed_origins": ["*"],
+        "enable_logging": true,
+        "enforce_auth_on_inference": true,
+        "initial_pool_size": 300
+      },
+      "config_store": {
+        "enabled": true,
+        "type": "postgres",
+        "config": {
+          "host": "{{ .postgres_host }}",
+          "port": "{{ .postgres_port }}",
+          "db_name": "{{ .postgres_db }}",
+          "user": "{{ .postgres_user }}",
+          "password": "{{ .postgres_password }}",
+          "ssl_mode": "disable"
+        }
+      },
+      "logs_store": {
+        "enabled": true,
+        "type": "postgres",
+        "config": {
+          "host": "{{ .postgres_host }}",
+          "port": "{{ .postgres_port }}",
+          "db_name": "{{ .postgres_db }}",
+          "user": "{{ .postgres_user }}",
+          "password": "{{ .postgres_password }}",
+          "ssl_mode": "disable"
+        }
+      },
+      "framework": {
+        "pricing": {
+          "pricing_url": "{{ .mockllm_url }}/datasheet",
+          "model_parameters_url": "{{ .mockllm_url }}/datasheet/model-parameters",
+          "pricing_sync_interval": 86400
+        }
+      },
+      "plugins": [
+        {"enabled": true, "name": "telemetry", "version": 1, "config": {}},
+        {"enabled": true, "name": "logging", "version": 1, "config": {"disable_content_logging": false}},
+        {"enabled": true, "name": "governance", "version": 1, "config": {"is_enterprise": false, "is_vk_mandatory": false}}
+      ]
+    }

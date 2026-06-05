@@ -1,0 +1,10 @@
+# serelib render context for the test bifrost deployment. Values resolve to the
+# umbrella deps chart's in-namespace services (short DNS names). Static — the
+# deployment is namespace-agnostic (applied with `kubectl apply -n <ns>`).
+bifrost_image: "bifrost:local-test"
+postgres_host: "bifrost-postgresql"
+postgres_port: "5432"
+postgres_db: "bifrost"
+postgres_user: "bifrost"
+postgres_password: "bifrost-test"
+mockllm_url: "http://mock-llm:8000"

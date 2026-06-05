@@ -25,6 +25,9 @@ variables:
   IS_PUBLIC: "true"
   GO_BUILDER_IMAGE: volterra.azurecr.io/ves.io/go-builder:v2.6.0
   GOTOOLCHAIN: auto
+  # Fetch gopkg.volterra.us modules directly via git (with the CI_JOB_TOKEN
+  # netrc) instead of the public proxy/sumdb.
+  GOPRIVATE: gopkg.volterra.us
   REGISTRY_SERVER: volterra.azurecr.io
   APP_TEMPLATE: bifrost-aigw
 
@@ -66,6 +69,57 @@ build-bifrost-aigw:
     BUILD_COMMENT="$(date -Iseconds) ${GITLAB_USER_LOGIN} ${CI_JOB_ID}"
   # Verify SHA is embedded in the binary
   - strings build_out/bifrost-aigw | grep "${CI_COMMIT_SHA}"
+
+# ---------------------------------------------------------------------------
+# Kubernetes API-sanity integration test (kind-based, tests/k8s harness).
+#
+# Base image bundles docker / kind / kubectl / helm / go (same family as
+# gubernator's integration-test job); runs on the shared-docker-daemon
+# [kubernetes] runners. The harness uses a FIXED kind cluster name
+# ("bifrost-test"), so the job is serialized via resource_group and tears down
+# every kind cluster in after_script to avoid cross-pipeline collisions.
+#
+# It builds bifrost:local-test (F5XC-patched), helm-installs postgres + mock-llm,
+# renders bifrost via serelib (serectl render) and kubectl-applies it, then
+# creates one of each governance API entity via the go-bifrost-ai SDK.
+#
+# OPTIONAL: when:manual (opt-in to run) + allow_failure:true (never blocks the
+# pipeline). No artifacts, no coverage.
+# ---------------------------------------------------------------------------
+k8s-test-api-sanity:
+  stage: test
+  tags: [kubernetes]
+  image: volterra.azurecr.io/ves.io/go-builder-ci-int-test@sha256:5b7d459136273bdaa41d69d6fccd101b95d48e55333212fef8f853b08f2eca71
+  resource_group: k8s-int-test
+  timeout: 1h
+  before_script:
+  # CI_JOB_TOKEN netrc lets `go` fetch the private gopkg.volterra.us SDK
+  # (go-bifrost-ai pinned pseudo-version) and complete go.sum before `go test`.
+  - echo "machine gitlab.com login gitlab-ci-token password ${CI_JOB_TOKEN}" > ~/.netrc
+  - mkdir -p "${GOMODCACHE:-/go/pkg/mod}"
+  - echo "${GLOBAL_PUBLIC_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PUBLIC_REGISTRY_USERNAME}" --password-stdin gcr.io
+  - echo "${GLOBAL_PRIVATE_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PRIVATE_REGISTRY_USERNAME}" --password-stdin "${GLOBAL_PRIVATE_REGISTRY_SERVER}"
+  - go version && docker version
+  - docker ps --filter "ancestor=kindest/node" --format "{{.Names}} {{.Ports}}" || true
+  # Pre-fetch the pinned SDK so go.sum is complete for the (readonly) test build.
+  - (cd tests/k8s && GOWORK=off GOFLAGS=-mod=mod go mod download)
+  script:
+  # `make test` builds the patched image, deploys deps + serelib-rendered
+  # bifrost, and runs TestAPISanity. The serelib render image is pulled from
+  # Azure CR (logged in above).
+  - make -C tests/k8s test TIMEOUT=30m
+  after_script:
+  # Shared docker daemon: ONLY tear down OUR cluster ("bifrost-test"). Never
+  # touch other clusters/containers — concurrent pipelines from other projects
+  # (e.g. nats-test) share this runner.
+  - command -v kind >/dev/null 2>&1 && kind delete cluster --name bifrost-test || true
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    when: manual
+    allow_failure: true
+  - if: $CI_COMMIT_BRANCH == "vesdev"
+    when: manual
+    allow_failure: true
 
 container-bifrost-aigw:
   variables:

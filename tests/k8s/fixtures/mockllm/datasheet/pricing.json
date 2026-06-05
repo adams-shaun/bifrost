@@ -1,0 +1,87 @@
+{
+  "openai/gpt-4o": {
+    "provider": "openai", "base_model": "gpt-4o", "mode": "chat",
+    "input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001,
+    "max_input_tokens": 128000, "max_output_tokens": 16384,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "openai/gpt-4o-mini": {
+    "provider": "openai", "base_model": "gpt-4o-mini", "mode": "chat",
+    "input_cost_per_token": 0.00000015, "output_cost_per_token": 0.0000006,
+    "max_input_tokens": 128000, "max_output_tokens": 16384,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "openai/gpt-4-turbo": {
+    "provider": "openai", "base_model": "gpt-4-turbo", "mode": "chat",
+    "input_cost_per_token": 0.00001, "output_cost_per_token": 0.00003,
+    "max_input_tokens": 128000, "max_output_tokens": 4096,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "openai/gpt-4o-mock": {
+    "provider": "openai", "base_model": "gpt-4o-mock", "mode": "chat",
+    "input_cost_per_token": 0, "output_cost_per_token": 0,
+    "max_input_tokens": 128000, "max_output_tokens": 16384,
+    "supports_function_calling": true
+  },
+  "anthropic/claude-3-5-sonnet-20241022": {
+    "provider": "anthropic", "base_model": "claude-3-5-sonnet-20241022", "mode": "chat",
+    "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015,
+    "cache_creation_input_token_cost": 0.00000375, "cache_read_input_token_cost": 0.0000003,
+    "max_input_tokens": 200000, "max_output_tokens": 8192,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "anthropic/claude-3-5-haiku-20241022": {
+    "provider": "anthropic", "base_model": "claude-3-5-haiku-20241022", "mode": "chat",
+    "input_cost_per_token": 0.0000008, "output_cost_per_token": 0.000004,
+    "max_input_tokens": 200000, "max_output_tokens": 8192,
+    "supports_function_calling": true
+  },
+  "anthropic/claude-3-opus-20240229": {
+    "provider": "anthropic", "base_model": "claude-3-opus-20240229", "mode": "chat",
+    "input_cost_per_token": 0.000015, "output_cost_per_token": 0.000075,
+    "max_input_tokens": 200000, "max_output_tokens": 4096,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "gemini/gemini-1.5-pro": {
+    "provider": "gemini", "base_model": "gemini-1.5-pro", "mode": "chat",
+    "input_cost_per_token": 0.00000125, "output_cost_per_token": 0.000005,
+    "max_input_tokens": 2097152, "max_output_tokens": 8192,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "gemini/gemini-1.5-flash": {
+    "provider": "gemini", "base_model": "gemini-1.5-flash", "mode": "chat",
+    "input_cost_per_token": 0.000000075, "output_cost_per_token": 0.0000003,
+    "max_input_tokens": 1048576, "max_output_tokens": 8192,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0": {
+    "provider": "bedrock", "base_model": "anthropic.claude-3-5-sonnet-20241022-v2:0", "mode": "chat",
+    "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015,
+    "max_input_tokens": 200000, "max_output_tokens": 8192,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "azure/gpt-4o": {
+    "provider": "azure", "base_model": "gpt-4o", "mode": "chat",
+    "input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001,
+    "max_input_tokens": 128000, "max_output_tokens": 16384,
+    "supports_function_calling": true, "supports_vision": true
+  },
+  "cohere/command-r-plus": {
+    "provider": "cohere", "base_model": "command-r-plus", "mode": "chat",
+    "input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001,
+    "max_input_tokens": 128000, "max_output_tokens": 4096,
+    "supports_function_calling": true
+  },
+  "cohere/command-r": {
+    "provider": "cohere", "base_model": "command-r", "mode": "chat",
+    "input_cost_per_token": 0.00000015, "output_cost_per_token": 0.0000006,
+    "max_input_tokens": 128000, "max_output_tokens": 4096,
+    "supports_function_calling": true
+  },
+  "openai/llama-3.1-8b-instruct": {
+    "provider": "openai", "base_model": "llama-3.1-8b-instruct", "mode": "chat",
+    "input_cost_per_token": 0, "output_cost_per_token": 0,
+    "max_input_tokens": 131072, "max_output_tokens": 8192,
+    "supports_function_calling": true
+  }
+}
