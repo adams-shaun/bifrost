@@ -86,6 +86,16 @@ func NewKindCluster(t *testing.T, opts ...KindOption) (*KindCluster, func()) {
 	}
 	kc.Kubeconfig = kubeconfig
 
+	// kind writes the kubeconfig server as the host-port mapping
+	// (127.0.0.1:<port>), which is unreachable from the test process on a
+	// shared / docker-in-docker daemon (e.g. CI). Repoint it at the
+	// control-plane container's bridge IP on :6443 — routable both locally
+	// (Linux) and from a sibling CI container, and covered by the kind API
+	// server cert SANs. Best-effort: on failure keep the default kubeconfig.
+	if err := repointKubeconfigToContainerIP(o.name, kubeconfig); err != nil {
+		t.Logf("repoint kubeconfig to control-plane container IP (using default 127.0.0.1): %v", err)
+	}
+
 	if err := kc.waitForNodesReady(2 * time.Minute); err != nil {
 		t.Fatalf("nodes ready: %v", err)
 	}
@@ -184,4 +194,37 @@ func exportKubeconfig(name string) (string, error) {
 		return "", fmt.Errorf("export kubeconfig: %w: %s", err, out)
 	}
 	return f.Name(), nil
+}
+
+// kindControlPlaneIP returns the docker bridge IP of the cluster's
+// control-plane container (<name>-control-plane).
+func kindControlPlaneIP(name string) (string, error) {
+	out, err := exec.Command("docker", "inspect", "-f",
+		"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+		name+"-control-plane",
+	).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker inspect %s-control-plane: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// repointKubeconfigToContainerIP rewrites the kind kubeconfig's server URL from
+// the host-port mapping (127.0.0.1:<port>) to the control-plane container's
+// bridge IP on :6443, so the API server is reachable on a shared/DinD docker
+// daemon. No-op when the container has no IP.
+func repointKubeconfigToContainerIP(name, kubeconfigPath string) error {
+	ip, err := kindControlPlaneIP(name)
+	if err != nil {
+		return err
+	}
+	if ip == "" {
+		return nil // leave the default kubeconfig unchanged
+	}
+	cmd := exec.Command("kubectl", "--kubeconfig", kubeconfigPath,
+		"config", "set-cluster", "kind-"+name, "--server=https://"+ip+":6443")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("set-cluster kind-%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
