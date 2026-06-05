@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -207,14 +206,32 @@ func (bf *BifrostInstall) renderAndApplyBifrost(ctx context.Context) {
 	}
 
 	t.Logf("serelib render bifrost manifests (serectl render)")
-	render := exec.CommandContext(ctx, "docker", "run", "--rm",
-		"-u", strconv.Itoa(os.Getuid()),
-		"-v", work+":"+work, "-w", work,
+	// Move files in/out of the serelib container with `docker cp` rather than a
+	// bind mount: on a shared / docker-in-docker daemon (CI) the test's temp dir
+	// is not a path on the docker HOST, so `-v <tmp>:<tmp>` mounts nothing
+	// ("failed to read context file"). Run as root (--user 0) so serectl can
+	// write the rendered files (docker cp lands them root-owned; the image's
+	// default user is 1000).
+	create := exec.CommandContext(ctx, "docker", "create", "--user", "0", "-w", "/work",
 		serelibImage, "serectl", "render", "-c", "context", "k8s")
-	render.Stdout = newTestLogWriter(t, "serelib")
-	render.Stderr = newTestLogWriter(t, "serelib")
-	if err := render.Run(); err != nil {
+	cidOut, err := create.Output()
+	if err != nil {
+		t.Fatalf("serelib docker create: %v", err)
+	}
+	cid := strings.TrimSpace(string(cidOut))
+	defer func() { _ = exec.Command("docker", "rm", "-f", cid).Run() }()
+
+	if out, err := exec.CommandContext(ctx, "docker", "cp", work+"/.", cid+":/work").CombinedOutput(); err != nil {
+		t.Fatalf("serelib docker cp in: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	startCmd := exec.CommandContext(ctx, "docker", "start", "-a", cid)
+	startCmd.Stdout = newTestLogWriter(t, "serelib")
+	startCmd.Stderr = newTestLogWriter(t, "serelib")
+	if err := startCmd.Run(); err != nil {
 		t.Fatalf("serelib render: %v", err)
+	}
+	if out, err := exec.CommandContext(ctx, "docker", "cp", cid+":/work/k8s/.", filepath.Join(work, "k8s")).CombinedOutput(); err != nil {
+		t.Fatalf("serelib docker cp out: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
 	apply := bf.cluster.Kubectl(ctx, "apply", "-n", bf.Namespace, "-f", filepath.Join(work, "k8s"))
