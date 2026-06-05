@@ -17,8 +17,17 @@ type KindCluster struct {
 	Kubeconfig string // absolute path to a writable kubeconfig for this cluster
 	NodeImage  string
 
-	t       *testing.T
-	created bool // true if this fixture created the cluster (vs reused)
+	t             *testing.T
+	ownKubeconfig bool // true if we exported the kubeconfig (vs got it from $KUBECONFIG)
+}
+
+// clusterName is the kind cluster the tests attach to. Its lifecycle (create /
+// delete) is owned by CI / the Makefile (make kind-up), not the test code.
+func clusterName() string {
+	if v := os.Getenv("BIFROST_K8S_CLUSTER"); v != "" {
+		return v
+	}
+	return "bifrost-test"
 }
 
 type KindOption func(*kindOptions)
@@ -35,85 +44,65 @@ func WithKindNodeImage(img string) KindOption { return func(o *kindOptions) { o.
 func WithKindWorkers(n int) KindOption        { return func(o *kindOptions) { o.workers = n } }
 func WithKindReuse() KindOption               { return func(o *kindOptions) { o.reuse = true } }
 
-// NewKindCluster ensures a kind cluster exists and returns a handle plus a
-// teardown func. If WithKindReuse is set, an existing cluster of the same
-// name is reused and the teardown is a no-op.
+// NewKindCluster ATTACHES to a pre-existing kind cluster and returns a handle
+// plus a teardown func. It does NOT create or delete the cluster — that
+// lifecycle is owned by CI / the Makefile (`make kind-up`). The kubeconfig is
+// taken from $KUBECONFIG when set (CI exports an already-repointed one),
+// otherwise it is exported from kind and repointed at the control-plane
+// container IP. Teardown only removes a kubeconfig we exported ourselves.
 func NewKindCluster(t *testing.T, opts ...KindOption) (*KindCluster, func()) {
 	t.Helper()
 
-	o := &kindOptions{
-		name:      "bifrost-test",
-		nodeImage: defaultNodeImage,
-	}
+	o := &kindOptions{name: clusterName(), nodeImage: defaultNodeImage}
 	for _, opt := range opts {
 		opt(o)
-	}
-
-	if _, err := exec.LookPath("kind"); err != nil {
-		t.Skipf("kind not installed: %v (run `make install-dev-tools`)", err)
 	}
 	if _, err := exec.LookPath("kubectl"); err != nil {
 		t.Skipf("kubectl not installed: %v", err)
 	}
 
-	exists, err := kindClusterExists(o.name)
-	if err != nil {
-		t.Fatalf("kind get clusters: %v", err)
-	}
+	kc := &KindCluster{Name: o.name, NodeImage: o.nodeImage, t: t}
 
-	kc := &KindCluster{
-		Name:      o.name,
-		NodeImage: o.nodeImage,
-		t:         t,
-	}
-
-	if exists {
-		if !o.reuse {
-			t.Fatalf("kind cluster %q already exists; use WithKindReuse() or `kind delete cluster --name %s`", o.name, o.name)
+	// Prefer an externally-provided kubeconfig (CI creates the cluster, repoints
+	// the kubeconfig at the control-plane container IP, and exports KUBECONFIG).
+	if env := os.Getenv("KUBECONFIG"); env != "" {
+		if _, err := os.Stat(env); err == nil {
+			kc.Kubeconfig = env
+			t.Logf("attaching to cluster %q via $KUBECONFIG=%s", o.name, env)
 		}
-		t.Logf("reusing existing kind cluster %q", o.name)
-	} else {
-		t.Logf("creating kind cluster %q (node image %s)", o.name, o.nodeImage)
-		if err := createKindCluster(o); err != nil {
-			t.Fatalf("create kind cluster: %v", err)
+	}
+	if kc.Kubeconfig == "" {
+		// Local path: the cluster must already exist (created by `make kind-up`).
+		if _, err := exec.LookPath("kind"); err != nil {
+			t.Skipf("kind not installed and $KUBECONFIG unset: %v", err)
 		}
-		kc.created = true
-	}
-
-	kubeconfig, err := exportKubeconfig(o.name)
-	if err != nil {
-		t.Fatalf("export kubeconfig: %v", err)
-	}
-	kc.Kubeconfig = kubeconfig
-
-	// kind writes the kubeconfig server as the host-port mapping
-	// (127.0.0.1:<port>), which is unreachable from the test process on a
-	// shared / docker-in-docker daemon (e.g. CI). Repoint it at the
-	// control-plane container's bridge IP on :6443 — routable both locally
-	// (Linux) and from a sibling CI container, and covered by the kind API
-	// server cert SANs. Best-effort: on failure keep the default kubeconfig.
-	if err := repointKubeconfigToContainerIP(o.name, kubeconfig); err != nil {
-		t.Logf("repoint kubeconfig to control-plane container IP (using default 127.0.0.1): %v", err)
+		exists, err := kindClusterExists(o.name)
+		if err != nil {
+			t.Fatalf("kind get clusters: %v", err)
+		}
+		if !exists {
+			t.Fatalf("kind cluster %q does not exist — create it first: `make -C tests/k8s kind-up` "+
+				"(or `kind create cluster --name %s`). Cluster lifecycle is owned by CI/make, not the test.", o.name, o.name)
+		}
+		kubeconfig, err := exportKubeconfig(o.name)
+		if err != nil {
+			t.Fatalf("export kubeconfig: %v", err)
+		}
+		kc.Kubeconfig = kubeconfig
+		kc.ownKubeconfig = true
+		if err := repointKubeconfigToContainerIP(o.name, kubeconfig); err != nil {
+			t.Logf("repoint kubeconfig to control-plane container IP (using default 127.0.0.1): %v", err)
+		}
 	}
 
 	if err := kc.waitForNodesReady(2 * time.Minute); err != nil {
-		t.Fatalf("nodes ready: %v", err)
+		t.Fatalf("control plane not reachable for cluster %q: %v", o.name, err)
 	}
 
 	teardown := func() {
-		if !kc.created || o.reuse {
-			return
+		if kc.ownKubeconfig && kc.Kubeconfig != "" {
+			_ = os.Remove(kc.Kubeconfig)
 		}
-		if KeepInfra() {
-			t.Logf("keep-infra set, leaving kind cluster %q running", kc.Name)
-			return
-		}
-		t.Logf("deleting kind cluster %q", kc.Name)
-		cmd := exec.Command("kind", "delete", "cluster", "--name", kc.Name)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Logf("kind delete (ignored): %v: %s", err, out)
-		}
-		_ = os.Remove(kc.Kubeconfig)
 	}
 	return kc, teardown
 }
@@ -149,37 +138,6 @@ func kindClusterExists(name string) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-func createKindCluster(o *kindOptions) error {
-	args := []string{"create", "cluster", "--name", o.name, "--image", o.nodeImage, "--wait", "120s"}
-
-	if o.workers > 0 {
-		cfg, err := os.CreateTemp("", "kind-config-*.yaml")
-		if err != nil {
-			return fmt.Errorf("temp config: %w", err)
-		}
-		defer os.Remove(cfg.Name())
-
-		fmt.Fprintln(cfg, "kind: Cluster")
-		fmt.Fprintln(cfg, "apiVersion: kind.x-k8s.io/v1alpha4")
-		fmt.Fprintln(cfg, "nodes:")
-		fmt.Fprintln(cfg, "- role: control-plane")
-		for i := 0; i < o.workers; i++ {
-			fmt.Fprintln(cfg, "- role: worker")
-		}
-		if err := cfg.Close(); err != nil {
-			return fmt.Errorf("close config: %w", err)
-		}
-		args = append(args, "--config", cfg.Name())
-	}
-
-	cmd := exec.Command("kind", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("kind create cluster: %w: %s", err, out)
-	}
-	return nil
 }
 
 func exportKubeconfig(name string) (string, error) {

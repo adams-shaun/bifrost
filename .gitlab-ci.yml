@@ -71,46 +71,46 @@ build-bifrost-aigw:
   - strings build_out/bifrost-aigw | grep "${CI_COMMIT_SHA}"
 
 # ---------------------------------------------------------------------------
-# Kubernetes API-sanity integration test (kind-based, tests/k8s harness).
+# Kubernetes integration tests (kind-based, tests/k8s harness).
 #
 # Base image bundles docker / kind / kubectl / helm / go (same family as
 # gubernator's integration-test job); runs on the shared-docker-daemon
-# [kubernetes] runners. The harness uses a FIXED kind cluster name
-# ("bifrost-test"), so the job is serialized via resource_group and tears down
-# every kind cluster in after_script to avoid cross-pipeline collisions.
+# [kubernetes] runners.
 #
-# It builds bifrost:local-test (F5XC-patched), helm-installs postgres + mock-llm,
-# renders bifrost via serelib (serectl render) and kubectl-applies it, then
-# creates one of each governance API entity via the go-bifrost-ai SDK.
+# Cluster lifecycle is owned by THIS JOB, not the Go code: before_script
+# creates the kind cluster if missing and repoints the kubeconfig at the
+# control-plane container IP (the host-port mapping is unreachable from the job
+# container on the shared/DinD daemon), then verifies connectivity. The script
+# runs each test into a per-job namespace; after_script deletes that namespace.
+# The cluster is serialized via resource_group and reused across jobs.
 #
-# OPTIONAL: when:manual (opt-in to run) + allow_failure:true (never blocks the
-# pipeline). No artifacts, no coverage.
+# OPTIONAL: when:manual (opt-in) + allow_failure:true (never blocks). No
+# artifacts/coverage.
 # ---------------------------------------------------------------------------
-k8s-test-api-sanity:
+integration-tests:
   stage: test
   tags: [kubernetes]
   image: volterra.azurecr.io/ves.io/go-builder-ci-int-test@sha256:f7a385945ea81abb8ecd480638bd14dc39a910eeffed723ee3cf3fc0a2feeeca
   resource_group: k8s-int-test
   timeout: 1h
+  variables:
+    KUBECONFIG: /tmp/bifrost-test.kubeconfig
+    NS: bifrost-test-${CI_JOB_ID}
   before_script:
-  # CI_JOB_TOKEN netrc lets `go` fetch the private gopkg.volterra.us SDK
-  # (go-bifrost-ai pinned pseudo-version) and complete go.sum before `go test`.
+  # CI_JOB_TOKEN netrc lets `go` fetch the private gopkg.volterra.us SDK.
   - echo "machine gitlab.com login gitlab-ci-token password ${CI_JOB_TOKEN}" > ~/.netrc
   - mkdir -p "${GOMODCACHE:-/go/pkg/mod}"
   - echo "${GLOBAL_PUBLIC_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PUBLIC_REGISTRY_USERNAME}" --password-stdin gcr.io
   - echo "${GLOBAL_PRIVATE_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PRIVATE_REGISTRY_USERNAME}" --password-stdin "${GLOBAL_PRIVATE_REGISTRY_SERVER}"
   - go version && docker version
-  - docker ps --filter "ancestor=kindest/node" --format "{{.Names}} {{.Ports}}" || true
+  # Create the kind cluster if missing, repoint kubeconfig at the node IP, verify.
+  - make -C tests/k8s kind-up KUBECONFIG_PATH="$KUBECONFIG"
   script:
-  # `make test` builds the patched image, deploys deps + serelib-rendered
-  # bifrost, and runs TestAPISanity. The serelib render image is pulled from
-  # Azure CR (logged in above).
-  - make -C tests/k8s test TIMEOUT=30m
+  - make -C tests/k8s test-k8s-api-sanity  SKIP_KIND_UP=1 KUBECONFIG_PATH="$KUBECONFIG" NAMESPACE="$NS"
+  - make -C tests/k8s test-k8s-crud-sanity SKIP_KIND_UP=1 KUBECONFIG_PATH="$KUBECONFIG" NAMESPACE="$NS"
   after_script:
-  # Shared docker daemon: ONLY tear down OUR cluster ("bifrost-test"). Never
-  # touch other clusters/containers — concurrent pipelines from other projects
-  # (e.g. nats-test) share this runner.
-  - command -v kind >/dev/null 2>&1 && kind delete cluster --name bifrost-test || true
+  # The job owns the per-job namespace; delete it (cluster is reused).
+  - kubectl --kubeconfig "${KUBECONFIG:-/tmp/bifrost-test.kubeconfig}" delete ns "bifrost-test-${CI_JOB_ID}" --ignore-not-found --wait=false || true
   rules:
   - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     when: manual

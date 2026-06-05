@@ -17,15 +17,25 @@ import (
 )
 
 const (
-	// bifrostNamespace is the fixed namespace the whole stack is deployed into.
-	// Fixed (not derived from t.Name) because the serelib-rendered bifrost
-	// manifests reach postgres/mock-llm by short in-namespace DNS names.
-	bifrostNamespace = "bifrost-apisanity"
+	// defaultNamespace is used when BIFROST_K8S_NAMESPACE is unset. The whole
+	// stack deploys into one namespace; the serelib-rendered bifrost manifests
+	// reach postgres/mock-llm by short in-namespace DNS names.
+	defaultNamespace = "bifrost-apisanity"
 	// depsRelease is the helm release for the postgres + mock-llm umbrella chart.
 	depsRelease = "bifrost-deps"
 	// serelibImage renders the bifrost manifests (serectl render).
 	serelibImage = "volterra.azurecr.io/ves.io/serelib:latest"
 )
+
+// namespace returns the deploy namespace. When BIFROST_K8S_NAMESPACE is set
+// (e.g. CI passes bifrost-test-$CI_JOB_ID), its lifecycle is owned by the
+// caller (CI after_script / make) and the test does NOT delete it on teardown.
+func namespace() (name string, callerManaged bool) {
+	if v := os.Getenv("BIFROST_K8S_NAMESPACE"); v != "" {
+		return v, true
+	}
+	return defaultNamespace, false
+}
 
 // BifrostInstall is a deployed bifrost + its in-cluster dependencies, with a
 // host-side port-forward to the bifrost HTTP API at BaseURL.
@@ -63,7 +73,8 @@ func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
 		t.Skipf("docker not installed: %v", err)
 	}
 
-	bf := &BifrostInstall{Namespace: bifrostNamespace, cluster: c, t: t}
+	ns, nsCallerManaged := namespace()
+	bf := &BifrostInstall{Namespace: ns, cluster: c, t: t}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -131,6 +142,20 @@ func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
 		un.Env = append(os.Environ(), "KUBECONFIG="+c.Kubeconfig)
 		if out, err := un.CombinedOutput(); err != nil {
 			t.Logf("helm uninstall (ignored): %v: %s", err, out)
+		}
+		if nsCallerManaged {
+			// CI / make owns this namespace's lifecycle (after_script deletes it);
+			// leave the namespace, but remove the serelib-applied bifrost
+			// resources (helm uninstall above only covered the deps chart) so a
+			// sibling test reusing the same namespace starts clean.
+			rm := c.Kubectl(context.Background(), "delete", "-n", bf.Namespace,
+				"deployment/bifrost", "service/bifrost", "configmap/bifrost-config",
+				"--ignore-not-found", "--wait=false")
+			if out, err := rm.CombinedOutput(); err != nil {
+				t.Logf("delete bifrost resources (ignored): %v: %s", err, out)
+			}
+			t.Logf("namespace %q is caller-managed (BIFROST_K8S_NAMESPACE); left in place", bf.Namespace)
+			return
 		}
 		t.Logf("kubectl delete ns %s", bf.Namespace)
 		del := c.Kubectl(context.Background(), "delete", "ns", bf.Namespace,
