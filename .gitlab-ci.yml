@@ -25,6 +25,9 @@ variables:
   IS_PUBLIC: "true"
   GO_BUILDER_IMAGE: volterra.azurecr.io/ves.io/go-builder:v2.6.0
   GOTOOLCHAIN: auto
+  # Fetch gopkg.volterra.us modules directly via git (with the CI_JOB_TOKEN
+  # netrc) instead of the public proxy/sumdb.
+  GOPRIVATE: gopkg.volterra.us
   REGISTRY_SERVER: volterra.azurecr.io
   APP_TEMPLATE: bifrost-aigw
 
@@ -66,6 +69,55 @@ build-bifrost-aigw:
     BUILD_COMMENT="$(date -Iseconds) ${GITLAB_USER_LOGIN} ${CI_JOB_ID}"
   # Verify SHA is embedded in the binary
   - strings build_out/bifrost-aigw | grep "${CI_COMMIT_SHA}"
+
+# ---------------------------------------------------------------------------
+# Kubernetes integration tests (kind-based, tests/k8s harness).
+#
+# Base image bundles docker / kind / kubectl / helm / go (same family as
+# gubernator's integration-test job); runs on the shared-docker-daemon
+# [kubernetes] runners.
+#
+# Cluster lifecycle is owned by THIS JOB, not the Go code: before_script
+# creates the kind cluster if missing and repoints the kubeconfig at the
+# control-plane container IP (the host-port mapping is unreachable from the job
+# container on the shared/DinD daemon), then verifies connectivity. The script
+# runs each test into a per-job namespace; after_script deletes that namespace.
+# The cluster is serialized via resource_group and reused across jobs.
+#
+# OPTIONAL: when:manual (opt-in) + allow_failure:true (never blocks). No
+# artifacts/coverage.
+# ---------------------------------------------------------------------------
+integration-tests:
+  stage: test
+  tags: [kubernetes]
+  image: volterra.azurecr.io/ves.io/go-builder-ci-int-test@sha256:f7a385945ea81abb8ecd480638bd14dc39a910eeffed723ee3cf3fc0a2feeeca
+  resource_group: k8s-int-test
+  timeout: 1h
+  variables:
+    KUBECONFIG: /tmp/bifrost-test.kubeconfig
+    NS: bifrost-test-${CI_JOB_ID}
+  before_script:
+  # CI_JOB_TOKEN netrc lets `go` fetch the private gopkg.volterra.us SDK.
+  - echo "machine gitlab.com login gitlab-ci-token password ${CI_JOB_TOKEN}" > ~/.netrc
+  - mkdir -p "${GOMODCACHE:-/go/pkg/mod}"
+  - echo "${GLOBAL_PUBLIC_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PUBLIC_REGISTRY_USERNAME}" --password-stdin gcr.io
+  - echo "${GLOBAL_PRIVATE_REGISTRY_PASSWORD}" | docker login -u "${GLOBAL_PRIVATE_REGISTRY_USERNAME}" --password-stdin "${GLOBAL_PRIVATE_REGISTRY_SERVER}"
+  - go version && docker version
+  # Create the kind cluster if missing, repoint kubeconfig at the node IP, verify.
+  - make -C tests/k8s kind-up KUBECONFIG_PATH="$KUBECONFIG"
+  script:
+  - make -C tests/k8s test-k8s-api-sanity  SKIP_KIND_UP=1 KUBECONFIG_PATH="$KUBECONFIG" NAMESPACE="$NS"
+  - make -C tests/k8s test-k8s-crud-sanity SKIP_KIND_UP=1 KUBECONFIG_PATH="$KUBECONFIG" NAMESPACE="$NS"
+  after_script:
+  # The job owns the per-job namespace; delete it (cluster is reused).
+  - kubectl --kubeconfig "${KUBECONFIG:-/tmp/bifrost-test.kubeconfig}" delete ns "bifrost-test-${CI_JOB_ID}" --ignore-not-found --wait=false || true
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    when: manual
+    allow_failure: true
+  - if: $CI_COMMIT_BRANCH == "vesdev"
+    when: manual
+    allow_failure: true
 
 container-bifrost-aigw:
   variables:

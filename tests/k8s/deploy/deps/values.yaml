@@ -1,0 +1,15 @@
+# Test dependencies for the bifrost API-sanity test. These are deployed via helm
+# (umbrella chart) into the same namespace as bifrost; bifrost (deployed
+# separately via serelib render) reaches them by their short service DNS names
+# `bifrost-postgresql` and `mock-llm`.
+postgres:
+  image: postgres:16-alpine
+  user: bifrost
+  password: bifrost-test
+  database: bifrost
+mockllm:
+  # Built locally (tests/k8s/fixtures/mockllm) and kind-loaded; never pulled.
+  image: bifrost-mockllm:local-test
+mockmcp:
+  # Streamable-HTTP mock MCP server (tests/k8s/fixtures/mockmcp); kind-loaded.
+  image: bifrost-mockmcp:local-test

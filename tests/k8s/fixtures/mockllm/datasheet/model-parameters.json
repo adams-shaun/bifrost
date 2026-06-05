@@ -1,0 +1,159 @@
+{
+  "openai/gpt-4o": {
+    "mode": "chat",
+    "supported_endpoints": ["chat", "responses"],
+    "supports_function_calling": true,
+    "supports_parallel_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_response_schema": true,
+    "supports_prompt_caching": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "max_completion_tokens"},
+      {"id": "frequency_penalty"}, {"id": "presence_penalty"}, {"id": "stop"}, {"id": "n"},
+      {"id": "stream"}, {"id": "seed"}, {"id": "tools"}, {"id": "tool_choice"}, {"id": "response_format"}
+    ]
+  },
+  "openai/gpt-4o-mini": {
+    "mode": "chat",
+    "supported_endpoints": ["chat", "responses"],
+    "supports_function_calling": true,
+    "supports_parallel_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_response_schema": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "max_completion_tokens"},
+      {"id": "frequency_penalty"}, {"id": "presence_penalty"}, {"id": "stop"}, {"id": "n"},
+      {"id": "stream"}, {"id": "seed"}, {"id": "tools"}, {"id": "tool_choice"}, {"id": "response_format"}
+    ]
+  },
+  "openai/gpt-4-turbo": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_parallel_function_calling": true,
+    "supports_tool_choice": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"},
+      {"id": "frequency_penalty"}, {"id": "presence_penalty"}, {"id": "stop"}, {"id": "n"},
+      {"id": "stream"}, {"id": "seed"}, {"id": "tools"}, {"id": "tool_choice"}, {"id": "response_format"}
+    ]
+  },
+  "openai/gpt-4o-mock": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "stop"}, {"id": "n"}, {"id": "stream"}
+    ]
+  },
+  "anthropic/claude-3-5-sonnet-20241022": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_assistant_prefill": true,
+    "supports_prompt_caching": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "top_k"}, {"id": "max_tokens"},
+      {"id": "stop_sequences"}, {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  },
+  "anthropic/claude-3-5-haiku-20241022": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_assistant_prefill": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "top_k"}, {"id": "max_tokens"},
+      {"id": "stop_sequences"}, {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  },
+  "anthropic/claude-3-opus-20240229": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_assistant_prefill": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "top_k"}, {"id": "max_tokens"},
+      {"id": "stop_sequences"}, {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  },
+  "gemini/gemini-1.5-pro": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_response_schema": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "top_k"}, {"id": "max_tokens"},
+      {"id": "stop"}, {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}, {"id": "response_format"}
+    ]
+  },
+  "gemini/gemini-1.5-flash": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_response_schema": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "top_k"}, {"id": "max_tokens"},
+      {"id": "stop"}, {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}, {"id": "response_format"}
+    ]
+  },
+  "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_assistant_prefill": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "top_k"}, {"id": "max_tokens"},
+      {"id": "stop_sequences"}, {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  },
+  "azure/gpt-4o": {
+    "mode": "chat",
+    "supported_endpoints": ["chat", "responses"],
+    "supports_function_calling": true,
+    "supports_parallel_function_calling": true,
+    "supports_tool_choice": true,
+    "supports_response_schema": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "max_completion_tokens"},
+      {"id": "frequency_penalty"}, {"id": "presence_penalty"}, {"id": "stop"}, {"id": "n"},
+      {"id": "stream"}, {"id": "seed"}, {"id": "tools"}, {"id": "tool_choice"}, {"id": "response_format"}
+    ]
+  },
+  "cohere/command-r-plus": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "stop"}, {"id": "stream"},
+      {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  },
+  "cohere/command-r": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "stop"}, {"id": "stream"},
+      {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  },
+  "openai/llama-3.1-8b-instruct": {
+    "mode": "chat",
+    "supported_endpoints": ["chat"],
+    "supports_function_calling": true,
+    "supports_tool_choice": true,
+    "model_parameters": [
+      {"id": "temperature"}, {"id": "top_p"}, {"id": "max_tokens"}, {"id": "stop"}, {"id": "n"},
+      {"id": "stream"}, {"id": "tools"}, {"id": "tool_choice"}
+    ]
+  }
+}

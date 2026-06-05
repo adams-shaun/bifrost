@@ -1,0 +1,6 @@
+apiVersion: v2
+name: bifrost-test-deps
+description: Test-only dependencies for the bifrost k8s API-sanity test — postgres + mock-llm.
+type: application
+version: 0.1.0
+appVersion: "1.0"

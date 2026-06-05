@@ -2149,3 +2149,28 @@ cmd-build-bifrost-aigw-container: ## Build enterprise container image
 # Enterprise variables (override via CI or env)
 DOCKER_REG ?= volterra.azurecr.io
 ARTIFACT_TAG ?= latest
+
+# ---- k8s e2e test image (built from F5XC-PATCHED source) ----
+# The kind-based e2e harness (tests/k8s) needs a bifrost image that contains the
+# patched governance features (users, vk-id-header, delta-dump) plus our
+# config-propagation watch and self-signed TLS. So the image MUST be built from
+# the patched working tree, not the pristine OSS source. This target applies the
+# patches (if not already applied), builds, then restores the tree — leaving any
+# pre-existing applied state untouched (marker-aware).
+.PHONY: test-k8s-image test-k8s-clean
+K8S_IMAGE_REPO ?= bifrost
+K8S_IMAGE_TAG  ?= local-test
+
+test-k8s-image: ## Build bifrost:local-test for the k8s e2e fixtures (from F5XC-patched source)
+	@$(ECHO) "$(BLUE)Building $(K8S_IMAGE_REPO):$(K8S_IMAGE_TAG) from transports/Dockerfile.local (F5XC-patched source)$(NC)"
+	@if [ -f $(F5XC_PATCH_MARKER) ]; then APPLIED_BY_ME=0; else APPLIED_BY_ME=1; $(MAKE) apply-patches; fi; \
+	DOCKER_BUILDKIT=0 docker build -f transports/Dockerfile.local \
+		-t $(K8S_IMAGE_REPO):$(K8S_IMAGE_TAG) \
+		--build-arg VERSION=$(K8S_IMAGE_TAG) . ; \
+	rc=$$?; \
+	if [ "$$APPLIED_BY_ME" = "1" ]; then $(MAKE) clean-patches; fi; \
+	exit $$rc
+
+test-k8s-clean: ## Delete the reusable 'bifrost-test' kind cluster left by the e2e harness
+	@$(ECHO) "$(YELLOW)Deleting kind cluster 'bifrost-test'$(NC)"
+	@kind delete cluster --name bifrost-test 2>/dev/null || true
