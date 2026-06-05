@@ -89,7 +89,7 @@ build-bifrost-aigw:
 k8s-test-api-sanity:
   stage: test
   tags: [kubernetes]
-  image: volterra.azurecr.io/ves.io/go-builder-ci-int-test@sha256:5b7d459136273bdaa41d69d6fccd101b95d48e55333212fef8f853b08f2eca71
+  image: volterra.azurecr.io/ves.io/go-builder-ci-int-test@sha256:f7a385945ea81abb8ecd480638bd14dc39a910eeffed723ee3cf3fc0a2feeeca
   resource_group: k8s-int-test
   timeout: 1h
   before_script:
