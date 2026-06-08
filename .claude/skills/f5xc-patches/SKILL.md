@@ -57,7 +57,10 @@ Never trust an existing marker. When in doubt, `make clean-patches` is a safe no
 2. **Never edit vendored source in the main worktree** to make a patch change — your edits
    mix with the applied state and you export a broken patch. Use a throwaway worktree.
 3. **Work in `$(pwd)/.workspaces/<name>`** (gitignored), not `/tmp` — keeps worktrees with the
-   repo, on the same filesystem, and out of `git status`.
+   repo, on the same filesystem, and out of `git status`. **Assume other agents share this
+   clone:** stay in your worktree, never touch the main checkout, and **branch from an explicit
+   ref — never `HEAD`** (HEAD follows the shared checkout and another agent can switch it under
+   you). Track your base reference (branch + SHA). See AGENTS.md → "Working in a shared repo".
 4. **Clean before apply** after any patch change: `make clean-patches && make apply-patches`.
 5. **`make verify-patches` must pass before you commit or push** anything under `f5xc-patches/`.
 6. **Commit from a vanilla tree.** Before `git commit`, confirm `f5xc-patches/.applied` is
@@ -99,11 +102,14 @@ Set up once per task:
 ```bash
 REPO=$(git rev-parse --show-toplevel)
 SERIES=patch2/vk-id-header        # the series you are changing
+BASE=vesdev                       # YOUR explicit base ref — never HEAD (a shared checkout
+                                  # may be on another agent's branch). Pin it, track it.
 WT="$REPO/.workspaces/edit"
 
-git worktree add -B tmp-edit "$WT" HEAD
+git worktree add -B tmp-edit "$WT" "$BASE"
 cd "$WT"
-git config user.email "you@f5.com" && git config user.name "Your Name"
+# Identity per-command (below) — do NOT `git config` in a worktree; it writes the shared
+# .git/config and clobbers another agent's identity. Prefer `git -c user.name=… -c user.email=…`.
 
 # Replay the existing series so HEAD == vanilla + this series, commit-by-commit.
 for p in "$REPO/f5xc-patches/$SERIES/patches"/*.patch; do
