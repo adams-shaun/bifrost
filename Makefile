@@ -77,7 +77,7 @@ define EXPOSE_ENV
 	fi
 endef
 
-.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches cmd-unittest coverage-all-bl
+.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches verify-patches cmd-unittest coverage-all-bl
 
 all: help
 
@@ -324,30 +324,59 @@ build-ui: install-ui ## Build ui
 # one (e.g. f5xc-patches/security/, which holds always-on base-source
 # reference patches that must NOT be applied at build time) are skipped.
 F5XC_PATCH_SERIES := $(sort $(dir $(wildcard f5xc-patches/*/*/apply.sh)))
+F5XC_PATCH_FILES  := $(sort $(wildcard f5xc-patches/*/*/patches/*.patch) $(wildcard f5xc-patches/*/*/apply.sh))
 F5XC_PATCH_MARKER := f5xc-patches/.applied
 
-apply-patches: $(F5XC_PATCH_MARKER) ## Apply F5XC patch overlays onto vendored bifrost source
-
-$(F5XC_PATCH_MARKER):
-	@$(ECHO) "$(GREEN)╔═══════════════════════════════════════════════╗$(NC)"
-	@$(ECHO) "$(GREEN)║  Applying F5XC patch overlays...              ║$(NC)"
-	@$(ECHO) "$(GREEN)╚═══════════════════════════════════════════════╝$(NC)"
-	@set -e; for d in $(F5XC_PATCH_SERIES); do \
+# The marker stores a CONTENT HASH of the patch set, not just "an apply ran".
+#
+# The old design was a bare `touch` stamp with no dependency on the patch files,
+# so this sequence silently shipped stale builds:
+#     make apply-patches      # applies, creates marker
+#     <edit a .patch file>
+#     make apply-patches      # marker exists -> "Nothing to be done" (NO-OP!)
+#     make build              # builds the OLD applied source; your edit is absent
+# i.e. the flag answered "did an apply ever happen?" when callers read it as
+# "is the CURRENT patch set applied?" — two different questions.
+#
+# Now apply-patches compares the live patch-set hash against the marker:
+#   - hash matches      -> already applied, fast no-op (correct)
+#   - no marker         -> apply, record hash
+#   - hash differs      -> FAIL LOUDLY. The applied tree is stale; reversing the
+#                          NEW patches against an OLD-applied tree is unsafe, so
+#                          we cannot auto-fix — but we refuse to lie. Run
+#                          `make clean-patches` then `make apply-patches`.
+apply-patches: ## Apply F5XC patch overlays onto vendored bifrost source (no-op if already applied; errors if the patch set changed since last apply)
+	@CUR=`git hash-object $(F5XC_PATCH_FILES) | git hash-object --stdin`; \
+	if [ -f $(F5XC_PATCH_MARKER) ]; then \
+		if [ "`cat $(F5XC_PATCH_MARKER)`" = "$$CUR" ]; then exit 0; fi; \
+		$(ECHO) "$(RED)╔═══════════════════════════════════════════════════════════════╗$(NC)" >&2; \
+		$(ECHO) "$(RED)║  F5XC patch set CHANGED since last apply — tree is STALE.     ║$(NC)" >&2; \
+		$(ECHO) "$(RED)║  Run:  make clean-patches && make apply-patches               ║$(NC)" >&2; \
+		$(ECHO) "$(RED)╚═══════════════════════════════════════════════════════════════╝$(NC)" >&2; \
+		exit 1; \
+	fi; \
+	$(ECHO) "$(GREEN)╔═══════════════════════════════════════════════╗$(NC)"; \
+	$(ECHO) "$(GREEN)║  Applying F5XC patch overlays...              ║$(NC)"; \
+	$(ECHO) "$(GREEN)╚═══════════════════════════════════════════════╝$(NC)"; \
+	set -e; for d in $(F5XC_PATCH_SERIES); do \
 		echo "==> $$d"; \
 		bash $${d}apply.sh; \
-	done
-	@touch $(F5XC_PATCH_MARKER)
+	done; \
+	echo "$$CUR" > $(F5XC_PATCH_MARKER)
 
 clean-patches: ## Reverse F5XC patch overlays (restore vanilla source)
 	@if [ -f $(F5XC_PATCH_MARKER) ]; then \
 		set -e; for d in $$(ls -r -d $(F5XC_PATCH_SERIES)); do \
 			for p in $$(ls -r $${d}patches/*.patch); do \
 				echo "    - Reversing $$(basename $$p)"; \
-				git apply -R --whitespace=nowarn $$p; \
+				git apply -R --recount --whitespace=nowarn $$p; \
 			done; \
 		done; \
 		rm -f $(F5XC_PATCH_MARKER); \
 	fi
+
+verify-patches: ## Strictly validate the F5XC patch series via `git am` (catches hand-edited / corrupt / drifted .patch files that `apply-patches` --recount would hide). Run before every commit/push that touches f5xc-patches/.
+	@bash f5xc-patches/verify.sh
 
 build: apply-patches build-ui ## Build bifrost-http binary
 	@if [ -n "$(LOCAL)" ]; then \
