@@ -1,3 +1,7 @@
+# Install both stages with a plain `pre-commit install`:
+#   pre-commit install   (wires pre-commit AND commit-msg hooks)
+default_install_hook_types: [pre-commit, commit-msg]
+
 repos:
 - repo: https://github.com/gitleaks/gitleaks
   rev: v8.16.3
@@ -13,6 +17,14 @@ repos:
   - id: shellcheck
 - repo: local
   hooks:
+  - id: commit-ref-trailer
+    name: require Jira Ref trailer
+    language: system
+    entry: bash f5xc-patches/check-commit-ref.sh
+    stages: [commit-msg]
+    description: >-
+      Rejects any commit message missing the mandatory
+      `Ref: https://jira.f5net.com/browse/XC-NNNNN` trailer (AGENTS.md → Commit Messages).
   - id: f5xc-verify-patches
     name: f5xc verify-patches (strict git am replay)
     language: system
