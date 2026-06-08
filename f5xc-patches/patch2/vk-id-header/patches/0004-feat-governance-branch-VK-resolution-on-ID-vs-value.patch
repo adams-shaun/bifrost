@@ -1,19 +1,19 @@
-From 1dbb62525cabba71309560f285eaa1e440502c34 Mon Sep 17 00:00:00 2001
+From 19caffa8f3ee4c7e551c854017a52b45bfe77717 Mon Sep 17 00:00:00 2001
 From: Sanju Abraham <s.abraham@f5.com>
 Date: Thu, 28 May 2026 00:41:06 -0700
-Subject: [PATCH 4/4] feat(governance): branch VK resolution on ID vs value
+Subject: [PATCH] feat(governance): branch VK resolution on ID vs value
 
 (rebased)
 ---
- plugins/governance/main.go                    | 46 +++++++++++++------
+ plugins/governance/main.go                    | 51 ++++++++++++++-----
  plugins/governance/store.go                   |  1 +
  .../bifrost-http/handlers/governance.go       |  5 +-
  transports/bifrost-http/handlers/providers.go |  4 +-
  .../bifrost-http/handlers/providers_test.go   |  2 +-
- 5 files changed, 42 insertions(+), 16 deletions(-)
+ 5 files changed, 47 insertions(+), 16 deletions(-)
 
 diff --git a/plugins/governance/main.go b/plugins/governance/main.go
-index eda1e9d85..330a19d24 100644
+index eda1e9d85..1e38979be 100644
 --- a/plugins/governance/main.go
 +++ b/plugins/governance/main.go
 @@ -343,15 +343,15 @@ func (p *GovernancePlugin) UpdateEnforceAuthOnInference(enforceAuthOnInference b
@@ -51,7 +51,7 @@ index eda1e9d85..330a19d24 100644
  	}
  
  	// Only unmarshal if we have VK or routing rules
-@@ -407,8 +407,16 @@ func (p *GovernancePlugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req
+@@ -407,8 +407,21 @@ func (p *GovernancePlugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req
  		}
  	}
  
@@ -66,11 +66,16 @@ index eda1e9d85..330a19d24 100644
 +		if !ok || virtualKey == nil || !virtualKey.IsActiveValue() {
 +			return nil, nil
 +		}
++		// Trusted ID path (X-Bifrost-VK-ID carries only the non-secret VK id):
++		// inject the resolved VK value into context so the rest of the pipeline
++		// — EvaluateGovernanceRequest's auth check and downstream value lookups —
++		// treats this as an authenticated VK request, exactly like the value path.
++		ctx.SetValue(schemas.BifrostContextKeyVirtualKey, virtualKey.Value)
 +	} else if virtualKeyValue != nil {
  		virtualKey, ok = p.store.GetVirtualKey(ctx, *virtualKeyValue)
  		if !ok || virtualKey == nil || !virtualKey.IsActiveValue() {
  			return nil, nil
-@@ -492,7 +500,7 @@ func (p *GovernancePlugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req
+@@ -492,7 +505,7 @@ func (p *GovernancePlugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req
  // The request body is streaming and cannot be modified, so we build a synthetic payload
  // from pre-extracted metadata and run VK validation, routing rules, and load balancing.
  // Any model changes are propagated via the metadata in context (not body rewriting).
@@ -79,7 +84,7 @@ index eda1e9d85..330a19d24 100644
  	metadata, _ := ctx.Value(schemas.BifrostContextKeyLargePayloadMetadata).(*schemas.LargePayloadMetadata)
  	if metadata == nil || metadata.Model == "" {
  		return nil, nil
-@@ -504,9 +512,15 @@ func (p *GovernancePlugin) governLargePayload(ctx *schemas.BifrostContext, req *
+@@ -504,9 +517,15 @@ func (p *GovernancePlugin) governLargePayload(ctx *schemas.BifrostContext, req *
  	}
  	originalModel := metadata.Model
  
@@ -97,7 +102,7 @@ index eda1e9d85..330a19d24 100644
  		vk, ok := p.store.GetVirtualKey(ctx, *virtualKeyValue)
  		if !ok || vk == nil || !vk.IsActiveValue() {
  			return nil, nil
-@@ -597,7 +611,7 @@ func realtimeModelQueryParam(req *schemas.HTTPRequest) string {
+@@ -597,7 +616,7 @@ func realtimeModelQueryParam(req *schemas.HTTPRequest) string {
  // of the JSON body. We build a synthetic payload so routing rules and VK
  // load-balancing can evaluate normally, then propagate any model rewrite back
  // to the original query param for the downstream handler to pick up.
@@ -106,7 +111,7 @@ index eda1e9d85..330a19d24 100644
  	modelQueryKey := "model"
  	modelParam := req.Query[modelQueryKey]
  	if modelParam == "" {
-@@ -613,9 +627,15 @@ func (p *GovernancePlugin) governRealtimeQueryParam(ctx *schemas.BifrostContext,
+@@ -613,9 +632,15 @@ func (p *GovernancePlugin) governRealtimeQueryParam(ctx *schemas.BifrostContext,
  	}
  	originalModel := modelParam
  
@@ -184,5 +189,5 @@ index b29cb999a..a76b460ee 100644
  			if got != nil {
  				gotValue = *got
 -- 
-2.39.5 (Apple Git-154)
+2.43.0
 

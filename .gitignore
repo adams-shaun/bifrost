@@ -13,6 +13,10 @@ test-coverage-local.sh
 # F5XC patch overlay state (created by `make apply-patches`)
 f5xc-patches/.applied
 
+# F5XC dev worktrees — throwaway git worktrees for editing/verifying patch
+# series (see .claude/skills/f5xc-patches/SKILL.md). Local-only, never committed.
+.workspaces/
+
 # Enterprise
 ui/app/enterprise
 ui/components/enterprise

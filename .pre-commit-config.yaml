@@ -1,3 +1,7 @@
+# Install both stages with a plain `pre-commit install`:
+#   pre-commit install   (wires pre-commit AND commit-msg hooks)
+default_install_hook_types: [pre-commit, commit-msg]
+
 repos:
 - repo: https://github.com/gitleaks/gitleaks
   rev: v8.16.3
@@ -13,6 +17,24 @@ repos:
   - id: shellcheck
 - repo: local
   hooks:
+  - id: commit-ref-trailer
+    name: require Jira Ref trailer
+    language: system
+    entry: bash f5xc-patches/check-commit-ref.sh
+    stages: [commit-msg]
+    description: >-
+      Rejects any commit message missing the mandatory
+      `Ref: https://jira.f5net.com/browse/XC-NNNNN` trailer (AGENTS.md → Commit Messages).
+  - id: f5xc-verify-patches
+    name: f5xc verify-patches (strict git am replay)
+    language: system
+    entry: bash f5xc-patches/verify.sh
+    files: ^f5xc-patches/.*/patches/.*\.patch$|^f5xc-patches/.*/apply\.sh$
+    pass_filenames: false
+    description: >-
+      Replays every F5XC patch series with `git am` so a hand-edited / corrupt /
+      drifted .patch (which `make apply-patches` --recount would silently tolerate)
+      fails the commit instead of shipping.
   - id: eslint
     name: eslint (ui)
     language: system
@@ -24,7 +46,12 @@ repos:
   rev: v4.4.0
   hooks:
   - id: end-of-file-fixer
+    # .patch files are byte-exact: their @@ hunk headers encode line counts, so
+    # "fixing" a trailing newline silently corrupts them. Never let the fixers touch them.
+    exclude: ^f5xc-patches/.*\.patch$
   - id: trailing-whitespace
+    # Same reason: context lines in a diff may legitimately carry trailing whitespace.
+    exclude: ^f5xc-patches/.*\.patch$
 - repo: https://github.com/pylint-dev/pylint
   rev: v2.17.2
   hooks:

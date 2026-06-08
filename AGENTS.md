@@ -146,6 +146,56 @@ go.work
 
 ---
 
+## F5XC Patch Overlays — READ BEFORE TOUCHING `f5xc-patches/`
+
+The vendored `maximhq/bifrost` source is kept **vanilla** in git. Every F5XC change lives as a
+`git format-patch` file under `f5xc-patches/<patchN>/<series>/patches/` and is applied at build
+time by `make apply-patches` (reversed by `make clean-patches`). This overlay has already
+shipped a corrupt patch to a merge request — treat it with care.
+
+**Hard rules (non-negotiable for every agent):**
+
+1. **Never hand-edit a `.patch` file** (no `Edit`/`Write` on `f5xc-patches/**/*.patch`).
+   `make apply-patches` uses `git apply --recount`, which silently rebuilds `@@` line counts —
+   so a hand-edit applies locally but is rejected as `corrupt patch` by `git am` (every replay/
+   rebase/CI path). It ships broken. Regenerate patches with `git format-patch` from a worktree.
+2. **Never edit vendored source in the main worktree** to make a patch change. Use a throwaway
+   worktree under `$(pwd)/.workspaces/` (gitignored).
+3. **After any patch change, `make clean-patches` before `make apply-patches`.** The `.applied`
+   marker is content-hashed and will error on a stale set, but clean-first is the safe habit.
+4. **`make verify-patches` must pass before committing or pushing** anything under
+   `f5xc-patches/`. It replays every series with strict `git am` and is the gate that catches
+   the hand-edit/corruption class. A pre-commit hook also runs it automatically.
+5. **Commit only from a vanilla tree** — no `f5xc-patches/.applied`, no modified vendored source
+   in `git status`; the diff should be only `.patch`/`apply.sh`/docs.
+
+**Full procedure and recipes:** `f5xc-patches/README.md` (mechanics) and the **`/f5xc-patches`
+skill** (the safety workflow). Use the skill whenever a task touches the overlay or a
+"my change isn't taking effect" symptom points at it.
+
+---
+
+## Commit Messages — every commit must reference a Jira issue
+
+Every commit **must** end with a `Ref:` trailer pointing at its Jira issue, on the
+last line after a blank line:
+
+```
+<subject>
+
+<body explaining the change>
+
+Ref: https://jira.f5net.com/browse/XC-NNNNN
+```
+
+- The `Ref:` trailer is **mandatory on every commit** in a series, not just the first.
+- It is always the **last line**, preceded by a blank line.
+- Derive the issue from the branch (e.g. `shaun/XC-24346-vkctx` →
+  `Ref: https://jira.f5net.com/browse/XC-24346`). If no issue is known, ask before
+  committing — do not invent one.
+
+---
+
 ## Build, Test & Dev Commands
 
 ```bash
@@ -580,7 +630,13 @@ Run: `make run-e2e FLOW=<feature>`
 
 ## Claude Code Skills
 
-Four skills are available via `/skill-name`:
+Available via `/skill-name`:
+
+### `/f5xc-patches`
+Safely edit, add, reorder, rebase, and verify the F5XC patch overlays under `f5xc-patches/`.
+Enforces the golden rules (never hand-edit `.patch` files, work in `.workspaces/` worktrees,
+clean-before-apply, `make verify-patches` before commit). Use whenever a task touches the
+overlay or a "my change isn't being applied" symptom points at it.
 
 ### `/docs-writer <feature-name>`
 Write, update, or review Mintlify MDX documentation. Researches UI code, Go handlers, and config schema. Validates `config.json` examples against `transports/config.schema.json`. Outputs docs with Web UI / API / config.json tabs.

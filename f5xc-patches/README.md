@@ -15,7 +15,8 @@ acts as a self-documenting changelog of every F5XC override.
 ```
 f5xc-patches/
 ├── README.md
-├── .applied                       ← marker file (gitignored, written by make apply-patches)
+├── .applied                       ← marker (gitignored); holds a CONTENT HASH of the patch set
+├── verify.sh                      ← strict `git am` validator (make verify-patches / pre-commit)
 ├── patch1/
 │   └── user-support/
 │       ├── apply.sh               ← applies just this series; idempotent within a single run
@@ -53,14 +54,21 @@ The top-level `Makefile` defines:
 
 | Target | What it does |
 |---|---|
-| `make apply-patches` | Iterates `f5xc-patches/*/*/apply.sh` in sorted order, applies every patch. Creates `f5xc-patches/.applied` as a marker so subsequent invocations are a no-op until you `make clean-patches`. |
+| `make apply-patches` | Iterates `f5xc-patches/*/*/apply.sh` in sorted order, applies every patch. Records a **content hash** of the patch set in `f5xc-patches/.applied`. Re-running is a no-op while the set is unchanged; if you edit a patch without cleaning first it **errors** ("patch set CHANGED — tree is STALE") instead of silently building stale source. |
 | `make clean-patches` | Reverses every patch (in reverse series + reverse patch order), removes the marker. Worktree returns to vanilla. |
+| `make verify-patches` | **Strictly** validates the series: replays every patch with `git am` (no `--recount`) in a throwaway `.workspaces/` worktree. Fails loudly on a hand-edited / corrupt / drifted `.patch`. Run before every commit/push that touches `f5xc-patches/`; a pre-commit hook runs it too. |
 | `make build` | Depends on `apply-patches` — so a fresh checkout running `make build` ends up with patches applied and the binary built. |
 
 Each series' `apply.sh` uses `git apply --recount --whitespace=nowarn` so:
 - Slight context drift is tolerated
 - `git format-patch` trailing footers (`-- 2.39.5 (Apple Git-154)`) print a
   benign warning but don't fail the apply
+
+> ⚠️ **The convenience of `--recount` is also a trap.** It *rebuilds* hunk line
+> counts, so a **hand-edited** `.patch` with stale `@@` counts still applies here
+> — but `git am` (used by every replay/rebase workflow below) rejects it as
+> `corrupt patch`. That is exactly how a broken patch shipped to MR !15. **Never
+> hand-edit `.patch` files; always `make verify-patches` before committing.**
 
 ---
 
@@ -77,8 +85,8 @@ REPO=$(pwd)
 SERIES=patch1/user-support
 
 # 1. Spin up a temp worktree at vanilla HEAD
-git worktree add -B tmp-edit /tmp/bf-edit HEAD
-cd /tmp/bf-edit
+git worktree add -B tmp-edit $REPO/.workspaces/edit HEAD
+cd $REPO/.workspaces/edit
 git config user.email "you@f5.com" && git config user.name "Your Name"
 
 # 2. Replay the existing series via git am (preserves author/message)
@@ -98,7 +106,7 @@ cp /tmp/new-patch/*.patch "$REPO/f5xc-patches/$SERIES/patches/"
 
 # 5. Tear down
 cd "$REPO"
-git worktree remove --force /tmp/bf-edit
+git worktree remove --force $REPO/.workspaces/edit
 git branch -D tmp-edit
 
 # 6. Verify end-to-end
@@ -113,8 +121,8 @@ make build              # full build check
 REPO=$(pwd)
 SERIES=patch1/user-support
 
-git worktree add -B tmp-edit /tmp/bf-edit HEAD
-cd /tmp/bf-edit
+git worktree add -B tmp-edit $REPO/.workspaces/edit HEAD
+cd $REPO/.workspaces/edit
 
 # Replay the series via git am
 for p in $REPO/f5xc-patches/$SERIES/patches/*.patch; do
@@ -139,7 +147,7 @@ rm "$REPO/f5xc-patches/$SERIES/patches"/*.patch
 cp /tmp/fresh/*.patch "$REPO/f5xc-patches/$SERIES/patches/"
 
 cd "$REPO"
-git worktree remove --force /tmp/bf-edit
+git worktree remove --force $REPO/.workspaces/edit
 git branch -D tmp-edit
 
 make clean-patches && make apply-patches    # verify
@@ -185,8 +193,8 @@ make apply-patches               # iterates all series
 REPO=$(pwd)
 SERIES=patchN/<broken-series>
 
-git worktree add -B tmp-rebase /tmp/bf-rebase HEAD
-cd /tmp/bf-rebase
+git worktree add -B tmp-rebase $REPO/.workspaces/rebase HEAD
+cd $REPO/.workspaces/rebase
 
 # Apply the series patches one at a time
 for p in $REPO/f5xc-patches/$SERIES/patches/*.patch; do
@@ -212,7 +220,7 @@ rm "$REPO/f5xc-patches/$SERIES/patches"/*.patch
 cp /tmp/fresh/*.patch "$REPO/f5xc-patches/$SERIES/patches/"
 
 cd "$REPO"
-git worktree remove --force /tmp/bf-rebase
+git worktree remove --force $REPO/.workspaces/rebase
 git branch -D tmp-rebase
 
 make clean-patches && make apply-patches
@@ -230,16 +238,22 @@ numbers are just for ordering).
 
 - **Keep patches small and single-purpose.** One logical change per commit /
   patch. Easier to rebase when upstream drifts.
-- **Always test the full chain via `make apply-patches && make clean-patches`**
-  before committing patch changes. Catches series-interaction conflicts
-  (e.g. two series both modifying `LocalGovernanceStore`).
-- **Don't hand-edit `.patch` files.** Always regenerate via `git format-patch`.
-  Hand-edited patches have stale line counts and break silently on the next
-  upstream merge.
+- **`make verify-patches` must pass before you commit or push.** It is the strict
+  (`git am`) gate that `make apply-patches` (`--recount`) cannot give you. The
+  pre-commit hook runs it automatically when a `.patch`/`apply.sh` is staged.
+- **Always test the full chain** `make clean-patches && make apply-patches && make build`
+  before committing. Catches series-interaction conflicts (e.g. two series both
+  modifying `LocalGovernanceStore`) and "applies but doesn't compile".
+- **Never hand-edit `.patch` files.** Always regenerate via `git format-patch`.
+  Hand-edited patches have stale `@@` line counts: they apply under `--recount`
+  but `git am` (and the next upstream merge) rejects them as corrupt.
 - **Don't edit source in the main worktree** to make patch changes. The
   apply state mixes with your changes and you'll regenerate broken patches.
-  Always use a temp worktree.
+  Always use a worktree under `$(pwd)/.workspaces/` (gitignored).
+- **Commit only from a vanilla tree.** Before `git commit`: no `f5xc-patches/.applied`,
+  no modified vendored source in `git status` — only `.patch`/`apply.sh`/docs.
 - **The marker file `f5xc-patches/.applied` is gitignored** — don't try to
-  commit it. It's local state for `make apply-patches` idempotency.
+  commit it. It holds a content hash of the applied patch set; `apply-patches`
+  errors (rather than silently no-op'ing) if you edit a patch without cleaning first.
 - **`go.work` is gitignored too** — run `make setup-workspace` after a fresh
   clone (or carry your own `go.work` referencing the modules you need).
