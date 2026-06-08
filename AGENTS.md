@@ -175,6 +175,47 @@ skill** (the safety workflow). Use the skill whenever a task touches the overlay
 
 ---
 
+## Working in a shared repo — assume other agents are active
+
+**Multiple agents may be working in this clone at the same time.** The main working tree
+and whatever branch it currently has checked out may belong to **another agent** — never
+assume it is yours. Treat the main checkout as read-only-to-you and stay in your own
+isolated git worktree.
+
+**Hard rules:**
+
+1. **Work only in your own worktree** under `$(pwd)/.workspaces/<unique-name>` (gitignored).
+   Never edit files, run `make apply-patches`/`build`, or commit in the main checkout — the
+   other agent sees those changes and you will corrupt each other's state.
+2. **Pin your base reference explicitly — never branch from `HEAD`.** `HEAD` follows the
+   shared checkout, which another agent can switch under you mid-task (this has happened).
+   Always create worktrees from an explicit branch or commit:
+   `git worktree add -B tmp-<ticket>-<purpose> .workspaces/<name> <branch-or-sha>` — not `HEAD`.
+3. **Track your base reference.** Write down the branch + short SHA your work descends from
+   (e.g. "XC-22630 ← shaun/XC-24346-userfill @ 31c85654e") and verify a branch's tip with
+   `git log -1 <branch>` before relying on it — do not trust the main checkout's current HEAD.
+4. **Namespace your worktrees and branches** (`tmp-<ticket>-<purpose>`, `.workspaces/<ticket>-…`)
+   so they never collide with another agent's refs.
+5. **Don't mutate shared git state.** Worktrees share one `.git`: never run `git config` in a
+   worktree (it writes the shared `.git/config` — pass identity per-command with
+   `git -c user.name=… -c user.email=… …`), never `git gc`, and never rely on or change the
+   shared `f5xc-patches/.applied` marker in the main checkout.
+6. **Verify the main checkout is untouched by you** before finishing (`git -C <repo> status`
+   should show no edits you made outside your worktree).
+7. **Create your own `go.work` — never inherit the main checkout's.** A `.workspaces/`
+   worktree is nested inside the repo, so `go` walks up and finds the **main checkout's**
+   `go.work` (another agent's — possibly missing the modules you need, or pinned for their
+   work). Point `GOWORK` at a worktree-local file and run all go commands with it:
+   ```bash
+   export GOWORK="$PWD/go.work.local"          # overrides the ancestor-search go.work
+   go work init && go work use ./core ./framework ./transports ./plugins/*
+   GOWORK="$GOWORK" go test ./...               # build/test against YOUR workspace
+   ```
+   `go.work`/`go.work.sum` are gitignored (the shared root one is another agent's) — never
+   edit or rely on them. Name yours `go.work.local` so it can't be confused with the shared one.
+
+---
+
 ## Commit Messages — every commit must reference a Jira issue
 
 Every commit **must** end with a `Ref:` trailer pointing at its Jira issue, on the
