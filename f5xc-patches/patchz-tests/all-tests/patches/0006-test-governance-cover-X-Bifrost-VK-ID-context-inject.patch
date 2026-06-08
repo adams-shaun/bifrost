@@ -1,0 +1,136 @@
+From dba42e6daf5d8a93fbdee9b54899c4742b362d8e Mon Sep 17 00:00:00 2001
+From: sadams <s.adams@f5.com>
+Date: Mon, 8 Jun 2026 19:40:50 +0000
+Subject: [PATCH] test(governance): cover X-Bifrost-VK-ID context injection +
+ mandatory-auth pass
+
+Regression coverage for patch2/0004: the trusted-id path must inject the
+resolved VK value into BifrostContextKeyVirtualKey so the mandatory-auth gate
+treats an id-only request as authenticated (was 401ing on header-only VK id).
+
+- TestHTTPTransportPreHook_VKIDPath_InjectsResolvedVKValueIntoContext: drives the
+  hook with only X-Bifrost-VK-ID and asserts the resolved value lands in context
+  (deleting the injection line fails this test).
+- TestEvaluateGovernanceRequest_VKMandatory_IDResolvedValuePassesAuth: the injected
+  value clears mandatory auth; a request with no VK still 401s.
+---
+ .../governance/vk_id_ctx_injection_test.go    | 107 ++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+ create mode 100644 plugins/governance/vk_id_ctx_injection_test.go
+
+diff --git a/plugins/governance/vk_id_ctx_injection_test.go b/plugins/governance/vk_id_ctx_injection_test.go
+new file mode 100644
+index 000000000..57953d06c
+--- /dev/null
++++ b/plugins/governance/vk_id_ctx_injection_test.go
+@@ -0,0 +1,107 @@
++package governance
++
++import (
++	"context"
++	"testing"
++
++	bifrost "github.com/maximhq/bifrost/core"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/stretchr/testify/require"
++)
++
++// Regression coverage for the X-Bifrost-VK-ID trusted-id path (patch2/0004).
++//
++// The trusted edge (Envoy) resolves a caller's identity to a non-secret VK *id*
++// and forwards it as the X-Bifrost-VK-ID header — it never sends the secret VK
++// value. The governance plugin resolves that id to the VK in HTTPTransportPreHook,
++// and MUST inject the resolved VK value into context (BifrostContextKeyVirtualKey)
++// so the downstream auth gate in PreLLMHook -> EvaluateGovernanceRequest treats the
++// request as authenticated. Without that injection an id-only request 401s whenever
++// virtual keys are mandatory.
++//
++// These tests are the load-bearing coverage for that line: deleting the
++// `ctx.SetValue(BifrostContextKeyVirtualKey, virtualKey.Value)` injection makes the
++// first test fail (context stays empty) and, end-to-end, reintroduces the 401.
++
++// TestHTTPTransportPreHook_VKIDPath_InjectsResolvedVKValueIntoContext drives the
++// HTTP-transport hook with ONLY the trusted X-Bifrost-VK-ID header (no x-bf-vk
++// value, no Authorization) and asserts the resolved VK value lands in context.
++func TestHTTPTransportPreHook_VKIDPath_InjectsResolvedVKValueIntoContext(t *testing.T) {
++	logger := NewMockLogger()
++	const vkID = "vk-id-abc"
++	const vkValue = "sk-bf-secret-xyz"
++	vk := buildVKWithID(vkID, vkValue)
++
++	store, err := NewLocalGovernanceStore(context.Background(), logger, nil, &configstore.GovernanceConfig{
++		VirtualKeys: []configstoreTables.TableVirtualKey{*vk},
++	}, nil)
++	require.NoError(t, err)
++
++	plugin, err := InitFromStore(context.Background(), &Config{IsVkMandatory: boolPtr(true)}, logger, store, nil, nil, nil, nil)
++	require.NoError(t, err)
++	defer func() { require.NoError(t, plugin.Cleanup()) }()
++
++	req := schemas.AcquireHTTPRequest()
++	defer schemas.ReleaseHTTPRequest(req)
++	req.Method = "POST"
++	req.Path = "/v1/chat/completions"
++	req.Headers[VKIDHeader] = vkID // trusted id only — the secret value is NOT on the wire
++	req.Headers["Content-Type"] = "application/json"
++	req.Body = []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`)
++
++	bfCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
++	resp, err := plugin.HTTPTransportPreHook(bfCtx, req)
++	require.NoError(t, err)
++	require.Nil(t, resp)
++
++	got := bifrost.GetStringFromContext(bfCtx, schemas.BifrostContextKeyVirtualKey)
++	require.Equal(t, vkValue, got,
++		"HTTPTransportPreHook must inject the id-resolved VK value into BifrostContextKeyVirtualKey")
++}
++
++// TestEvaluateGovernanceRequest_VKMandatory_IDResolvedValuePassesAuth proves the
++// other half of the contract: the auth gate accepts the injected value and rejects
++// a request that carries no virtual key at all when VKs are mandatory.
++func TestEvaluateGovernanceRequest_VKMandatory_IDResolvedValuePassesAuth(t *testing.T) {
++	logger := NewMockLogger()
++	const vkID = "vk-id-abc"
++	const vkValue = "sk-bf-secret-xyz"
++	vk := buildVKWithID(vkID, vkValue)
++
++	store, err := NewLocalGovernanceStore(context.Background(), logger, nil, &configstore.GovernanceConfig{
++		VirtualKeys: []configstoreTables.TableVirtualKey{*vk},
++	}, nil)
++	require.NoError(t, err)
++
++	plugin, err := InitFromStore(context.Background(), &Config{IsVkMandatory: boolPtr(true)}, logger, store, nil, nil, nil, nil)
++	require.NoError(t, err)
++	defer func() { require.NoError(t, plugin.Cleanup()) }()
++
++	// Positive: the value the VK-ID path injects must clear the mandatory-auth gate.
++	// Downstream provider/budget decisions are out of scope — we assert only that
++	// auth itself did not reject the request (i.e. no 401 virtual_key_required).
++	bfCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
++	_, berr := plugin.EvaluateGovernanceRequest(bfCtx,
++		&EvaluationRequest{VirtualKey: vkValue, Provider: schemas.OpenAI, Model: "gpt-4"},
++		schemas.ChatCompletionRequest)
++	if berr != nil {
++		if berr.StatusCode != nil {
++			require.NotEqual(t, 401, *berr.StatusCode, "a present VK value must not trip the mandatory-auth 401")
++		}
++		if berr.Type != nil {
++			require.NotEqual(t, "virtual_key_required", *berr.Type)
++			require.NotEqual(t, "virtual_key_not_found", *berr.Type)
++		}
++	}
++
++	// Negative: no virtual key at all + mandatory -> 401, proving the gate is real.
++	bfCtxEmpty := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
++	_, berrEmpty := plugin.EvaluateGovernanceRequest(bfCtxEmpty,
++		&EvaluationRequest{VirtualKey: "", Provider: schemas.OpenAI, Model: "gpt-4"},
++		schemas.ChatCompletionRequest)
++	require.NotNil(t, berrEmpty, "missing VK under mandatory auth must be rejected")
++	require.NotNil(t, berrEmpty.StatusCode)
++	require.Equal(t, 401, *berrEmpty.StatusCode)
++}
+-- 
+2.43.0
+
