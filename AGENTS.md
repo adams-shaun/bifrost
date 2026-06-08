@@ -202,6 +202,17 @@ isolated git worktree.
    shared `f5xc-patches/.applied` marker in the main checkout.
 6. **Verify the main checkout is untouched by you** before finishing (`git -C <repo> status`
    should show no edits you made outside your worktree).
+7. **Create your own `go.work` — never inherit the main checkout's.** A `.workspaces/`
+   worktree is nested inside the repo, so `go` walks up and finds the **main checkout's**
+   `go.work` (another agent's — possibly missing the modules you need, or pinned for their
+   work). Point `GOWORK` at a worktree-local file and run all go commands with it:
+   ```bash
+   export GOWORK="$PWD/go.work.local"          # overrides the ancestor-search go.work
+   go work init && go work use ./core ./framework ./transports ./plugins/*
+   GOWORK="$GOWORK" go test ./...               # build/test against YOUR workspace
+   ```
+   `go.work`/`go.work.sum` are gitignored (the shared root one is another agent's) — never
+   edit or rely on them. Name yours `go.work.local` so it can't be confused with the shared one.
 
 ---
 
