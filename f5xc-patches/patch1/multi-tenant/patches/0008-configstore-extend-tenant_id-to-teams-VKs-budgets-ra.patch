@@ -1,0 +1,299 @@
+From b65c59d853eca608f3de61c9d839b793fff040f3 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 17:03:28 -0600
+Subject: [PATCH] configstore: extend tenant_id to teams, VKs, budgets, rate
+ limits
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 1 schema rollout step 2. Adds tenant_id (default "default") to
+the four remaining core governance entities:
+  - governance_teams
+  - governance_virtual_keys
+  - governance_budgets
+  - governance_rate_limits
+
+One unified migration (add_tenant_id_to_governance_tables) iterates
+the four target tables, AddColumn + idempotent backfill via UPDATE
+... WHERE tenant_id IS NULL OR tenant_id = '' (Postgres respects the
+column default but older SQLite may not honor it on existing rows).
+
+Provider configs, MCP configs, and other child entities are
+intentionally NOT touched here — they belong to a tenant transitively
+via the owning VK or team. A future migration can promote tenant_id
+to those rows if a row-level scoping pass shows the joins are too
+expensive.
+
+Backward-compatible by construction: single-tenant deployments keep
+working, every existing governance row ends up assigned to the
+DefaultTenantID seeded by the previous migration.
+
+Test: TestMigrationAddTenantIDToGovernanceTables_AppliesToAllFour
+asserts the column landed on all four tables, the column default
+kicks in for new inserts that omit TenantID, and the migration is
+idempotent on re-run.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/migrations.go        | 85 ++++++++++++++++++++++
+ framework/configstore/migrations_test.go   | 81 +++++++++++++++++++++
+ framework/configstore/tables/budget.go     |  4 +
+ framework/configstore/tables/ratelimit.go  |  4 +
+ framework/configstore/tables/team.go       |  4 +
+ framework/configstore/tables/virtualkey.go |  5 ++
+ 6 files changed, 183 insertions(+)
+
+diff --git a/framework/configstore/migrations.go b/framework/configstore/migrations.go
+index 230930d94..ab32c5deb 100644
+--- a/framework/configstore/migrations.go
++++ b/framework/configstore/migrations.go
+@@ -799,6 +799,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
+ 	if err := migrationAddTenantsTableAndCustomerTenantID(ctx, db); err != nil {
+ 		return err
+ 	}
++	if err := migrationAddTenantIDToGovernanceTables(ctx, db); err != nil {
++		return err
++	}
+ 	return nil
+ }
+ 
+@@ -8618,3 +8621,85 @@ func migrationAddTenantsTableAndCustomerTenantID(ctx context.Context, db *gorm.D
+ 	}
+ 	return nil
+ }
++
++// migrationAddTenantIDToGovernanceTables extends the multi-tenant rollout to
++// the remaining four governance entities — teams, virtual keys, budgets, rate
++// limits — using the same backward-compatible pattern as patch 0007:
++//
++//   - AddColumn with the "default" column default so single-tenant deployments
++//     keep working transparently.
++//   - Backfill UPDATE for any row left with NULL or empty string after the
++//     ALTER (Postgres respects the default but older SQLite may not honor it
++//     when adding a NOT NULL column to existing rows).
++//
++// Provider configs, MCP configs, access profiles, and other entities that
++// transitively belong to a tenant via VK or team are intentionally NOT
++// touched here — the query layer can derive tenant_id by joining to the
++// owning VK/team. Future migrations can promote those if a row-level
++// scoping pass shows joins are too expensive.
++func migrationAddTenantIDToGovernanceTables(ctx context.Context, db *gorm.DB) error {
++	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
++		ID: "add_tenant_id_to_governance_tables",
++		Migrate: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++
++			// Table -> (struct, gorm field name, db table name) for the
++			// AddColumn + backfill loop. Order is teams/VK/budget/ratelimit so
++			// the backfill UPDATEs run in dependency order (teams first since
++			// VKs reference them).
++			targets := []struct {
++				model     any
++				fieldName string
++				tableName string
++			}{
++				{&tables.TableTeam{}, "TenantID", "governance_teams"},
++				{&tables.TableVirtualKey{}, "TenantID", "governance_virtual_keys"},
++				{&tables.TableBudget{}, "TenantID", "governance_budgets"},
++				{&tables.TableRateLimit{}, "TenantID", "governance_rate_limits"},
++			}
++
++			for _, t := range targets {
++				if !mig.HasColumn(t.model, "tenant_id") {
++					if err := mig.AddColumn(t.model, t.fieldName); err != nil {
++						return fmt.Errorf("failed to add tenant_id column to %s: %w", t.tableName, err)
++					}
++				}
++				// Idempotent backfill — only touches rows the default missed.
++				if err := tx.Exec(
++					fmt.Sprintf(`UPDATE %s SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''`, t.tableName),
++					tables.DefaultTenantID,
++				).Error; err != nil {
++					return fmt.Errorf("failed to backfill %s.tenant_id: %w", t.tableName, err)
++				}
++			}
++			return nil
++		},
++		Rollback: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++			// Reverse order: ratelimit, budget, vk, teams.
++			rollback := []struct {
++				model     any
++				tableName string
++			}{
++				{&tables.TableRateLimit{}, "governance_rate_limits"},
++				{&tables.TableBudget{}, "governance_budgets"},
++				{&tables.TableVirtualKey{}, "governance_virtual_keys"},
++				{&tables.TableTeam{}, "governance_teams"},
++			}
++			for _, t := range rollback {
++				if mig.HasColumn(t.model, "tenant_id") {
++					if err := mig.DropColumn(t.model, "tenant_id"); err != nil {
++						return fmt.Errorf("failed to drop tenant_id column from %s: %w", t.tableName, err)
++					}
++				}
++			}
++			return nil
++		},
++	}})
++	if err := m.Migrate(); err != nil {
++		return fmt.Errorf("error running add_tenant_id_to_governance_tables migration: %s", err.Error())
++	}
++	return nil
++}
+diff --git a/framework/configstore/migrations_test.go b/framework/configstore/migrations_test.go
+index dea803ed3..4a54d843e 100644
+--- a/framework/configstore/migrations_test.go
++++ b/framework/configstore/migrations_test.go
+@@ -2429,3 +2429,84 @@ func TestMigrationAddTenants_CreatesTableAndSeedsDefault(t *testing.T) {
+ 	require.NoError(t, db.Model(&tables.TableTenant{}).Where("id = ?", tables.DefaultTenantID).Count(&count).Error)
+ 	assert.Equal(t, int64(1), count, "default tenant must not be duplicated on re-run")
+ }
++
++// TestMigrationAddTenantIDToGovernanceTables_AppliesToAllFour verifies that
++// the second multi-tenant migration lands tenant_id on teams, virtual_keys,
++// budgets, and rate_limits, and that the "default" column default kicks in
++// for new inserts that omit TenantID.
++func TestMigrationAddTenantIDToGovernanceTables_AppliesToAllFour(t *testing.T) {
++	_, db := setupFullMigrationDB(t)
++	ctx := context.Background()
++
++	for _, m := range []any{
++		&tables.TableTeam{},
++		&tables.TableVirtualKey{},
++		&tables.TableBudget{},
++		&tables.TableRateLimit{},
++	} {
++		assert.True(t, db.Migrator().HasColumn(m, "tenant_id"),
++			"tenant_id column should exist on %T", m)
++	}
++
++	now := time.Now()
++
++	// Team: insert without TenantID; should pick up the "default".
++	team := tables.TableTeam{ID: "team-1", Name: "Engineering", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&team).Error)
++	var teamRT tables.TableTeam
++	require.NoError(t, db.First(&teamRT, "id = ?", "team-1").Error)
++	assert.Equal(t, tables.DefaultTenantID, teamRT.TenantID,
++		"team tenant_id should default to %q", tables.DefaultTenantID)
++
++	// Budget.
++	budget := tables.TableBudget{
++		ID:            "budget-1",
++		MaxLimit:      100.0,
++		ResetDuration: "1h",
++		LastReset:     now,
++		CreatedAt:     now,
++		UpdatedAt:     now,
++	}
++	require.NoError(t, db.Create(&budget).Error)
++	var budgetRT tables.TableBudget
++	require.NoError(t, db.First(&budgetRT, "id = ?", "budget-1").Error)
++	assert.Equal(t, tables.DefaultTenantID, budgetRT.TenantID)
++
++	// RateLimit.
++	rl := tables.TableRateLimit{ID: "rl-1", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&rl).Error)
++	var rlRT tables.TableRateLimit
++	require.NoError(t, db.First(&rlRT, "id = ?", "rl-1").Error)
++	assert.Equal(t, tables.DefaultTenantID, rlRT.TenantID)
++
++	// VirtualKey: needs unique Name + Value. BeforeSave hook handles hashing
++	// and encryption; we just supply valid fields.
++	vk := tables.TableVirtualKey{
++		ID:        "vk-1",
++		Name:      "test-vk-tenant-default",
++		Value:     "sk-test-tenant-default",
++		CreatedAt: now,
++		UpdatedAt: now,
++	}
++	require.NoError(t, db.Create(&vk).Error)
++	var vkRT tables.TableVirtualKey
++	require.NoError(t, db.First(&vkRT, "id = ?", "vk-1").Error)
++	assert.Equal(t, tables.DefaultTenantID, vkRT.TenantID)
++
++	// Idempotency: re-running the migration must not error and must not
++	// change any of the seeded tenant_ids.
++	require.NoError(t, migrationAddTenantIDToGovernanceTables(ctx, db))
++	for tableName, rowID := range map[string]string{
++		"governance_teams":        "team-1",
++		"governance_virtual_keys": "vk-1",
++		"governance_budgets":      "budget-1",
++		"governance_rate_limits":  "rl-1",
++	} {
++		var tid string
++		require.NoError(t, db.Raw(
++			fmt.Sprintf("SELECT tenant_id FROM %s WHERE id = ?", tableName), rowID,
++		).Scan(&tid).Error)
++		assert.Equal(t, tables.DefaultTenantID, tid,
++			"%s row should still carry default tenant_id after re-run", tableName)
++	}
++}
+diff --git a/framework/configstore/tables/budget.go b/framework/configstore/tables/budget.go
+index 015ec6e69..002f4ea45 100644
+--- a/framework/configstore/tables/budget.go
++++ b/framework/configstore/tables/budget.go
+@@ -20,6 +20,10 @@ type TableBudget struct {
+ 	VirtualKeyID     *string `gorm:"type:varchar(255);index" json:"virtual_key_id,omitempty"`
+ 	ProviderConfigID *uint   `gorm:"index" json:"provider_config_id,omitempty"`
+ 
++	// TenantID scopes this budget to a tenant for multi-tenant deployments.
++	// See TableCustomer.TenantID. Backfilled to DefaultTenantID on upgrade.
++	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++
+ 	// Deprecated: set calendar_aligned on the parent access profile / VK / team
+ 	// instead. Kept for backward compatibility with older config.json files;
+ 	// the OSS applyV1Compat path and the enterprise access-profile reconciler
+diff --git a/framework/configstore/tables/ratelimit.go b/framework/configstore/tables/ratelimit.go
+index 086a9449a..18a802c89 100644
+--- a/framework/configstore/tables/ratelimit.go
++++ b/framework/configstore/tables/ratelimit.go
+@@ -23,6 +23,10 @@ type TableRateLimit struct {
+ 	RequestCurrentUsage  int64     `gorm:"default:0" json:"request_current_usage"`                   // Current request usage
+ 	RequestLastReset     time.Time `gorm:"index" json:"request_last_reset"`                          // Last time request counter was reset
+ 
++	// TenantID scopes this rate limit to a tenant for multi-tenant deployments.
++	// See TableCustomer.TenantID. Backfilled to DefaultTenantID on upgrade.
++	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++
+ 	// Deprecated: set calendar_aligned on the parent access profile / VK / team
+ 	// instead. Kept for backward compatibility with older config.json files;
+ 	// the OSS applyV1Compat path and the enterprise access-profile reconciler
+diff --git a/framework/configstore/tables/team.go b/framework/configstore/tables/team.go
+index 616471934..741f558bd 100644
+--- a/framework/configstore/tables/team.go
++++ b/framework/configstore/tables/team.go
+@@ -16,6 +16,10 @@ type TableTeam struct {
+ 	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
+ 	SourceID    *string `gorm:"type:varchar(255);uniqueIndex" json:"source_id,omitempty"`
+ 
++	// TenantID scopes this team to a tenant for multi-tenant deployments.
++	// See TableCustomer.TenantID for the rationale and backfill behavior.
++	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++
+ 	// Relationships
+ 	Customer    *TableCustomer    `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`
+ 	Budgets     []TableBudget     `gorm:"foreignKey:TeamID;constraint:OnDelete:CASCADE" json:"budgets,omitempty"` // Multiple budgets with different reset intervals
+diff --git a/framework/configstore/tables/virtualkey.go b/framework/configstore/tables/virtualkey.go
+index d018dd99c..910b1bcb0 100644
+--- a/framework/configstore/tables/virtualkey.go
++++ b/framework/configstore/tables/virtualkey.go
+@@ -205,6 +205,11 @@ type TableVirtualKey struct {
+ 	ProviderConfigs []TableVirtualKeyProviderConfig `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"provider_configs"` // Empty means no providers allowed (deny-by-default)
+ 	MCPConfigs      []TableVirtualKeyMCPConfig      `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"mcp_configs"`
+ 
++	// TenantID scopes this virtual key to a tenant for multi-tenant deployments.
++	// The HTTP tenant-resolver middleware reads this via the VK lookup before
++	// dispatching to the per-tenant Bifrost runtime. See TableCustomer.TenantID.
++	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++
+ 	// Foreign key relationships (mutually exclusive: TeamID, CustomerID, or AccessProfileID)
+ 	TeamID          *string `gorm:"type:varchar(255);index" json:"team_id,omitempty"`
+ 	CustomerID      *string `gorm:"type:varchar(255);index" json:"customer_id,omitempty"`
+-- 
+2.51.0
+
