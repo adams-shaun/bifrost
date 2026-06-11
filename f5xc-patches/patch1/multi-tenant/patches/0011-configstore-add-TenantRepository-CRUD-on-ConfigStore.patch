@@ -1,0 +1,497 @@
+From 3a52a1b0c569c2129a068fb20c7d6afce42fda2b Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 17:38:38 -0600
+Subject: [PATCH] configstore: add TenantRepository CRUD on ConfigStore
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds six methods to the ConfigStore interface and implements them on
+RDBConfigStore so the platform-admin control plane can manage tenants
+without reaching into the DB layer directly:
+
+  GetTenants(ctx)
+  GetTenantsPaginated(ctx, params) — search + status filter + paging
+  GetTenant(ctx, id)
+  CreateTenant(ctx, tenant)
+  UpdateTenant(ctx, tenant)
+  DeleteTenant(ctx, id)
+
+DeleteTenant is the only non-trivial one:
+
+  - returns ErrReservedTenant for DefaultTenantID — single-tenant OSS
+    deployments depend on that row existing
+  - returns ErrTenantNotEmpty if any of the 8 tenant-scoped tables
+    (customers, teams, virtual_keys, budgets, rate_limits, providers,
+    keys, mcp_clients) still holds rows pointing at this tenant_id
+
+Operators wanting "stop billing" semantics should flip Status to
+TenantStatusSuspended via UpdateTenant rather than DeleteTenant.
+
+Two new error sentinels in errors.go: ErrTenantNotEmpty and
+ErrReservedTenant.
+
+Tests (7 new in rdb_test.go):
+  - TestTenant_CreateGetUpdate: round-trip + status flip + rename
+  - TestTenant_CreateDuplicateRejected: unique-id enforcement
+  - TestTenant_GetNotFound: ErrNotFound on missing id
+  - TestTenant_DeleteEmptyTenant: happy-path delete
+  - TestTenant_DeleteRefusedWhenNotEmpty: ErrTenantNotEmpty + still
+    deletable after dependents are cleaned up
+  - TestTenant_DeleteDefaultRefused: ErrReservedTenant on the default
+  - TestTenant_ListAndPaginate: list, search by name fragment, status
+    filter
+
+setupRDBTestStore also gains TableTenant in its AutoMigrate list and
+seeds the default tenant row (the minimal test setup skips the
+migration chain that does this for the real DB).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/errors.go   |  10 ++
+ framework/configstore/rdb.go      | 157 ++++++++++++++++++++++++++
+ framework/configstore/rdb_test.go | 178 ++++++++++++++++++++++++++++++
+ framework/configstore/store.go    |  21 ++++
+ 4 files changed, 366 insertions(+)
+
+diff --git a/framework/configstore/errors.go b/framework/configstore/errors.go
+index 61c1c7a74..803d54ce2 100644
+--- a/framework/configstore/errors.go
++++ b/framework/configstore/errors.go
+@@ -9,6 +9,16 @@ import (
+ var ErrNotFound = errors.New("not found")
+ var ErrAlreadyExists = errors.New("already exists")
+ 
++// ErrTenantNotEmpty is returned by DeleteTenant when the tenant still owns
++// governance / config rows. Callers must drain the tenant (suspend + clean
++// up dependents, or transfer ownership) before deletion.
++var ErrTenantNotEmpty = errors.New("tenant is not empty")
++
++// ErrReservedTenant is returned when an operation targets a reserved
++// tenant ID like DefaultTenantID — the default tenant cannot be deleted
++// because single-tenant OSS deployments depend on it existing.
++var ErrReservedTenant = errors.New("reserved tenant")
++
+ // ErrUnresolvedKeys is returned when one or more keys could not be resolved
+ type ErrUnresolvedKeys struct {
+ 	Identifiers []string
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index c5fd51b3a..4379cea2f 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -3423,6 +3423,163 @@ func (s *RDBConfigStore) DeleteCustomer(ctx context.Context, id string) error {
+ 	return nil
+ }
+ 
++// =====================
++// TENANT CRUD METHODS
++// =====================
++//
++// Tenants are the platform-level isolation boundary that sits above the
++// governance entities (customers, teams, virtual keys) and the user-config
++// entities (providers, keys, MCP clients). Each governance/config row
++// carries a tenant_id; the per-tenant Bifrost runtime registry uses that
++// to dispatch requests into the right tenant's world.
++//
++// These methods are deliberately small and do not preload relationships
++// — tenants own a lot of dependents and the admin UI / control plane
++// will paginate them via the entity-specific endpoints.
++
++// GetTenants retrieves all tenants from the database, ordered by creation.
++func (s *RDBConfigStore) GetTenants(ctx context.Context) ([]tables.TableTenant, error) {
++	var tenants []tables.TableTenant
++	if err := s.DB().WithContext(ctx).Order("created_at ASC").Find(&tenants).Error; err != nil {
++		return nil, err
++	}
++	return tenants, nil
++}
++
++// GetTenantsPaginated retrieves tenants with pagination and optional
++// search / status filtering.
++func (s *RDBConfigStore) GetTenantsPaginated(ctx context.Context, params TenantsQueryParams) ([]tables.TableTenant, int64, error) {
++	baseQuery := s.DB().WithContext(ctx).Model(&tables.TableTenant{})
++	if params.Search != "" {
++		search := "%" + strings.ToLower(params.Search) + "%"
++		baseQuery = baseQuery.Where("LOWER(name) LIKE ? OR LOWER(id) LIKE ?", search, search)
++	}
++	if params.Status != "" {
++		baseQuery = baseQuery.Where("status = ?", params.Status)
++	}
++	var totalCount int64
++	if err := baseQuery.Count(&totalCount).Error; err != nil {
++		return nil, 0, err
++	}
++	limit := params.Limit
++	offset := params.Offset
++	if limit <= 0 {
++		limit = 25
++	} else if limit > 100 {
++		limit = 100
++	}
++	if offset < 0 {
++		offset = 0
++	}
++	var tenants []tables.TableTenant
++	if err := baseQuery.Order("created_at ASC, id ASC").
++		Offset(offset).Limit(limit).
++		Find(&tenants).Error; err != nil {
++		return nil, 0, err
++	}
++	return tenants, totalCount, nil
++}
++
++// GetTenant retrieves a specific tenant by ID.
++func (s *RDBConfigStore) GetTenant(ctx context.Context, id string) (*tables.TableTenant, error) {
++	var tenant tables.TableTenant
++	if err := s.DB().WithContext(ctx).First(&tenant, "id = ?", id).Error; err != nil {
++		if errors.Is(err, gorm.ErrRecordNotFound) {
++			return nil, ErrNotFound
++		}
++		return nil, err
++	}
++	return &tenant, nil
++}
++
++// CreateTenant inserts a new tenant. Returns ErrAlreadyExists if the ID
++// collides with an existing row (e.g. the seeded "default" tenant).
++func (s *RDBConfigStore) CreateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
++	var txDB *gorm.DB
++	if len(tx) > 0 {
++		txDB = tx[0]
++	} else {
++		txDB = s.DB()
++	}
++	if err := txDB.WithContext(ctx).Create(tenant).Error; err != nil {
++		return s.parseGormError(err)
++	}
++	return nil
++}
++
++// UpdateTenant persists changes to a tenant (rename, status flip,
++// description edit).
++func (s *RDBConfigStore) UpdateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
++	var txDB *gorm.DB
++	if len(tx) > 0 {
++		txDB = tx[0]
++	} else {
++		txDB = s.DB()
++	}
++	if err := txDB.WithContext(ctx).Save(tenant).Error; err != nil {
++		return s.parseGormError(err)
++	}
++	return nil
++}
++
++// DeleteTenant removes a tenant. Refuses if any owned rows remain
++// (ErrTenantNotEmpty) or if the target is the reserved DefaultTenantID
++// (ErrReservedTenant). Operators expecting "deactivate" semantics should
++// flip Status to TenantStatusSuspended via UpdateTenant instead.
++//
++// The emptiness check covers every table that carries a tenant_id today
++// (governance: customers, teams, virtual keys, budgets, rate limits;
++// config: providers, keys, MCP clients). A future patch that adds
++// tenant_id to a new table must extend this loop too.
++func (s *RDBConfigStore) DeleteTenant(ctx context.Context, id string) error {
++	if id == tables.DefaultTenantID {
++		return ErrReservedTenant
++	}
++	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		// 1) Tenant must exist.
++		var tenant tables.TableTenant
++		if err := tx.WithContext(ctx).First(&tenant, "id = ?", id).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return ErrNotFound
++			}
++			return err
++		}
++
++		// 2) Tenant must be drained. We check each tenant-scoped table; the
++		//    first non-zero count short-circuits with ErrTenantNotEmpty.
++		ownedTables := []struct {
++			model     any
++			tableName string
++		}{
++			{&tables.TableCustomer{}, "governance_customers"},
++			{&tables.TableTeam{}, "governance_teams"},
++			{&tables.TableVirtualKey{}, "governance_virtual_keys"},
++			{&tables.TableBudget{}, "governance_budgets"},
++			{&tables.TableRateLimit{}, "governance_rate_limits"},
++			{&tables.TableProvider{}, "config_providers"},
++			{&tables.TableKey{}, "config_keys"},
++			{&tables.TableMCPClient{}, "config_mcp_clients"},
++		}
++		for _, t := range ownedTables {
++			var count int64
++			if err := tx.WithContext(ctx).Model(t.model).
++				Where("tenant_id = ?", id).
++				Count(&count).Error; err != nil {
++				return fmt.Errorf("count %s rows for tenant %s: %w", t.tableName, id, err)
++			}
++			if count > 0 {
++				return fmt.Errorf("%w: %d row(s) in %s still reference this tenant", ErrTenantNotEmpty, count, t.tableName)
++			}
++		}
++
++		// 3) Safe to delete.
++		if err := tx.WithContext(ctx).Delete(&tables.TableTenant{}, "id = ?", id).Error; err != nil {
++			return err
++		}
++		return nil
++	})
++}
++
+ // GetRateLimits retrieves all rate limits from the database.
+ func (s *RDBConfigStore) GetRateLimits(ctx context.Context) ([]tables.TableRateLimit, error) {
+ 	var rateLimits []tables.TableRateLimit
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index 268ef1ba2..2cedc6484 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -3,6 +3,7 @@ package configstore
+ import (
+ 	"context"
+ 	"encoding/json"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/maximhq/bifrost/core/schemas"
+@@ -32,6 +33,7 @@ func setupRDBTestStore(t *testing.T) *RDBConfigStore {
+ 		&tables.TableVirtualKeyProviderConfigKey{},
+ 		&tables.TableCustomer{},
+ 		&tables.TableTeam{},
++		&tables.TableTenant{},
+ 		&tables.TableClientConfig{},
+ 		&tables.TablePlugin{},
+ 		&tables.TableMCPClient{},
+@@ -47,6 +49,16 @@ func setupRDBTestStore(t *testing.T) *RDBConfigStore {
+ 	)
+ 	require.NoError(t, err, "Failed to migrate test database")
+ 
++	// Seed the default tenant. The migration chain does this via the
++	// initial multi-tenant migration; the minimal AutoMigrate above
++	// skips that, so seed it explicitly so DeleteTenant's reserved-id
++	// guard has something to point at.
++	require.NoError(t, db.Create(&tables.TableTenant{
++		ID:     tables.DefaultTenantID,
++		Name:   "Default Tenant",
++		Status: tables.TenantStatusActive,
++	}).Error)
++
+ 	// Setup join table
+ 	err = db.SetupJoinTable(&tables.TableVirtualKeyProviderConfig{}, "Keys", &tables.TableVirtualKeyProviderConfigKey{})
+ 	require.NoError(t, err, "Failed to setup join table")
+@@ -1087,6 +1099,172 @@ func TestCreateTeam(t *testing.T) {
+ 	assert.Equal(t, "customer-for-team", *result.CustomerID)
+ }
+ 
++// =============================================================================
++// Tenant CRUD Tests
++// =============================================================================
++
++func TestTenant_CreateGetUpdate(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	// Default tenant is seeded by the initial multi-tenant migration.
++	def, err := store.GetTenant(ctx, tables.DefaultTenantID)
++	require.NoError(t, err)
++	assert.Equal(t, tables.DefaultTenantID, def.ID)
++	assert.Equal(t, tables.TenantStatusActive, def.Status)
++
++	// Create.
++	tenant := &tables.TableTenant{
++		ID:          "acme",
++		Name:        "Acme Corp",
++		Status:      tables.TenantStatusActive,
++		Description: "primary acme account",
++	}
++	require.NoError(t, store.CreateTenant(ctx, tenant))
++
++	got, err := store.GetTenant(ctx, "acme")
++	require.NoError(t, err)
++	assert.Equal(t, "Acme Corp", got.Name)
++	assert.Equal(t, "primary acme account", got.Description)
++
++	// Update — flip to suspended + rename.
++	got.Status = tables.TenantStatusSuspended
++	got.Name = "Acme Corp (suspended)"
++	require.NoError(t, store.UpdateTenant(ctx, got))
++
++	got2, err := store.GetTenant(ctx, "acme")
++	require.NoError(t, err)
++	assert.Equal(t, tables.TenantStatusSuspended, got2.Status)
++	assert.Equal(t, "Acme Corp (suspended)", got2.Name)
++}
++
++func TestTenant_CreateDuplicateRejected(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	tenant := &tables.TableTenant{
++		ID:     "acme",
++		Name:   "Acme",
++		Status: tables.TenantStatusActive,
++	}
++	require.NoError(t, store.CreateTenant(ctx, tenant))
++
++	// Re-inserting the same ID must fail. parseGormError typically maps
++	// uniqueness violations to ErrAlreadyExists; the exact sentinel is
++	// less important than the error not being nil.
++	err := store.CreateTenant(ctx, tenant)
++	require.Error(t, err)
++}
++
++func TestTenant_GetNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	_, err := store.GetTenant(ctx, "no-such-tenant")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++func TestTenant_DeleteEmptyTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	tenant := &tables.TableTenant{
++		ID:     "empty-tenant",
++		Name:   "Empty",
++		Status: tables.TenantStatusActive,
++	}
++	require.NoError(t, store.CreateTenant(ctx, tenant))
++	require.NoError(t, store.DeleteTenant(ctx, "empty-tenant"))
++
++	_, err := store.GetTenant(ctx, "empty-tenant")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++func TestTenant_DeleteRefusedWhenNotEmpty(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	tenant := &tables.TableTenant{
++		ID:     "owns-stuff",
++		Name:   "Owns Stuff",
++		Status: tables.TenantStatusActive,
++	}
++	require.NoError(t, store.CreateTenant(ctx, tenant))
++
++	// Insert a customer assigned to this tenant.
++	customer := &tables.TableCustomer{
++		ID:       "owned-customer",
++		Name:     "Owned Customer",
++		TenantID: "owns-stuff",
++	}
++	require.NoError(t, store.CreateCustomer(ctx, customer))
++
++	err := store.DeleteTenant(ctx, "owns-stuff")
++	require.Error(t, err)
++	assert.ErrorIs(t, err, ErrTenantNotEmpty)
++
++	// Tenant must still exist.
++	_, err = store.GetTenant(ctx, "owns-stuff")
++	require.NoError(t, err)
++
++	// Remove the customer; delete now succeeds.
++	require.NoError(t, store.DeleteCustomer(ctx, "owned-customer"))
++	require.NoError(t, store.DeleteTenant(ctx, "owns-stuff"))
++}
++
++func TestTenant_DeleteDefaultRefused(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	err := store.DeleteTenant(ctx, tables.DefaultTenantID)
++	assert.ErrorIs(t, err, ErrReservedTenant)
++
++	// Default tenant is still there.
++	def, err := store.GetTenant(ctx, tables.DefaultTenantID)
++	require.NoError(t, err)
++	assert.Equal(t, tables.DefaultTenantID, def.ID)
++}
++
++func TestTenant_ListAndPaginate(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	// Seed three tenants beyond the default.
++	for _, id := range []string{"alpha", "beta", "gamma"} {
++		require.NoError(t, store.CreateTenant(ctx, &tables.TableTenant{
++			ID:     id,
++			Name:   strings.ToUpper(id),
++			Status: tables.TenantStatusActive,
++		}))
++	}
++
++	all, err := store.GetTenants(ctx)
++	require.NoError(t, err)
++	// At minimum: default + 3 we just added.
++	assert.GreaterOrEqual(t, len(all), 4)
++
++	// Search by lowercased name fragment.
++	page, total, err := store.GetTenantsPaginated(ctx, TenantsQueryParams{Search: "alph", Limit: 10})
++	require.NoError(t, err)
++	assert.Equal(t, int64(1), total)
++	require.Len(t, page, 1)
++	assert.Equal(t, "alpha", page[0].ID)
++
++	// Filter by status — flip beta to suspended.
++	beta, err := store.GetTenant(ctx, "beta")
++	require.NoError(t, err)
++	beta.Status = tables.TenantStatusSuspended
++	require.NoError(t, store.UpdateTenant(ctx, beta))
++
++	page, _, err = store.GetTenantsPaginated(ctx, TenantsQueryParams{
++		Status: tables.TenantStatusSuspended,
++		Limit:  10,
++	})
++	require.NoError(t, err)
++	require.Len(t, page, 1)
++	assert.Equal(t, "beta", page[0].ID)
++}
++
+ // =============================================================================
+ // Ping and Health Tests
+ // =============================================================================
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index 451ba86c5..080372ff4 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -63,6 +63,16 @@ type CustomersQueryParams struct {
+ 	Search string
+ }
+ 
++// TenantsQueryParams holds pagination, filtering, and search parameters for
++// tenant queries. Status filters to only tenants with that status (active /
++// suspended); empty matches all.
++type TenantsQueryParams struct {
++	Limit  int
++	Offset int
++	Search string
++	Status string
++}
++
+ // PricingOverrideFilters holds the filters for pricing overrides.
+ type PricingOverrideFilters struct {
+ 	ScopeKind     *string
+@@ -198,6 +208,17 @@ type ConfigStore interface {
+ 	UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
+ 	DeleteCustomer(ctx context.Context, id string) error
+ 
++	// Tenant CRUD — the platform-level isolation boundary above governance.
++	// DeleteTenant refuses with ErrTenantNotEmpty if any governance / config
++	// rows still carry the tenant_id, and with ErrReservedTenant for the
++	// DefaultTenantID (which single-tenant OSS deployments depend on).
++	GetTenants(ctx context.Context) ([]tables.TableTenant, error)
++	GetTenantsPaginated(ctx context.Context, params TenantsQueryParams) ([]tables.TableTenant, int64, error)
++	GetTenant(ctx context.Context, id string) (*tables.TableTenant, error)
++	CreateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error
++	UpdateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error
++	DeleteTenant(ctx context.Context, id string) error
++
+ 	// Rate limit CRUD
+ 	GetRateLimits(ctx context.Context) ([]tables.TableRateLimit, error)
+ 	GetRateLimit(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableRateLimit, error)
+-- 
+2.51.0
+
