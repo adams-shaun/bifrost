@@ -1,0 +1,264 @@
+From 8b2ab437760869bedef9c846e47695e6434d20c8 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 16:02:45 -0600
+Subject: [PATCH 7/7] configstore: add TableTenant and customer.tenant_id
+ (Phase 1 schema starter)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First migration of the multi-tenant Phase 1 rollout. Creates a
+bf_tenants table at the platform level (above governance), seeds a
+"default" tenant so existing single-tenant deployments keep working,
+adds tenant_id to governance_customers with a "default" default, and
+backfills any pre-existing customer rows to the default tenant.
+
+This is the pattern for the rest of the governance tables (teams,
+virtual_keys, budgets, rate_limits, provider_configs) — keeping each
+table's tenant_id rollout as its own migration commit makes review
+tractable.
+
+Backward-compatible by construction: single-tenant deployments observe
+no behavior change (every customer belongs to tenant=default).
+
+Tests:
+  - TestTriggerMigrations_FreshDB now asserts bf_tenants exists
+  - TestMigrationAddTenants_CreatesTableAndSeedsDefault asserts the
+    default tenant is seeded, the column default kicks in for new
+    customer inserts, and the migration is idempotent on re-run
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/migrations.go      | 79 ++++++++++++++++++++++++
+ framework/configstore/migrations_test.go | 48 ++++++++++++++
+ framework/configstore/tables/customer.go |  5 ++
+ framework/configstore/tables/tenant.go   | 44 +++++++++++++
+ 4 files changed, 176 insertions(+)
+ create mode 100644 framework/configstore/tables/tenant.go
+
+diff --git a/framework/configstore/migrations.go b/framework/configstore/migrations.go
+index 4ddde3604..230930d94 100644
+--- a/framework/configstore/migrations.go
++++ b/framework/configstore/migrations.go
+@@ -796,6 +796,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
+ 	if err := migrationRefreshConfigHashAfterMCPExternalServerURLRemoval(ctx, db); err != nil {
+ 		return err
+ 	}
++	if err := migrationAddTenantsTableAndCustomerTenantID(ctx, db); err != nil {
++		return err
++	}
+ 	return nil
+ }
+ 
+@@ -8539,3 +8542,79 @@ func migrationAddTempTokensTable(ctx context.Context, db *gorm.DB) error {
+ 	}
+ 	return nil
+ }
++
++// migrationAddTenantsTableAndCustomerTenantID is the first migration in the
++// multi-tenant rollout. It creates bf_tenants, seeds a "default" tenant so
++// existing single-tenant deployments keep working, adds tenant_id to
++// governance_customers, and backfills any pre-existing rows to "default".
++//
++// Other governance tables (teams, virtual_keys, budgets, rate_limits,
++// provider_configs) follow this pattern in later migrations to keep each
++// commit reviewable.
++func migrationAddTenantsTableAndCustomerTenantID(ctx context.Context, db *gorm.DB) error {
++	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
++		ID: "add_tenants_table_and_customer_tenant_id",
++		Migrate: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++
++			// 1. Create bf_tenants table.
++			if !mig.HasTable(&tables.TableTenant{}) {
++				if err := mig.CreateTable(&tables.TableTenant{}); err != nil {
++					return fmt.Errorf("failed to create bf_tenants: %w", err)
++				}
++			}
++
++			// 2. Seed the default tenant. ON CONFLICT DO NOTHING lets the
++			//    migration be idempotent across re-runs and across dialects.
++			now := time.Now()
++			defaultTenant := &tables.TableTenant{
++				ID:          tables.DefaultTenantID,
++				Name:        "Default Tenant",
++				Status:      tables.TenantStatusActive,
++				Description: "Seeded by initial multi-tenant migration. Single-tenant deployments stay assigned to this tenant.",
++				CreatedAt:   now,
++				UpdatedAt:   now,
++			}
++			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(defaultTenant).Error; err != nil {
++				return fmt.Errorf("failed to seed default tenant: %w", err)
++			}
++
++			// 3. Add tenant_id to governance_customers.
++			if !mig.HasColumn(&tables.TableCustomer{}, "tenant_id") {
++				if err := mig.AddColumn(&tables.TableCustomer{}, "TenantID"); err != nil {
++					return fmt.Errorf("failed to add tenant_id column to governance_customers: %w", err)
++				}
++			}
++
++			// 4. Backfill any rows the AddColumn default didn't populate
++			//    (Postgres respects the default; older SQLite may not honor
++			//    it when adding NOT NULL columns to existing rows).
++			if err := tx.Exec(`UPDATE governance_customers SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''`,
++				tables.DefaultTenantID).Error; err != nil {
++				return fmt.Errorf("failed to backfill governance_customers.tenant_id: %w", err)
++			}
++
++			return nil
++		},
++		Rollback: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++			if mig.HasColumn(&tables.TableCustomer{}, "tenant_id") {
++				if err := mig.DropColumn(&tables.TableCustomer{}, "tenant_id"); err != nil {
++					return fmt.Errorf("failed to drop tenant_id column from governance_customers: %w", err)
++				}
++			}
++			if mig.HasTable(&tables.TableTenant{}) {
++				if err := mig.DropTable(&tables.TableTenant{}); err != nil {
++					return fmt.Errorf("failed to drop bf_tenants: %w", err)
++				}
++			}
++			return nil
++		},
++	}})
++	if err := m.Migrate(); err != nil {
++		return fmt.Errorf("error running add_tenants_table_and_customer_tenant_id migration: %s", err.Error())
++	}
++	return nil
++}
+diff --git a/framework/configstore/migrations_test.go b/framework/configstore/migrations_test.go
+index 4675db3ea..dea803ed3 100644
+--- a/framework/configstore/migrations_test.go
++++ b/framework/configstore/migrations_test.go
+@@ -1157,6 +1157,7 @@ func TestTriggerMigrations_FreshDB(t *testing.T) {
+ 		&tables.TableClientConfig{},
+ 		&tables.TableVirtualKeyProviderConfig{},
+ 		&tables.TableVirtualKeyMCPConfig{},
++		&tables.TableTenant{},
+ 	}
+ 
+ 	migrator := db.Migrator()
+@@ -2381,3 +2382,50 @@ func assertNoCorruptedFKReferences(t *testing.T, db *gorm.DB) {
+ }
+ 
+ func strPtr(s string) *string { return &s }
++
++// TestMigrationAddTenants_CreatesTableAndSeedsDefault verifies that the
++// initial multi-tenant migration:
++//   - creates the bf_tenants table
++//   - seeds the "default" tenant
++//   - adds tenant_id to governance_customers
++//   - backfills existing customer rows to the default tenant
++//
++// Plus an idempotency check (second run must not duplicate the default tenant).
++func TestMigrationAddTenants_CreatesTableAndSeedsDefault(t *testing.T) {
++	_, db := setupFullMigrationDB(t)
++	ctx := context.Background()
++
++	// The table should exist and hold the default tenant.
++	require.True(t, db.Migrator().HasTable(&tables.TableTenant{}))
++	var got tables.TableTenant
++	err := db.First(&got, "id = ?", tables.DefaultTenantID).Error
++	require.NoError(t, err)
++	assert.Equal(t, tables.DefaultTenantID, got.ID)
++	assert.Equal(t, tables.TenantStatusActive, got.Status)
++
++	// governance_customers should have tenant_id.
++	assert.True(t, db.Migrator().HasColumn(&tables.TableCustomer{}, "tenant_id"))
++
++	// A customer inserted without an explicit TenantID gets the default via
++	// the column default (NOT via the migration backfill, which only touches
++	// rows inserted *before* the column existed).
++	now := time.Now()
++	cust := tables.TableCustomer{
++		ID:        "cust-1",
++		Name:      "Acme",
++		CreatedAt: now,
++		UpdatedAt: now,
++	}
++	require.NoError(t, db.Create(&cust).Error)
++	var roundtripped tables.TableCustomer
++	require.NoError(t, db.First(&roundtripped, "id = ?", "cust-1").Error)
++	assert.Equal(t, tables.DefaultTenantID, roundtripped.TenantID,
++		"customer.tenant_id should default to %q when omitted on insert", tables.DefaultTenantID)
++
++	// Idempotency: running the migration a second time must not duplicate
++	// the default tenant row or fail.
++	require.NoError(t, migrationAddTenantsTableAndCustomerTenantID(ctx, db))
++	var count int64
++	require.NoError(t, db.Model(&tables.TableTenant{}).Where("id = ?", tables.DefaultTenantID).Count(&count).Error)
++	assert.Equal(t, int64(1), count, "default tenant must not be duplicated on re-run")
++}
+diff --git a/framework/configstore/tables/customer.go b/framework/configstore/tables/customer.go
+index c3b9a6f08..ab547d93a 100644
+--- a/framework/configstore/tables/customer.go
++++ b/framework/configstore/tables/customer.go
+@@ -9,6 +9,11 @@ type TableCustomer struct {
+ 	BudgetID    *string `gorm:"type:varchar(255);index" json:"budget_id,omitempty"`
+ 	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
+ 
++	// TenantID scopes this customer to a tenant for multi-tenant deployments.
++	// Single-tenant OSS uses the DefaultTenantID; the initial tenant migration
++	// backfills existing rows to that value before making the column NOT NULL.
++	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++
+ 	// Relationships
+ 	Budget      *TableBudget      `gorm:"foreignKey:BudgetID" json:"budget,omitempty"`
+ 	RateLimit   *TableRateLimit   `gorm:"foreignKey:RateLimitID" json:"rate_limit,omitempty"`
+diff --git a/framework/configstore/tables/tenant.go b/framework/configstore/tables/tenant.go
+new file mode 100644
+index 000000000..572bc4841
+--- /dev/null
++++ b/framework/configstore/tables/tenant.go
+@@ -0,0 +1,44 @@
++package tables
++
++import "time"
++
++// TableTenant is the top-level isolation boundary for multi-tenant Bifrost
++// deployments. Every governance entity (customers, teams, virtual keys,
++// budgets, rate limits) belongs to exactly one tenant.
++//
++// Single-tenant OSS deployments use the "default" tenant created by the
++// initial tenant migration so existing data remains valid. The HTTP transport
++// resolves an inbound virtual key to its owning tenant before dispatching
++// to the per-tenant Bifrost runtime; queries inside the governance plugin
++// scope by the tenant_id carried in BifrostContext.
++//
++// Tenants intentionally hold no provider keys, MCP configs, or plugin
++// configs of their own — those are still attached to customers/teams/VKs.
++// The Tenant table is a *grouping* construct, not a config container.
++type TableTenant struct {
++	ID     string `gorm:"primaryKey;type:varchar(255)" json:"id"`
++	Name   string `gorm:"type:varchar(255);not null" json:"name"`
++	Status string `gorm:"type:varchar(32);not null;default:active" json:"status"`
++
++	// Description is a human-readable note shown in the admin UI.
++	Description string `gorm:"type:text" json:"description,omitempty"`
++
++	CreatedAt time.Time `gorm:"index;not null" json:"created_at"`
++	UpdatedAt time.Time `gorm:"index;not null" json:"updated_at"`
++}
++
++// TableName sets the table name. We prefix with bf_ rather than governance_
++// because tenants are a platform concept above governance, not a governance
++// entity themselves.
++func (TableTenant) TableName() string { return "bf_tenants" }
++
++// DefaultTenantID is the ID seeded by the initial migration so existing
++// single-tenant deployments don't need to opt in to multi-tenancy. All
++// governance rows with no explicit tenant are backfilled to this value.
++const DefaultTenantID = "default"
++
++// TenantStatus values.
++const (
++	TenantStatusActive    = "active"
++	TenantStatusSuspended = "suspended"
++)
+-- 
+2.51.0
+

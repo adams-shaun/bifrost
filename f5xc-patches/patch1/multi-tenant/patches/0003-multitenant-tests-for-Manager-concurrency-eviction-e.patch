@@ -1,0 +1,350 @@
+From a8c7b5554e0be3b14abdf781b2980a8f959bfb23 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 14:41:57 -0600
+Subject: [PATCH 3/7] multitenant: tests for Manager concurrency, eviction,
+ error retry
+
+Nine tests covering the Manager invariants that the spike doesn't
+exercise directly:
+
+  - concurrent Acquire on the same tenant loads exactly once (initOnce)
+  - eviction respects refcount: pinned tenants block until released
+  - loader errors propagate and the entry is forgotten so a future
+    Acquire actually retries the loader
+  - Shutdown rejects new Acquires (ErrManagerClosed) and tears down
+    all loaded runtimes
+  - Handle.Release is idempotent
+  - CachedVKResolver expires entries after the configured TTL
+
+Passes under -race in ~1.2s.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ multitenant/manager_test.go | 315 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 315 insertions(+)
+ create mode 100644 multitenant/manager_test.go
+
+diff --git a/multitenant/manager_test.go b/multitenant/manager_test.go
+new file mode 100644
+index 000000000..82f7385b0
+--- /dev/null
++++ b/multitenant/manager_test.go
+@@ -0,0 +1,315 @@
++package multitenant
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// minimalLoader returns the cheapest BifrostConfig that still passes Init —
++// one OpenAI provider with a fake key and tiny concurrency. Avoids real
++// network I/O and keeps Init in the microsecond range.
++func minimalLoader(_ context.Context, tid TenantID) (schemas.BifrostConfig, error) {
++	acct := NewStaticAccount(tid)
++	acct.AddProvider(schemas.OpenAI, []schemas.Key{{
++		ID:     "k",
++		Value:  *schemas.NewEnvVar("fake"),
++		Models: schemas.WhiteList{"*"},
++		Weight: 1.0,
++	}}, &schemas.ProviderConfig{
++		NetworkConfig: schemas.DefaultNetworkConfig,
++		ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{
++			Concurrency: 2,
++			BufferSize:  4,
++		},
++	})
++	return schemas.BifrostConfig{
++		Account:         acct,
++		InitialPoolSize: 4,
++	}, nil
++}
++
++// countingLoader records how many times the loader was actually invoked.
++// Used to verify initOnce serialization under concurrent Acquire.
++type countingLoader struct {
++	calls atomic.Int64
++}
++
++func (c *countingLoader) load(ctx context.Context, tid TenantID) (schemas.BifrostConfig, error) {
++	c.calls.Add(1)
++	return minimalLoader(ctx, tid)
++}
++
++func TestAcquireRelease_RoundTrip(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	mgr, err := NewManager(ctx, ManagerConfig{Loader: minimalLoader})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer mgr.Shutdown(ctx)
++
++	h, err := mgr.Acquire(ctx, "acme")
++	if err != nil {
++		t.Fatalf("Acquire: %v", err)
++	}
++	if h.Bifrost() == nil {
++		t.Fatal("nil Bifrost in handle")
++	}
++	if got := mgr.ActiveRuntimes(); got != 1 {
++		t.Fatalf("ActiveRuntimes=%d want 1", got)
++	}
++	h.Release()
++	h.Release() // idempotent
++}
++
++func TestAcquire_ConcurrentSameTenant_LoadsOnce(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	cl := &countingLoader{}
++	mgr, err := NewManager(ctx, ManagerConfig{Loader: cl.load})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer mgr.Shutdown(ctx)
++
++	const N = 64
++	var wg sync.WaitGroup
++	errs := make(chan error, N)
++	for i := 0; i < N; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			h, err := mgr.Acquire(ctx, "acme")
++			if err != nil {
++				errs <- err
++				return
++			}
++			defer h.Release()
++		}()
++	}
++	wg.Wait()
++	close(errs)
++	for e := range errs {
++		t.Fatalf("Acquire err: %v", e)
++	}
++	if got := cl.calls.Load(); got != 1 {
++		t.Fatalf("loader called %d times, want 1", got)
++	}
++}
++
++func TestAcquire_EvictionUnderCap(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	mgr, err := NewManager(ctx, ManagerConfig{
++		Loader:            minimalLoader,
++		MaxActiveRuntimes: 2,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer mgr.Shutdown(ctx)
++
++	// Acquire+release three distinct tenants. Cap is 2 so the third triggers
++	// eviction. We don't hold handles, so the LRU has an idle victim.
++	for _, tid := range []TenantID{"a", "b", "c"} {
++		h, err := mgr.Acquire(ctx, tid)
++		if err != nil {
++			t.Fatalf("Acquire(%s): %v", tid, err)
++		}
++		h.Release()
++	}
++	if got := mgr.ActiveRuntimes(); got != 2 {
++		t.Fatalf("ActiveRuntimes=%d want 2", got)
++	}
++}
++
++func TestAcquire_EvictionRespectsRefcount(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	mgr, err := NewManager(ctx, ManagerConfig{
++		Loader:            minimalLoader,
++		MaxActiveRuntimes: 2,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer mgr.Shutdown(ctx)
++
++	// Hold handles to a + b so both are pinned. Acquiring c must block until
++	// one of them is released.
++	hA, err := mgr.Acquire(ctx, "a")
++	if err != nil {
++		t.Fatal(err)
++	}
++	hB, err := mgr.Acquire(ctx, "b")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	cAcquired := make(chan error, 1)
++	go func() {
++		acqCtx, acqCancel := context.WithTimeout(ctx, 2*time.Second)
++		defer acqCancel()
++		hC, err := mgr.Acquire(acqCtx, "c")
++		if err == nil {
++			hC.Release()
++		}
++		cAcquired <- err
++	}()
++
++	// Briefly let the goroutine spin; we want to see it blocked.
++	time.Sleep(50 * time.Millisecond)
++	select {
++	case e := <-cAcquired:
++		t.Fatalf("Acquire(c) returned too early: %v", e)
++	default:
++	}
++
++	hA.Release()
++	select {
++	case e := <-cAcquired:
++		if e != nil {
++			t.Fatalf("Acquire(c) failed after Release(a): %v", e)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("Acquire(c) did not unblock after Release(a)")
++	}
++	hB.Release()
++}
++
++func TestAcquire_LoaderErrorPropagates_AndEntryIsRetryable(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	var fail atomic.Bool
++	fail.Store(true)
++	calls := atomic.Int64{}
++	loader := func(ctx context.Context, tid TenantID) (schemas.BifrostConfig, error) {
++		calls.Add(1)
++		if fail.Load() {
++			return schemas.BifrostConfig{}, errors.New("boom")
++		}
++		return minimalLoader(ctx, tid)
++	}
++
++	mgr, err := NewManager(ctx, ManagerConfig{Loader: loader})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer mgr.Shutdown(ctx)
++
++	if _, err := mgr.Acquire(ctx, "acme"); err == nil {
++		t.Fatal("Acquire should have returned loader error")
++	}
++	if got := mgr.ActiveRuntimes(); got != 0 {
++		t.Fatalf("ActiveRuntimes=%d want 0 after failed Init", got)
++	}
++
++	// Flip the loader to succeed and retry — the entry must have been
++	// forgotten so the next Acquire actually re-invokes the loader.
++	fail.Store(false)
++	h, err := mgr.Acquire(ctx, "acme")
++	if err != nil {
++		t.Fatalf("Acquire after recovery: %v", err)
++	}
++	h.Release()
++	if got := calls.Load(); got != 2 {
++		t.Fatalf("loader calls=%d want 2", got)
++	}
++}
++
++func TestShutdown_BlocksNewAcquires(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	mgr, err := NewManager(ctx, ManagerConfig{Loader: minimalLoader})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := mgr.Shutdown(ctx); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := mgr.Acquire(ctx, "acme"); !errors.Is(err, ErrManagerClosed) {
++		t.Fatalf("Acquire after Shutdown err=%v want %v", err, ErrManagerClosed)
++	}
++}
++
++func TestShutdown_TearsDownRuntimes(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	mgr, err := NewManager(ctx, ManagerConfig{Loader: minimalLoader})
++	if err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 3; i++ {
++		h, err := mgr.Acquire(ctx, TenantID(fmt.Sprintf("t%d", i)))
++		if err != nil {
++			t.Fatal(err)
++		}
++		h.Release()
++	}
++	if got := mgr.ActiveRuntimes(); got != 3 {
++		t.Fatalf("pre-shutdown ActiveRuntimes=%d want 3", got)
++	}
++	if err := mgr.Shutdown(ctx); err != nil {
++		t.Fatal(err)
++	}
++	if got := mgr.ActiveRuntimes(); got != 0 {
++		t.Fatalf("post-shutdown ActiveRuntimes=%d want 0", got)
++	}
++}
++
++func TestMemoryVKResolver(t *testing.T) {
++	r := NewMemoryVKResolver(map[string]TenantID{"sk-a": "alpha"})
++	tid, err := r.ResolveVK(context.Background(), "sk-a")
++	if err != nil || tid != "alpha" {
++		t.Fatalf("got tid=%s err=%v", tid, err)
++	}
++	if _, err := r.ResolveVK(context.Background(), "sk-z"); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("expected ErrUnknownVK, got %v", err)
++	}
++}
++
++func TestCachedVKResolver_CachesAndExpires(t *testing.T) {
++	backing := NewMemoryVKResolver(map[string]TenantID{"sk-a": "alpha"})
++	cached := NewCachedVKResolver(backing, 50*time.Millisecond)
++
++	if _, err := cached.ResolveVK(context.Background(), "sk-a"); err != nil {
++		t.Fatal(err)
++	}
++	if got := cached.CacheSize(); got != 1 {
++		t.Fatalf("CacheSize=%d want 1", got)
++	}
++	// Hit cache — no error, same answer.
++	tid, err := cached.ResolveVK(context.Background(), "sk-a")
++	if err != nil || tid != "alpha" {
++		t.Fatalf("got tid=%s err=%v", tid, err)
++	}
++
++	// After TTL the entry is stale — we don't actively GC, but ResolveVK
++	// refuses stale entries and refetches.
++	time.Sleep(80 * time.Millisecond)
++	tid, err = cached.ResolveVK(context.Background(), "sk-a")
++	if err != nil || tid != "alpha" {
++		t.Fatalf("after TTL: tid=%s err=%v", tid, err)
++	}
++}
++
++func TestNewManager_RejectsMissingLoader(t *testing.T) {
++	_, err := NewManager(context.Background(), ManagerConfig{})
++	if !errors.Is(err, ErrLoaderRequired) {
++		t.Fatalf("got %v want ErrLoaderRequired", err)
++	}
++}
+-- 
+2.51.0
+

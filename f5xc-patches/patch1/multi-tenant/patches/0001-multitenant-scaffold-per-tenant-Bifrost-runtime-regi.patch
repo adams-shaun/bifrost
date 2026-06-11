@@ -1,0 +1,671 @@
+From b9ec579f97b58ec2d737782ab0d1a04df9e718aa Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 14:41:44 -0600
+Subject: [PATCH 1/7] multitenant: scaffold per-tenant Bifrost runtime registry
+
+Wraps the unchanged core/bifrost runtime in a tenant-keyed Manager that
+lazy-loads each tenant on first Acquire, refcounts in-flight Handles to
+defer eviction, and runs an LRU policy when MaxActiveRuntimes is set.
+
+Phase 2 of the enterprise multi-tenant fork plan: validates that we can
+run N independent Bifrost worlds in one process without touching
+core/bifrost.go.
+
+- tenant.go     TenantID, TenantLoader callback
+- runtime.go    runtimeEntry (initOnce/refCount/lastUsed), Handle
+- manager.go    Manager.Acquire, Evict, Shutdown; LRU + refcount-aware eviction
+- resolver.go   VKResolver interface, MemoryVKResolver, TTL-cached wrapper
+- account.go    StaticAccount: tenant-scoped schemas.Account impl for fixtures
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ multitenant/account.go  |  77 +++++++++++
+ multitenant/go.mod      |   7 +
+ multitenant/manager.go  | 290 ++++++++++++++++++++++++++++++++++++++++
+ multitenant/resolver.go | 111 +++++++++++++++
+ multitenant/runtime.go  |  82 ++++++++++++
+ multitenant/tenant.go   |  30 +++++
+ 6 files changed, 597 insertions(+)
+ create mode 100644 multitenant/account.go
+ create mode 100644 multitenant/go.mod
+ create mode 100644 multitenant/manager.go
+ create mode 100644 multitenant/resolver.go
+ create mode 100644 multitenant/runtime.go
+ create mode 100644 multitenant/tenant.go
+
+diff --git a/multitenant/account.go b/multitenant/account.go
+new file mode 100644
+index 000000000..3bb45ba0a
+--- /dev/null
++++ b/multitenant/account.go
+@@ -0,0 +1,77 @@
++package multitenant
++
++import (
++	"context"
++	"fmt"
++	"sync"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// StaticAccount is a minimal schemas.Account implementation backed by a fixed
++// per-tenant config map. Use only for tests / the spike — real tenants would
++// resolve providers and keys from Postgres on Init (and ideally hot-reload).
++//
++// All methods are safe for concurrent read.
++type StaticAccount struct {
++	tenantID TenantID
++	mu       sync.RWMutex
++	providers map[schemas.ModelProvider]staticProviderEntry
++}
++
++type staticProviderEntry struct {
++	keys   []schemas.Key
++	config *schemas.ProviderConfig
++}
++
++// NewStaticAccount returns an empty StaticAccount for the given tenant.
++// Use AddProvider to register provider configs before Init.
++func NewStaticAccount(tid TenantID) *StaticAccount {
++	return &StaticAccount{
++		tenantID:  tid,
++		providers: make(map[schemas.ModelProvider]staticProviderEntry),
++	}
++}
++
++// AddProvider registers a provider entry. cfg may be nil to use defaults.
++func (a *StaticAccount) AddProvider(p schemas.ModelProvider, keys []schemas.Key, cfg *schemas.ProviderConfig) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	a.providers[p] = staticProviderEntry{keys: keys, config: cfg}
++}
++
++func (a *StaticAccount) GetConfiguredProviders() ([]schemas.ModelProvider, error) {
++	a.mu.RLock()
++	defer a.mu.RUnlock()
++	out := make([]schemas.ModelProvider, 0, len(a.providers))
++	for p := range a.providers {
++		out = append(out, p)
++	}
++	return out, nil
++}
++
++func (a *StaticAccount) GetKeysForProvider(_ context.Context, providerKey schemas.ModelProvider) ([]schemas.Key, error) {
++	a.mu.RLock()
++	defer a.mu.RUnlock()
++	e, ok := a.providers[providerKey]
++	if !ok {
++		return nil, fmt.Errorf("provider %s not configured for tenant %s", providerKey, a.tenantID)
++	}
++	return e.keys, nil
++}
++
++func (a *StaticAccount) GetConfigForProvider(providerKey schemas.ModelProvider) (*schemas.ProviderConfig, error) {
++	a.mu.RLock()
++	defer a.mu.RUnlock()
++	e, ok := a.providers[providerKey]
++	if !ok {
++		return nil, fmt.Errorf("provider %s not configured for tenant %s", providerKey, a.tenantID)
++	}
++	if e.config != nil {
++		return e.config, nil
++	}
++	return &schemas.ProviderConfig{
++		NetworkConfig:            schemas.DefaultNetworkConfig,
++		ConcurrencyAndBufferSize: schemas.DefaultConcurrencyAndBufferSize,
++	}, nil
++}
+diff --git a/multitenant/go.mod b/multitenant/go.mod
+new file mode 100644
+index 000000000..5317b3d1f
+--- /dev/null
++++ b/multitenant/go.mod
+@@ -0,0 +1,7 @@
++module github.com/maximhq/bifrost/multitenant
++
++go 1.26.4
++
++require github.com/maximhq/bifrost/core v0.0.0
++
++replace github.com/maximhq/bifrost/core => ../core
+diff --git a/multitenant/manager.go b/multitenant/manager.go
+new file mode 100644
+index 000000000..6c4557275
+--- /dev/null
++++ b/multitenant/manager.go
+@@ -0,0 +1,290 @@
++package multitenant
++
++import (
++	"container/list"
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"time"
++
++	bifrost "github.com/maximhq/bifrost/core"
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// ErrManagerClosed is returned by Acquire after Shutdown has been called.
++var ErrManagerClosed = errors.New("multitenant: manager is closed")
++
++// ErrLoaderRequired is returned by NewManager if no TenantLoader was supplied.
++var ErrLoaderRequired = errors.New("multitenant: TenantLoader is required")
++
++// ManagerConfig is the construction-time configuration for Manager.
++type ManagerConfig struct {
++	// Loader builds a BifrostConfig for a tenant on demand. Required.
++	Loader TenantLoader
++
++	// MaxActiveRuntimes caps how many tenant runtimes can be ready at once.
++	// When Acquire would push the count above this cap, the LRU entry is
++	// evicted (after its in-flight requests drain). Zero = unbounded.
++	MaxActiveRuntimes int
++
++	// Logger receives operational logs. Defaults to bifrost's default logger.
++	Logger schemas.Logger
++}
++
++// Manager is the top-level multi-tenant wrapper. Hold one per process.
++// Manager is safe for concurrent use.
++type Manager struct {
++	cfg ManagerConfig
++
++	// rootCtx is the parent context for all tenant runtimes. Cancelled when
++	// Shutdown is called; child runtimes observe the cancellation and exit.
++	rootCtx    context.Context
++	rootCancel context.CancelFunc
++
++	// runtimes maps TenantID → *runtimeEntry. Read lock-free via sync.Map.
++	runtimes sync.Map
++
++	// mu guards lru list and closed flag. We deliberately keep this mutex
++	// off the hot path: Acquire updates the LRU on cache-hit but the typical
++	// op is O(1) — list.MoveToFront on an existing element.
++	mu     sync.Mutex
++	lru    *list.List // *list of *runtimeEntry, MRU at front, LRU at back
++	closed bool
++
++	logger schemas.Logger
++}
++
++// NewManager constructs a Manager. The provided ctx is the root for all
++// tenant runtimes; cancelling it triggers a graceful Shutdown.
++func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
++	if cfg.Loader == nil {
++		return nil, ErrLoaderRequired
++	}
++	if cfg.Logger == nil {
++		cfg.Logger = bifrost.NewDefaultLogger(schemas.LogLevelInfo)
++	}
++	rootCtx, cancel := context.WithCancel(ctx)
++	m := &Manager{
++		cfg:        cfg,
++		rootCtx:    rootCtx,
++		rootCancel: cancel,
++		lru:        list.New(),
++		logger:     cfg.Logger,
++	}
++	// Propagate parent-ctx cancellation into a graceful Shutdown so callers
++	// can wire Manager into application lifecycles without a separate stop call.
++	go func() {
++		<-rootCtx.Done()
++		_ = m.Shutdown(context.Background())
++	}()
++	return m, nil
++}
++
++// Acquire returns a Handle to the tenant's *bifrost.Bifrost, loading the
++// runtime lazily if it doesn't exist yet. The caller MUST call Handle.Release
++// when done — typically via defer — to allow eventual eviction.
++//
++// If MaxActiveRuntimes is set and Acquire would push the cache over the cap,
++// the least-recently-used idle (refCount==0) entry is evicted first. If no
++// idle entries exist, Acquire blocks until one frees up or ctx is cancelled.
++func (m *Manager) Acquire(ctx context.Context, tid TenantID) (*Handle, error) {
++	if tid == "" {
++		return nil, fmt.Errorf("multitenant: empty tenant id")
++	}
++
++	m.mu.Lock()
++	if m.closed {
++		m.mu.Unlock()
++		return nil, ErrManagerClosed
++	}
++	m.mu.Unlock()
++
++	// Fast path: existing entry. LoadOrStore avoids a second hash lookup on
++	// the common cache-hit branch.
++	newEntry := newRuntimeEntry(m.rootCtx, tid)
++	v, loaded := m.runtimes.LoadOrStore(tid, newEntry)
++	entry := v.(*runtimeEntry)
++
++	if !loaded {
++		// We won the race to create this tenant. Make eviction room before
++		// running the (potentially expensive) loader, and only then enroll
++		// the entry in the LRU.
++		if err := m.maybeEvictLocked(ctx); err != nil {
++			m.runtimes.Delete(tid)
++			newEntry.cancel()
++			return nil, err
++		}
++		m.mu.Lock()
++		entry.lruElem = m.lru.PushFront(entry)
++		m.mu.Unlock()
++	}
++
++	// initOnce makes the loader run exactly once even under concurrent Acquire.
++	// Concurrent callers block on the same Do; subsequent callers see initErr.
++	entry.initOnce.Do(func() {
++		bfCfg, err := m.cfg.Loader(entry.ctx, tid)
++		if err != nil {
++			entry.initErr = fmt.Errorf("loader: %w", err)
++			return
++		}
++		if bfCfg.Logger == nil {
++			bfCfg.Logger = m.logger
++		}
++		bf, err := bifrost.Init(entry.ctx, bfCfg)
++		if err != nil {
++			entry.initErr = fmt.Errorf("bifrost.Init: %w", err)
++			return
++		}
++		entry.bf = bf
++	})
++
++	if entry.initErr != nil {
++		// Failed init: forget the entry so a future Acquire can retry.
++		// Loader bugs that are persistent will simply fail again on next call.
++		m.runtimes.Delete(tid)
++		m.mu.Lock()
++		if entry.lruElem != nil {
++			m.lru.Remove(entry.lruElem)
++			entry.lruElem = nil
++		}
++		m.mu.Unlock()
++		entry.cancel()
++		return nil, entry.initErr
++	}
++
++	// Bookkeeping for active borrow + LRU position.
++	entry.refCount.Add(1)
++	entry.touch()
++	m.mu.Lock()
++	if entry.lruElem != nil {
++		m.lru.MoveToFront(entry.lruElem)
++	}
++	m.mu.Unlock()
++
++	h := &Handle{
++		tid: tid,
++		bf:  entry.bf,
++	}
++	h.release = func() {
++		entry.refCount.Add(-1)
++		entry.touch()
++	}
++	return h, nil
++}
++
++// maybeEvictLocked evicts LRU entries (refCount==0) until under the cap.
++// Returns an error only if the cap is exceeded AND no idle entry exists
++// AND ctx is cancelled before one frees up.
++//
++// Note: we hold the lock briefly per check; the actual Shutdown of an evicted
++// entry runs without the lock to avoid blocking other tenants.
++func (m *Manager) maybeEvictLocked(ctx context.Context) error {
++	if m.cfg.MaxActiveRuntimes <= 0 {
++		return nil
++	}
++	for {
++		m.mu.Lock()
++		over := m.lru.Len() >= m.cfg.MaxActiveRuntimes
++		var victim *runtimeEntry
++		if over {
++			for e := m.lru.Back(); e != nil; e = e.Prev() {
++				cand := e.Value.(*runtimeEntry)
++				if cand.refCount.Load() == 0 && !cand.shuttingDown.Load() {
++					victim = cand
++					break
++				}
++			}
++		}
++		m.mu.Unlock()
++
++		if !over {
++			return nil
++		}
++		if victim != nil {
++			m.evict(victim)
++			continue // re-check; may need to evict more (unlikely but safe)
++		}
++
++		// At cap and no idle victim. Brief sleep + retry; ctx-cancel wakes us.
++		// This is the spike-quality back-off; production would use a condvar.
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-time.After(10 * time.Millisecond):
++		}
++	}
++}
++
++// evict removes the entry from the registry and shuts down its Bifrost.
++// Idempotent. Blocks until shutdown finishes.
++func (m *Manager) evict(e *runtimeEntry) {
++	if !e.shuttingDown.CompareAndSwap(false, true) {
++		<-e.shutdownDone
++		return
++	}
++	defer close(e.shutdownDone)
++
++	// Remove from registry first so new Acquires don't find this entry.
++	m.runtimes.Delete(e.tenantID)
++	m.mu.Lock()
++	if e.lruElem != nil {
++		m.lru.Remove(e.lruElem)
++		e.lruElem = nil
++	}
++	m.mu.Unlock()
++
++	// Wait briefly for in-flight refs to drain. We don't have a condvar in
++	// the spike; production should signal via a per-entry channel.
++	deadline := time.Now().Add(5 * time.Second)
++	for e.refCount.Load() > 0 && time.Now().Before(deadline) {
++		time.Sleep(5 * time.Millisecond)
++	}
++
++	if e.bf != nil {
++		e.bf.Shutdown()
++	}
++	e.cancel()
++	m.logger.Info("multitenant: evicted tenant %s", string(e.tenantID))
++}
++
++// Evict explicitly removes a tenant from the cache. Blocks until shutdown
++// completes. Returns true if the tenant was present.
++func (m *Manager) Evict(tid TenantID) bool {
++	v, ok := m.runtimes.Load(tid)
++	if !ok {
++		return false
++	}
++	m.evict(v.(*runtimeEntry))
++	return true
++}
++
++// ActiveRuntimes returns the current count of loaded tenant runtimes.
++// Useful for telemetry and tests.
++func (m *Manager) ActiveRuntimes() int {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.lru.Len()
++}
++
++// Shutdown evicts all tenants and prevents further Acquire calls. Safe to call
++// multiple times. The supplied ctx bounds the wait for in-flight drains.
++func (m *Manager) Shutdown(ctx context.Context) error {
++	m.mu.Lock()
++	if m.closed {
++		m.mu.Unlock()
++		return nil
++	}
++	m.closed = true
++	var victims []*runtimeEntry
++	for e := m.lru.Front(); e != nil; e = e.Next() {
++		victims = append(victims, e.Value.(*runtimeEntry))
++	}
++	m.mu.Unlock()
++
++	for _, v := range victims {
++		m.evict(v)
++	}
++	m.rootCancel()
++	return nil
++}
+diff --git a/multitenant/resolver.go b/multitenant/resolver.go
+new file mode 100644
+index 000000000..1efa6d85f
+--- /dev/null
++++ b/multitenant/resolver.go
+@@ -0,0 +1,111 @@
++package multitenant
++
++import (
++	"context"
++	"errors"
++	"hash/fnv"
++	"sync"
++	"time"
++)
++
++// ErrUnknownVK is returned when a virtual key doesn't resolve to any tenant.
++var ErrUnknownVK = errors.New("multitenant: unknown virtual key")
++
++// VKResolver maps an inbound virtual key string to its owning TenantID.
++//
++// Production impl will be a Postgres lookup against governance_virtual_keys
++// fronted by an LRU cache (and invalidated by LISTEN/NOTIFY). For the spike,
++// MemoryVKResolver hardcodes the mapping.
++type VKResolver interface {
++	ResolveVK(ctx context.Context, vk string) (TenantID, error)
++}
++
++// VKResolverFunc adapts a function to VKResolver.
++type VKResolverFunc func(ctx context.Context, vk string) (TenantID, error)
++
++func (f VKResolverFunc) ResolveVK(ctx context.Context, vk string) (TenantID, error) {
++	return f(ctx, vk)
++}
++
++// MemoryVKResolver is a fixed VK→TenantID map suitable for tests and the spike.
++// Concurrent reads are safe; mutations are not.
++type MemoryVKResolver struct {
++	mapping map[string]TenantID
++}
++
++// NewMemoryVKResolver builds a resolver from a copy of m.
++func NewMemoryVKResolver(m map[string]TenantID) *MemoryVKResolver {
++	c := make(map[string]TenantID, len(m))
++	for k, v := range m {
++		c[k] = v
++	}
++	return &MemoryVKResolver{mapping: c}
++}
++
++func (r *MemoryVKResolver) ResolveVK(_ context.Context, vk string) (TenantID, error) {
++	t, ok := r.mapping[vk]
++	if !ok {
++		return "", ErrUnknownVK
++	}
++	return t, nil
++}
++
++// CachedVKResolver wraps another resolver with an in-memory LRU-ish cache
++// keyed by hash(vk). Entries expire after TTL. This mirrors the production
++// design where Postgres backs the resolver but a TTL'd cache keeps the hot
++// path off the DB.
++//
++// Spike-quality: not a true LRU; just TTL-eviction in a sync.Map. Fine for
++// measuring resolver overhead.
++type CachedVKResolver struct {
++	backing VKResolver
++	ttl     time.Duration
++
++	mu    sync.RWMutex
++	cache map[uint64]cachedVK
++}
++
++type cachedVK struct {
++	tid    TenantID
++	expiry time.Time
++}
++
++func NewCachedVKResolver(backing VKResolver, ttl time.Duration) *CachedVKResolver {
++	return &CachedVKResolver{
++		backing: backing,
++		ttl:     ttl,
++		cache:   make(map[uint64]cachedVK),
++	}
++}
++
++func (r *CachedVKResolver) ResolveVK(ctx context.Context, vk string) (TenantID, error) {
++	h := hashVK(vk)
++	r.mu.RLock()
++	if c, ok := r.cache[h]; ok && time.Now().Before(c.expiry) {
++		r.mu.RUnlock()
++		return c.tid, nil
++	}
++	r.mu.RUnlock()
++
++	tid, err := r.backing.ResolveVK(ctx, vk)
++	if err != nil {
++		return "", err
++	}
++	r.mu.Lock()
++	r.cache[h] = cachedVK{tid: tid, expiry: time.Now().Add(r.ttl)}
++	r.mu.Unlock()
++	return tid, nil
++}
++
++func hashVK(vk string) uint64 {
++	h := fnv.New64a()
++	_, _ = h.Write([]byte(vk))
++	return h.Sum64()
++}
++
++// CacheSize returns the current number of cached VK entries. For telemetry/test.
++func (r *CachedVKResolver) CacheSize() int {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	return len(r.cache)
++}
+diff --git a/multitenant/runtime.go b/multitenant/runtime.go
+new file mode 100644
+index 000000000..d506f0fe6
+--- /dev/null
++++ b/multitenant/runtime.go
+@@ -0,0 +1,82 @@
++package multitenant
++
++import (
++	"container/list"
++	"context"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	bifrost "github.com/maximhq/bifrost/core"
++)
++
++// runtimeEntry holds one tenant's *bifrost.Bifrost plus lifecycle metadata.
++// Loaded lazily by Manager.Acquire; evicted by LRU policy or explicit Evict.
++//
++// Lifecycle states:
++//
++//	uninitialized → loading → ready → shutting_down → shutdown
++//
++// `initOnce` ensures the loader runs exactly once even under concurrent Acquire
++// calls. `refCount` tracks in-flight handles; eviction must wait for it to drop
++// to zero before calling bifrost.Shutdown so producers don't race with channel
++// teardown.
++type runtimeEntry struct {
++	tenantID TenantID
++
++	initOnce sync.Once
++	initErr  error
++	bf       *bifrost.Bifrost
++	ctx      context.Context // child of Manager.rootCtx; cancelled on evict
++	cancel   context.CancelFunc
++
++	refCount atomic.Int64 // in-flight Handle count; must be 0 to evict
++	lastUsed atomic.Int64 // unix nano of last Acquire; updated lock-free
++
++	// lru bookkeeping (guarded by Manager.mu)
++	lruElem *list.Element
++
++	// shutdown coordination
++	shuttingDown atomic.Bool
++	shutdownDone chan struct{}
++}
++
++func newRuntimeEntry(rootCtx context.Context, tid TenantID) *runtimeEntry {
++	ctx, cancel := context.WithCancel(rootCtx)
++	e := &runtimeEntry{
++		tenantID:     tid,
++		ctx:          ctx,
++		cancel:       cancel,
++		shutdownDone: make(chan struct{}),
++	}
++	e.lastUsed.Store(time.Now().UnixNano())
++	return e
++}
++
++// touch updates the last-used timestamp. Cheap, lock-free.
++func (e *runtimeEntry) touch() {
++	e.lastUsed.Store(time.Now().UnixNano())
++}
++
++// Handle is a borrowed reference to a tenant's *bifrost.Bifrost.
++// Callers MUST call Release() exactly once when done — typically via defer.
++// Holding a Handle prevents the runtime from being evicted.
++type Handle struct {
++	tid     TenantID
++	bf      *bifrost.Bifrost
++	release func()
++	once    sync.Once
++}
++
++// Bifrost returns the underlying *bifrost.Bifrost for the tenant. The pointer
++// is valid only until Release() is called.
++func (h *Handle) Bifrost() *bifrost.Bifrost { return h.bf }
++
++// TenantID returns the tenant this handle was acquired for.
++func (h *Handle) TenantID() TenantID { return h.tid }
++
++// Release returns the handle to the Manager, decrementing the refcount and
++// allowing eviction. Safe to call multiple times; only the first has effect.
++func (h *Handle) Release() {
++	h.once.Do(h.release)
++}
+diff --git a/multitenant/tenant.go b/multitenant/tenant.go
+new file mode 100644
+index 000000000..b48707d0f
+--- /dev/null
++++ b/multitenant/tenant.go
+@@ -0,0 +1,30 @@
++// Package multitenant provides a SaaS-style multi-tenant wrapper around the
++// single-tenant core/bifrost runtime. Each tenant gets its own *bifrost.Bifrost
++// instance (own Account, own plugins, own MCP manager, own request queues).
++// Tenants are lazy-loaded on first request and tracked in a registry; an
++// optional active-tenant cap drives LRU-style eviction with graceful drain.
++//
++// This is a spike: hot-path is intentionally simple, no clustering, no DB.
++package multitenant
++
++import (
++	"context"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// TenantID uniquely identifies a tenant within the process. Opaque string so
++// downstream code (DB IDs, ULIDs, UUIDs, slugs) can pick a representation.
++type TenantID string
++
++// TenantLoader is the user-supplied callback that produces a BifrostConfig for
++// a given tenant. The loader is invoked exactly once per tenant runtime per
++// process lifetime (or until the runtime is evicted and re-acquired).
++//
++// The returned BifrostConfig.Account is required; other fields are optional
++// and follow the same semantics as bifrost.Init.
++//
++// The ctx passed to the loader is the Manager's root context; it is cancelled
++// when the runtime is being evicted or the Manager is shutting down. Loaders
++// that block on I/O should respect cancellation.
++type TenantLoader func(ctx context.Context, tid TenantID) (schemas.BifrostConfig, error)
+-- 
+2.51.0
+
