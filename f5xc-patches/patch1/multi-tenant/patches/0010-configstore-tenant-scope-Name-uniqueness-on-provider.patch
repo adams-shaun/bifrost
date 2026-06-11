@@ -1,0 +1,335 @@
+From ef9a9c59e60952fef2f270321191e108dff03eb8 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 17:23:33 -0600
+Subject: [PATCH] configstore: tenant-scope Name uniqueness on providers, keys,
+ MCP clients
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the Phase 1 schema rollout. Two tenants can now independently
+register a provider named "openai", an MCP client named "tools", a key
+named "production", etc — without colliding.
+
+Index restructure:
+  - drop legacy single-column unique indexes:
+      idx_config_providers_name
+      idx_config_mcp_clients_name
+      idx_key_name
+  - replace with composite (tenant_id, name) unique indexes:
+      idx_providers_tenant_name
+      idx_mcp_tenant_name
+      idx_key_tenant_name
+
+Caller update (must ship in the same patch):
+  RDBConfigStore.UpdateProvidersConfig upsert now lists
+  (tenant_id, name) as its OnConflict target. Dropping the old
+  single-column index without this change broke TestFullVirtualKeyFlow
+  with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+  constraint" in the patch 0009 draft — splitting the index change
+  from the caller change was not viable.
+
+Out of scope (stays globally unique):
+  - config_mcp_clients.client_id — FK target for TableOauthUserToken;
+    a composite FK would cascade through the oauth tables.
+  - config_keys.key_id — UUID, doesn't benefit from per-tenant scoping.
+
+NOT in this patch: the broader query layer refactor (Get/Update/Delete
+methods accepting a tenant_id argument). Until those land, the
+GetProvider*ByName / GetMCPClientByName paths still take the first
+matching row across all tenants — runtime isolation in the per-tenant
+Bifrost dispatch layer is what keeps reads scoped today.
+
+Test: TestMigrationTenantScopedNameUniques_PerTenantUniqueness
+asserts the legacy indexes are gone, the composites are present, two
+tenants can register the same Name on each table, intra-tenant
+uniqueness still holds, and ClientID stays globally unique.
+
+Full framework/configstore + plugins/governance + multitenant test
+suites pass.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/migrations.go      | 94 ++++++++++++++++++++++++
+ framework/configstore/migrations_test.go | 64 ++++++++++++++++
+ framework/configstore/rdb.go             |  6 +-
+ framework/configstore/tables/key.go      | 11 ++-
+ framework/configstore/tables/mcp.go      | 15 ++--
+ framework/configstore/tables/provider.go |  8 +-
+ 6 files changed, 177 insertions(+), 21 deletions(-)
+
+diff --git a/framework/configstore/migrations.go b/framework/configstore/migrations.go
+index 48d39f96e..e9055e713 100644
+--- a/framework/configstore/migrations.go
++++ b/framework/configstore/migrations.go
+@@ -805,6 +805,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
+ 	if err := migrationAddTenantIDToProviderConfigTables(ctx, db); err != nil {
+ 		return err
+ 	}
++	if err := migrationTenantScopedNameUniques(ctx, db); err != nil {
++		return err
++	}
+ 	return nil
+ }
+ 
+@@ -8781,3 +8784,94 @@ func migrationAddTenantIDToProviderConfigTables(ctx context.Context, db *gorm.DB
+ 	}
+ 	return nil
+ }
++
++// migrationTenantScopedNameUniques flips the legacy global Name unique
++// indexes on config_providers / config_keys / config_mcp_clients to
++// composite (tenant_id, name) unique indexes so two tenants can
++// independently register a provider named "openai", an MCP client called
++// "tools", a key called "production", and so on.
++//
++// Must run after migrationAddTenantIDToProviderConfigTables (which seeds
++// the tenant_id column). Coordinates with the OnConflict update in
++// RDBConfigStore.UpdateProvidersConfig — that path now lists
++// (tenant_id, name) as the conflict target, so dropping the old index
++// before this lands would break the upsert. Updating the index +
++// updating the callers must ship in the same patch.
++//
++// ClientID on config_mcp_clients and KeyID on config_keys stay globally
++// unique. ClientID is an FK target for TableOauthUserToken; KeyID is a
++// UUID and doesn't benefit from per-tenant scoping.
++func migrationTenantScopedNameUniques(ctx context.Context, db *gorm.DB) error {
++	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
++		ID: "tenant_scoped_name_uniques_providers_keys_mcp",
++		Migrate: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++
++			// Drop legacy single-column unique indexes. GORM's default
++			// auto-naming is idx_<table>_<column>; idx_key_name is the
++			// explicit name from TableKey's struct tag history.
++			drops := []struct {
++				model   any
++				idxName string
++			}{
++				{&tables.TableProvider{}, "idx_config_providers_name"},
++				{&tables.TableMCPClient{}, "idx_config_mcp_clients_name"},
++				{&tables.TableKey{}, "idx_key_name"},
++			}
++			for _, d := range drops {
++				if mig.HasIndex(d.model, d.idxName) {
++					if err := mig.DropIndex(d.model, d.idxName); err != nil {
++						return fmt.Errorf("drop legacy index %s: %w", d.idxName, err)
++					}
++				}
++			}
++
++			// Create the new composite indexes. GORM picks up the column
++			// set from the struct tag (both Name and TenantID share the
++			// idx_*_tenant_name name).
++			creates := []struct {
++				model   any
++				idxName string
++			}{
++				{&tables.TableProvider{}, "idx_providers_tenant_name"},
++				{&tables.TableMCPClient{}, "idx_mcp_tenant_name"},
++				{&tables.TableKey{}, "idx_key_tenant_name"},
++			}
++			for _, c := range creates {
++				if !mig.HasIndex(c.model, c.idxName) {
++					if err := mig.CreateIndex(c.model, c.idxName); err != nil {
++						return fmt.Errorf("create composite index %s: %w", c.idxName, err)
++					}
++				}
++			}
++			return nil
++		},
++		Rollback: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++			// Drop composite indexes; rebuilding the legacy single-column
++			// uniques would require reviving the prior struct tags, which
++			// only matters for true rollback testing.
++			for _, idx := range []struct {
++				model   any
++				idxName string
++			}{
++				{&tables.TableProvider{}, "idx_providers_tenant_name"},
++				{&tables.TableMCPClient{}, "idx_mcp_tenant_name"},
++				{&tables.TableKey{}, "idx_key_tenant_name"},
++			} {
++				if mig.HasIndex(idx.model, idx.idxName) {
++					if err := mig.DropIndex(idx.model, idx.idxName); err != nil {
++						return fmt.Errorf("drop composite index %s: %w", idx.idxName, err)
++					}
++				}
++			}
++			return nil
++		},
++	}})
++	if err := m.Migrate(); err != nil {
++		return fmt.Errorf("error running tenant_scoped_name_uniques migration: %s", err.Error())
++	}
++	return nil
++}
+diff --git a/framework/configstore/migrations_test.go b/framework/configstore/migrations_test.go
+index dd7ab7152..a8e7a309b 100644
+--- a/framework/configstore/migrations_test.go
++++ b/framework/configstore/migrations_test.go
+@@ -2576,3 +2576,67 @@ func TestMigrationAddTenantIDToProviderConfigTables_ColumnAddedAndDefaulted(t *t
+ 	// Idempotency: re-running must succeed and leave tenant_ids untouched.
+ 	require.NoError(t, migrationAddTenantIDToProviderConfigTables(ctx, db))
+ }
++
++// TestMigrationTenantScopedNameUniques_PerTenantUniqueness verifies the
++// fourth multi-tenant migration:
++//   - drops legacy single-column unique indexes on Name for providers /
++//     keys / MCP clients
++//   - replaces them with composite (tenant_id, name) unique indexes
++//   - two distinct tenants can therefore register a provider/MCP/key
++//     sharing a Name
++//   - intra-tenant uniqueness is still enforced (one tenant can't
++//     register two providers called "openai")
++//   - ClientID on config_mcp_clients stays globally unique (FK target)
++//   - KeyID on config_keys stays globally unique (UUID)
++func TestMigrationTenantScopedNameUniques_PerTenantUniqueness(t *testing.T) {
++	_, db := setupFullMigrationDB(t)
++	ctx := context.Background()
++
++	// Legacy indexes should be gone, composites in place.
++	mig := db.Migrator()
++	assert.False(t, mig.HasIndex(&tables.TableProvider{}, "idx_config_providers_name"))
++	assert.False(t, mig.HasIndex(&tables.TableMCPClient{}, "idx_config_mcp_clients_name"))
++	assert.False(t, mig.HasIndex(&tables.TableKey{}, "idx_key_name"))
++	assert.True(t, mig.HasIndex(&tables.TableProvider{}, "idx_providers_tenant_name"))
++	assert.True(t, mig.HasIndex(&tables.TableMCPClient{}, "idx_mcp_tenant_name"))
++	assert.True(t, mig.HasIndex(&tables.TableKey{}, "idx_key_tenant_name"))
++
++	now := time.Now()
++
++	// --- Providers ---
++	provA := tables.TableProvider{Name: "openai", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&provA).Error)
++	provB := tables.TableProvider{Name: "openai", TenantID: "tenant-b", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&provB).Error,
++		"two tenants must be able to register the same provider name")
++	// Intra-tenant duplicate must still fail.
++	dupA := tables.TableProvider{Name: "openai", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
++	require.Error(t, db.Create(&dupA).Error,
++		"intra-tenant provider name uniqueness must still be enforced")
++
++	// --- MCP clients ---
++	mcpA := tables.TableMCPClient{ClientID: "mcp-a", Name: "tools", TenantID: "tenant-a", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&mcpA).Error)
++	mcpB := tables.TableMCPClient{ClientID: "mcp-b", Name: "tools", TenantID: "tenant-b", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&mcpB).Error,
++		"two tenants must be able to register MCP clients with the same name")
++	dupMCPSameTenant := tables.TableMCPClient{ClientID: "mcp-a2", Name: "tools", TenantID: "tenant-a", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
++	require.Error(t, db.Create(&dupMCPSameTenant).Error,
++		"intra-tenant MCP name uniqueness must still be enforced")
++	dupMCPClientID := tables.TableMCPClient{ClientID: "mcp-a", Name: "tools-other", TenantID: "tenant-b", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
++	require.Error(t, db.Create(&dupMCPClientID).Error,
++		"ClientID stays globally unique (FK target)")
++
++	// --- Keys --- (need providers to satisfy FK)
++	keyA := tables.TableKey{Name: "production", ProviderID: provA.ID, Provider: "openai", KeyID: "kid-a", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&keyA).Error)
++	keyB := tables.TableKey{Name: "production", ProviderID: provB.ID, Provider: "openai", KeyID: "kid-b", TenantID: "tenant-b", CreatedAt: now, UpdatedAt: now}
++	require.NoError(t, db.Create(&keyB).Error,
++		"two tenants must be able to register the same key name")
++	dupKeyName := tables.TableKey{Name: "production", ProviderID: provA.ID, Provider: "openai", KeyID: "kid-a2", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
++	require.Error(t, db.Create(&dupKeyName).Error,
++		"intra-tenant key name uniqueness must still be enforced")
++
++	// Idempotency.
++	require.NoError(t, migrationTenantScopedNameUniques(ctx, db))
++}
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index dc95f5f39..c5fd51b3a 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -647,10 +647,12 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
+ 			dbProvider.RateLimitID = existing.RateLimitID
+ 		}
+ 
+-		// Upsert provider (create or update if exists).
++		// Upsert provider (create or update if exists). Conflict target is
++		// the composite (tenant_id, name) unique index so two tenants can
++		// independently register a provider with the same Name.
+ 		if err := txDB.WithContext(ctx).Clauses(
+ 			clause.OnConflict{
+-				Columns:   []clause.Column{{Name: "name"}},
++				Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "name"}},
+ 				UpdateAll: true,
+ 			},
+ 			clause.Returning{Columns: []clause.Column{{Name: "id"}}},
+diff --git a/framework/configstore/tables/key.go b/framework/configstore/tables/key.go
+index 02ef7e55e..ba2ddd3ec 100644
+--- a/framework/configstore/tables/key.go
++++ b/framework/configstore/tables/key.go
+@@ -14,15 +14,14 @@ import (
+ // TableKey represents an API key configuration in the database
+ type TableKey struct {
+ 	ID                    uint           `gorm:"primaryKey;autoIncrement" json:"id"`
+-	Name                  string         `gorm:"type:varchar(255);uniqueIndex:idx_key_name;not null" json:"name"`
++	Name                  string         `gorm:"type:varchar(255);uniqueIndex:idx_key_tenant_name;not null" json:"name"`
+ 	ProviderID            uint           `gorm:"index;not null" json:"provider_id"`
+ 	Provider              string         `gorm:"index;type:varchar(50)" json:"provider"`                          // ModelProvider as string
+ 	KeyID                 string         `gorm:"type:varchar(255);uniqueIndex:idx_key_id;not null" json:"key_id"` // UUID from schemas.Key, globally unique
+-	// TenantID scopes this key to a tenant for multi-tenant deployments.
+-	// See TableCustomer.TenantID. Name remains globally unique in this patch —
+-	// the (tenant_id, name) composite is deferred to a follow-up alongside the
+-	// rdb upsert callers.
+-	TenantID              string         `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++	// TenantID scopes this key to a tenant. Name becomes composite-unique
++	// with TenantID via idx_key_tenant_name so two tenants can both have a
++	// key called "production". KeyID stays globally unique.
++	TenantID              string         `gorm:"type:varchar(255);not null;uniqueIndex:idx_key_tenant_name;default:default" json:"tenant_id"`
+ 	Value                 schemas.EnvVar `gorm:"type:text;not null" json:"value"`
+ 	ModelsJSON            string         `gorm:"type:text" json:"-"` // JSON serialized []string
+ 	BlacklistedModelsJSON string         `gorm:"type:text" json:"-"` // JSON serialized []string
+diff --git a/framework/configstore/tables/mcp.go b/framework/configstore/tables/mcp.go
+index 704e0ceb8..1f45b8a2c 100644
+--- a/framework/configstore/tables/mcp.go
++++ b/framework/configstore/tables/mcp.go
+@@ -14,14 +14,13 @@ import (
+ // TableMCPClient represents an MCP client configuration in the database
+ type TableMCPClient struct {
+ 	ID                      uint            `gorm:"primaryKey;autoIncrement" json:"id"` // ID is used as the internal primary key and is also accessed by public methods, so it must be present.
+-	ClientID                string          `gorm:"type:varchar(255);uniqueIndex;not null" json:"client_id"`
+-	Name                    string          `gorm:"type:varchar(255);uniqueIndex;not null" json:"name"`
+-	// TenantID scopes this MCP client to a tenant for multi-tenant deployments.
+-	// See TableCustomer.TenantID. Name and ClientID remain globally unique in
+-	// this patch — (tenant_id, name) composite is deferred to a follow-up that
+-	// also handles the rdb upsert callers; ClientID stays globally unique
+-	// because OauthUserToken holds an FK to it.
+-	TenantID                string          `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++	ClientID                string          `gorm:"type:varchar(255);uniqueIndex;not null" json:"client_id"` // Globally unique; FK target for TableOauthUserToken.
++	Name                    string          `gorm:"type:varchar(255);uniqueIndex:idx_mcp_tenant_name;not null" json:"name"`
++	// TenantID scopes this MCP client to a tenant. Name becomes composite-unique
++	// with TenantID via idx_mcp_tenant_name so two tenants can both register
++	// an MCP client called "tools". ClientID stays globally unique because
++	// OauthUserToken holds an FK to it.
++	TenantID                string          `gorm:"type:varchar(255);not null;uniqueIndex:idx_mcp_tenant_name;default:default" json:"tenant_id"`
+ 	IsCodeModeClient        bool            `gorm:"default:false" json:"is_code_mode_client"`         // Whether the client is a code mode client
+ 	ConnectionType          string          `gorm:"type:varchar(20);not null" json:"connection_type"` // schemas.MCPConnectionType
+ 	ConnectionString        *schemas.EnvVar `gorm:"type:text" json:"connection_string,omitempty"`
+diff --git a/framework/configstore/tables/provider.go b/framework/configstore/tables/provider.go
+index 8e08e1d36..27516fa50 100644
+--- a/framework/configstore/tables/provider.go
++++ b/framework/configstore/tables/provider.go
+@@ -16,13 +16,11 @@ import (
+ // That helps us detect changes between config file and database config
+ type TableProvider struct {
+ 	ID                       uint      `gorm:"primaryKey;autoIncrement" json:"id"`
+-	Name                     string    `gorm:"type:varchar(50);uniqueIndex;not null" json:"name"` // ModelProvider as string. Globally unique today; (tenant_id, name) composite uniqueness is a follow-up patch (requires updating rdb.go ON CONFLICT clauses).
++	Name                     string    `gorm:"type:varchar(50);uniqueIndex:idx_providers_tenant_name;not null" json:"name"` // ModelProvider as string. Unique per (tenant_id, name) — two tenants can both register "openai".
+ 	// TenantID scopes this provider config to a tenant for multi-tenant
+ 	// deployments. See TableCustomer.TenantID. Backfilled to DefaultTenantID
+-	// on upgrade. NOTE: Name remains globally unique in this patch — a
+-	// follow-up makes uniqueness per-tenant once the rdb upsert paths are
+-	// updated to include tenant_id in their ON CONFLICT targets.
+-	TenantID                 string    `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++	// on upgrade. Composite-unique with Name via idx_providers_tenant_name.
++	TenantID                 string    `gorm:"type:varchar(255);not null;uniqueIndex:idx_providers_tenant_name;default:default" json:"tenant_id"`
+ 	NetworkConfigJSON        string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.NetworkConfig
+ 	ConcurrencyBufferJSON    string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ConcurrencyAndBufferSize
+ 	ProxyConfigJSON          string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ProxyConfig
+-- 
+2.51.0
+
