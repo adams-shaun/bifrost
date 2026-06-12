@@ -1,0 +1,404 @@
+From 5cf1b2e1eedc27e4f8773175e6c48148548ddae8 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 15:51:55 -0600
+Subject: [PATCH] transports: POST
+ /api/tenants/{tenant_id}/governance/virtual-keys (admin create per-tenant VK)
+
+Companion to the tenant-scoped provider POST: the second admin write
+needed to make the inference plane end-to-end testable per tenant. The
+inference VK->tenant resolver (patch 0009) reads tenant_id off the
+TableVirtualKey row; this handler is what lets a platform-admin mint
+that row via the API rather than directly through the DB.
+
+Handler:
+- Reads tenant_id from ctx (set by RequireTenantPathMiddleware from
+  patch 0015), validates the minimum payload (name required), mints
+  a governance-prefixed VK value if the caller omits one, then calls
+  the existing ConfigStore.CreateVirtualKey with tenant_id pinned on
+  the TableVirtualKey row.
+- Best-effort cache invalidation via the same TenantRuntimeEvictor
+  interface the provider handler uses, so the next inference attempt
+  for this tenant resolves the freshly minted VK without waiting for
+  the 60s resolver cache TTL.
+- Response carries the resulting id + value so E2E (or the operator)
+  can drive inference immediately without re-querying.
+
+Scope: POST only. The legacy /api/governance/virtual-keys still serves
+the rich team/customer/access-profile/budget/rate-limit/per-provider
+linkage shape; those compositions can be added under the
+tenant-scoped route family once AdminAuthz resolves a real
+tenant-admin caller (Phase 4).
+
+Wires into server.go under the same multi-tenant gate that mounts
+the provider handler.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../handlers/tenant_virtualkeys.go            | 142 +++++++++++++
+ .../handlers/tenant_virtualkeys_test.go       | 187 ++++++++++++++++++
+ transports/bifrost-http/server/server.go      |   6 +
+ 3 files changed, 335 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/tenant_virtualkeys.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+
+diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys.go b/transports/bifrost-http/handlers/tenant_virtualkeys.go
+new file mode 100644
+index 000000000..673a612a6
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_virtualkeys.go
+@@ -0,0 +1,142 @@
++// Package handlers — tenant-scoped virtual-key admin.
++//
++// Mounts POST /api/tenants/{tenant_id}/governance/virtual-keys so a
++// platform-admin can create a virtual key whose tenant_id is pinned
++// explicitly (so the inference-plane VK->tenant resolver lookup returns
++// the right tenant) without going through the legacy single-tenant
++// governance VK endpoint.
++//
++// v1 minimum surface: POST only, simple payload. The legacy
++// createVirtualKey at /api/governance/virtual-keys supports rich linkage
++// (teams, customers, access profiles, rate limits, budgets,
++// per-provider configs) — once tenant-admin auth lands in Phase 4 those
++// features can be exposed under the tenant-scoped route family too.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	"github.com/google/uuid"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/plugins/governance"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantVirtualKeyHandler implements POST
++// /api/tenants/{tenant_id}/governance/virtual-keys for the v1 admin
++// surface needed by E2E.
++type TenantVirtualKeyHandler struct {
++	configStore configstore.ConfigStore
++	// evictor lets us bust the cached tenant runtime + the VK resolver
++	// cache after creating a new VK so the next inference request
++	// resolves the tenant id correctly. Optional.
++	evictor TenantRuntimeEvictor
++}
++
++// NewTenantVirtualKeyHandler constructs a TenantVirtualKeyHandler.
++// configStore is required.
++func NewTenantVirtualKeyHandler(configStore configstore.ConfigStore, evictor TenantRuntimeEvictor) (*TenantVirtualKeyHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantVirtualKeyHandler{configStore: configStore, evictor: evictor}, nil
++}
++
++// RegisterRoutes mounts the tenant-scoped VK routes. middlewares MUST
++// include handlers.RequireTenantPathMiddleware (or equivalent).
++func (h *TenantVirtualKeyHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.POST("/api/tenants/{tenant_id}/governance/virtual-keys", lib.ChainMiddlewares(h.createVirtualKey, middlewares...))
++}
++
++// CreateTenantVirtualKeyRequest is the minimum-viable payload. The
++// legacy CreateVirtualKeyRequest under /api/governance/virtual-keys
++// supports many more fields; this v1 form keeps the surface tight so
++// E2E can drive it with a one-line POST.
++type CreateTenantVirtualKeyRequest struct {
++	Name string `json:"name"`
++	// Value is optional. When empty, the server mints a fresh
++	// governance-prefixed value so the caller doesn't have to know the
++	// prefix. The response carries the resulting value so the E2E
++	// harness (or the operator) can drive inference with it.
++	Value string `json:"value,omitempty"`
++	// Description is informational; safe to leave empty.
++	Description string `json:"description,omitempty"`
++}
++
++// CreateTenantVirtualKeyResponse is what we return on success — the
++// generated id, the (possibly server-minted) value, and a readback of
++// the supplied/derived fields.
++type CreateTenantVirtualKeyResponse struct {
++	ID       string `json:"id"`
++	TenantID string `json:"tenant_id"`
++	Name     string `json:"name"`
++	Value    string `json:"value"`
++}
++
++func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++
++	var req CreateTenantVirtualKeyRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
++		return
++	}
++
++	value := req.Value
++	if value == "" {
++		value = governance.GenerateVirtualKey()
++	}
++
++	isActive := true
++	vk := &configstoreTables.TableVirtualKey{
++		ID:          uuid.NewString(),
++		TenantID:    string(tid),
++		Name:        req.Name,
++		Value:       value,
++		Description: req.Description,
++		IsActive:    &isActive,
++	}
++
++	if err := h.configStore.CreateVirtualKey(ctx, vk); err != nil {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Virtual key %s already exists for tenant %s", req.Name, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create virtual key: %v", err))
++		return
++	}
++
++	// Best-effort cache invalidation. The VK resolver caches lookups for
++	// 60s; an existing inference request mid-flight already has a
++	// resolved tenant on its ctx, so this matters most for *subsequent*
++	// requests with the freshly minted VK. Evicting the tenant runtime
++	// (if loaded) keeps the per-tenant Account in sync if downstream
++	// patches start coupling VK metadata into the Account.
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++
++	SendJSONWithStatus(ctx, CreateTenantVirtualKeyResponse{
++		ID:       vk.ID,
++		TenantID: string(tid),
++		Name:     vk.Name,
++		Value:    vk.Value,
++	}, fasthttp.StatusCreated)
++}
+diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+new file mode 100644
+index 000000000..592b61bc8
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+@@ -0,0 +1,187 @@
++package handlers
++
++import (
++	"context"
++	"net"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
++)
++
++// stubVKStore is the minimum ConfigStore surface this handler exercises.
++type stubVKStore struct {
++	configstore.ConfigStore // nil embedded — unimplemented methods panic if hit
++	mu                      sync.Mutex
++	created                 []*configstoreTables.TableVirtualKey
++	createErr               error
++}
++
++func (s *stubVKStore) CreateVirtualKey(ctx context.Context, vk *configstoreTables.TableVirtualKey, tx ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.createErr != nil {
++		return s.createErr
++	}
++	cp := *vk
++	s.created = append(s.created, &cp)
++	return nil
++}
++
++func newTenantVKCtx(t *testing.T, body string, tid string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/" + tid + "/governance/virtual-keys")
++	req.Header.SetMethod(fasthttp.MethodPost)
++	req.SetBodyString(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	return ctx
++}
++
++func TestTenantVirtualKeyHandler_Create_HappyPath_ServerMintsValue(t *testing.T) {
++	store := &stubVKStore{}
++	evictor := &stubEvictor{}
++	h, err := NewTenantVirtualKeyHandler(store, evictor)
++	if err != nil {
++		t.Fatalf("NewTenantVirtualKeyHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{"name": "ci-vk-1"})
++	ctx := newTenantVKCtx(t, string(body), "acme")
++
++	h.createVirtualKey(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if got := len(store.created); got != 1 {
++		t.Fatalf("CreateVirtualKey calls got %d want 1", got)
++	}
++	vk := store.created[0]
++	if vk.TenantID != "acme" {
++		t.Fatalf("tenant_id got %q want %q", vk.TenantID, "acme")
++	}
++	if vk.Name != "ci-vk-1" {
++		t.Fatalf("name got %q want %q", vk.Name, "ci-vk-1")
++	}
++	if !strings.HasPrefix(vk.Value, "sk-bf-") {
++		t.Fatalf("server-minted VK should carry governance prefix; got %q", vk.Value)
++	}
++	if vk.IsActive == nil || *vk.IsActive != true {
++		t.Fatal("new VK should default IsActive=true")
++	}
++
++	// Body should echo the value so the caller can drive inference with it
++	// without re-querying.
++	var resp CreateTenantVirtualKeyResponse
++	if err := sonic.Unmarshal(ctx.Response.Body(), &resp); err != nil {
++		t.Fatalf("response decode: %v", err)
++	}
++	if resp.Value != vk.Value {
++		t.Fatalf("response value mismatch; got %q want %q", resp.Value, vk.Value)
++	}
++	if resp.TenantID != "acme" {
++		t.Fatalf("response tenant_id got %q want acme", resp.TenantID)
++	}
++}
++
++func TestTenantVirtualKeyHandler_Create_RespectsExplicitValue(t *testing.T) {
++	store := &stubVKStore{}
++	h, _ := NewTenantVirtualKeyHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "ci-vk-2", "value": "sk-bf-fixture-value"})
++	ctx := newTenantVKCtx(t, string(body), "acme")
++
++	h.createVirtualKey(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.created[0].Value != "sk-bf-fixture-value" {
++		t.Fatalf("explicit value should pass through; got %q", store.created[0].Value)
++	}
++}
++
++func TestTenantVirtualKeyHandler_Create_MissingName(t *testing.T) {
++	store := &stubVKStore{}
++	h, _ := NewTenantVirtualKeyHandler(store, nil)
++
++	ctx := newTenantVKCtx(t, `{}`, "acme")
++
++	h.createVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("missing name should be 400; got %d", got)
++	}
++	if len(store.created) != 0 {
++		t.Fatal("store must not be called when payload invalid")
++	}
++}
++
++func TestTenantVirtualKeyHandler_Create_MissingTenantCtx(t *testing.T) {
++	store := &stubVKStore{}
++	h, _ := NewTenantVirtualKeyHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "x"})
++	ctx := newTenantVKCtx(t, string(body), "")
++
++	h.createVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusInternalServerError {
++		t.Fatalf("missing tenant ctx should be 500; got %d", got)
++	}
++}
++
++func TestTenantVirtualKeyHandler_Create_StoreError_AlreadyExists(t *testing.T) {
++	store := &stubVKStore{createErr: configstore.ErrAlreadyExists}
++	h, _ := NewTenantVirtualKeyHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "dup"})
++	ctx := newTenantVKCtx(t, string(body), "acme")
++
++	h.createVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusConflict {
++		t.Fatalf("ErrAlreadyExists should be 409; got %d", got)
++	}
++}
++
++func TestTenantVirtualKeyHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantVirtualKeyHandler(nil, nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
++
++func TestTenantVirtualKeyHandler_Create_EvictsTenantRuntime(t *testing.T) {
++	store := &stubVKStore{}
++	evictor := &stubEvictor{}
++	h, _ := NewTenantVirtualKeyHandler(store, evictor)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "vk"})
++	ctx := newTenantVKCtx(t, string(body), "acme")
++
++	h.createVirtualKey(ctx)
++
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 {
++		t.Fatalf("Evict should fire once; got %d", len(evictor.called))
++	}
++	if evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("evicted tid got %q want acme", evictor.called[0])
++	}
++}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 7fd272ad2..49ec23fb4 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1334,6 +1334,12 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 			return fmt.Errorf("failed to initialize tenant provider handler: %v", err)
+ 		}
+ 		tenantProviderHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++
++		tenantVKHandler, err := handlers.NewTenantVirtualKeyHandler(s.Config.ConfigStore, s.multitenantManager)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant virtual key handler: %v", err)
++		}
++		tenantVKHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
+ 	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+-- 
+2.51.0
+
