@@ -1,0 +1,631 @@
+From f3965fc243b437ab54f000d82c6b2167d89f9268 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 18:55:37 -0600
+Subject: [PATCH] transports: add /api/platform/tenants admin handlers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wires the TenantRepository CRUD primitives from patch 0011 into the
+HTTP transport so the platform-admin control plane can manage tenants
+end-to-end:
+
+  GET    /api/platform/tenants                  list + paging + filters
+  POST   /api/platform/tenants                  create
+  GET    /api/platform/tenants/{tenant_id}      get one
+  PUT    /api/platform/tenants/{tenant_id}      partial update
+  DELETE /api/platform/tenants/{tenant_id}      delete (with guards)
+
+Routes live under /api/platform rather than /api/governance because
+tenants sit above the governance hierarchy and the access-control
+layer needs to gate them with platform-admin-only auth (cross-tenant)
+once the RBAC layer lands.
+
+Status codes wired through to the store-level errors:
+  - 400 on missing/invalid fields, invalid status, malformed JSON
+  - 404 on ErrNotFound (Get/Update/Delete of missing id)
+  - 409 on ErrAlreadyExists (Create with duplicate id)
+  - 409 on ErrReservedTenant (Delete of DefaultTenantID)
+  - 409 on ErrTenantNotEmpty (Delete with dependents)
+  - 201 Created on successful Create
+  - 200 OK on every other success
+
+Update is a partial PUT: only fields supplied in the body overwrite
+the existing row (Name / Status / Description). ID is immutable.
+
+New handler file (handlers/tenants.go) plus 12 HTTP-level tests in
+handlers/tenants_test.go that spin up a real SQLite-backed
+ConfigStore via configstore.NewConfigStore — exercising the actual
+migration chain so the default tenant is seeded and tenant_id
+columns are present everywhere.
+
+Wired in server.go alongside the other admin handlers, behind the
+shared middlewares chain. Tightening to platform-admin-only auth is
+a follow-up that depends on the RBAC layer.
+
+All test suites still pass:
+  - framework/configstore
+  - plugins/governance
+  - multitenant
+  - transports/bifrost-http/handlers (12 new TestTenantsHandler_*)
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ transports/bifrost-http/handlers/tenants.go   | 251 ++++++++++++++++
+ .../bifrost-http/handlers/tenants_test.go     | 274 ++++++++++++++++++
+ transports/bifrost-http/server/server.go      |  13 +
+ 3 files changed, 538 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/tenants.go
+ create mode 100644 transports/bifrost-http/handlers/tenants_test.go
+
+diff --git a/transports/bifrost-http/handlers/tenants.go b/transports/bifrost-http/handlers/tenants.go
+new file mode 100644
+index 000000000..e192ad3c4
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenants.go
+@@ -0,0 +1,251 @@
++// Package handlers — platform-admin tenant CRUD.
++//
++// This file lives separate from governance.go because tenants are above the
++// governance hierarchy, not inside it. Routes are mounted under
++// /api/platform/tenants so the access-control layer can apply
++// platform-admin-only auth (cross-tenant) rather than the per-tenant scope
++// that governance endpoints use.
++package handlers
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strconv"
++
++	"github.com/fasthttp/router"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantsHandler exposes platform-admin CRUD for the tenant entity.
++// Tenants are the top-level isolation boundary for multi-tenant deployments;
++// every governance and user-config row carries a tenant_id, and the per-tenant
++// Bifrost runtime registry uses that to dispatch into the right tenant's world.
++type TenantsHandler struct {
++	configStore configstore.ConfigStore
++}
++
++// NewTenantsHandler constructs a TenantsHandler. Returns an error if the
++// ConfigStore is nil — tenants must be persisted.
++func NewTenantsHandler(configStore configstore.ConfigStore) (*TenantsHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantsHandler{configStore: configStore}, nil
++}
++
++// CreateTenantRequest is the POST /api/platform/tenants body.
++//
++// ID is required (the platform admin picks a stable slug-like identifier).
++// Auto-generation would prevent IdP and SCIM integrations from minting
++// tenants with stable external IDs.
++type CreateTenantRequest struct {
++	ID          string `json:"id"`
++	Name        string `json:"name"`
++	Status      string `json:"status,omitempty"`
++	Description string `json:"description,omitempty"`
++}
++
++// UpdateTenantRequest is the PUT /api/platform/tenants/{tenant_id} body.
++// Only the mutable fields are accepted; ID cannot change.
++type UpdateTenantRequest struct {
++	Name        *string `json:"name,omitempty"`
++	Status      *string `json:"status,omitempty"`
++	Description *string `json:"description,omitempty"`
++}
++
++// RegisterRoutes wires tenant routes under /api/platform/tenants. The
++// supplied middlewares should include the platform-admin auth check; this
++// API must NOT be reachable from per-tenant credentials.
++func (h *TenantsHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	r.GET("/api/platform/tenants", lib.ChainMiddlewares(h.listTenants, middlewares...))
++	r.POST("/api/platform/tenants", lib.ChainMiddlewares(h.createTenant, middlewares...))
++	r.GET("/api/platform/tenants/{tenant_id}", lib.ChainMiddlewares(h.getTenant, middlewares...))
++	r.PUT("/api/platform/tenants/{tenant_id}", lib.ChainMiddlewares(h.updateTenant, middlewares...))
++	r.DELETE("/api/platform/tenants/{tenant_id}", lib.ChainMiddlewares(h.deleteTenant, middlewares...))
++}
++
++// listTenants — GET /api/platform/tenants
++//
++// Query params:
++//
++//	limit=N (default 25, max 100)
++//	offset=N (default 0)
++//	search=text (case-insensitive substring on id or name)
++//	status=active|suspended (exact match)
++func (h *TenantsHandler) listTenants(ctx *fasthttp.RequestCtx) {
++	params := configstore.TenantsQueryParams{
++		Search: string(ctx.QueryArgs().Peek("search")),
++		Status: string(ctx.QueryArgs().Peek("status")),
++	}
++	if v := string(ctx.QueryArgs().Peek("limit")); v != "" {
++		if n, err := strconv.Atoi(v); err == nil {
++			params.Limit = n
++		}
++	}
++	if v := string(ctx.QueryArgs().Peek("offset")); v != "" {
++		if n, err := strconv.Atoi(v); err == nil {
++			params.Offset = n
++		}
++	}
++
++	tenants, total, err := h.configStore.GetTenantsPaginated(ctx, params)
++	if err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, "failed to retrieve tenants")
++		return
++	}
++	SendJSON(ctx, map[string]interface{}{
++		"tenants":     tenants,
++		"count":       len(tenants),
++		"total_count": total,
++		"limit":       params.Limit,
++		"offset":      params.Offset,
++	})
++}
++
++// getTenant — GET /api/platform/tenants/{tenant_id}
++func (h *TenantsHandler) getTenant(ctx *fasthttp.RequestCtx) {
++	id, ok := ctx.UserValue("tenant_id").(string)
++	if !ok || id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "tenant_id is required")
++		return
++	}
++	tenant, err := h.configStore.GetTenant(ctx, id)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, "tenant not found")
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, "failed to retrieve tenant")
++		return
++	}
++	SendJSON(ctx, map[string]interface{}{"tenant": tenant})
++}
++
++// createTenant — POST /api/platform/tenants
++func (h *TenantsHandler) createTenant(ctx *fasthttp.RequestCtx) {
++	var req CreateTenantRequest
++	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "invalid JSON")
++		return
++	}
++	if req.ID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "tenant id is required")
++		return
++	}
++	if req.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "tenant name is required")
++		return
++	}
++	status := req.Status
++	if status == "" {
++		status = configstoreTables.TenantStatusActive
++	}
++	if status != configstoreTables.TenantStatusActive && status != configstoreTables.TenantStatusSuspended {
++		SendError(ctx, fasthttp.StatusBadRequest, "status must be 'active' or 'suspended'")
++		return
++	}
++
++	tenant := &configstoreTables.TableTenant{
++		ID:          req.ID,
++		Name:        req.Name,
++		Status:      status,
++		Description: req.Description,
++	}
++	if err := h.configStore.CreateTenant(ctx, tenant); err != nil {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, "tenant with this id already exists")
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, "failed to create tenant")
++		return
++	}
++	SendJSONWithStatus(ctx, map[string]interface{}{
++		"message": "tenant created successfully",
++		"tenant":  tenant,
++	}, fasthttp.StatusCreated)
++}
++
++// updateTenant — PUT /api/platform/tenants/{tenant_id}
++//
++// Partial update: only the fields supplied in the request body are
++// overwritten on the existing row. ID cannot change.
++func (h *TenantsHandler) updateTenant(ctx *fasthttp.RequestCtx) {
++	id, ok := ctx.UserValue("tenant_id").(string)
++	if !ok || id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "tenant_id is required")
++		return
++	}
++	var req UpdateTenantRequest
++	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "invalid JSON")
++		return
++	}
++	existing, err := h.configStore.GetTenant(ctx, id)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, "tenant not found")
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, "failed to retrieve tenant")
++		return
++	}
++
++	if req.Name != nil {
++		if *req.Name == "" {
++			SendError(ctx, fasthttp.StatusBadRequest, "name cannot be empty")
++			return
++		}
++		existing.Name = *req.Name
++	}
++	if req.Status != nil {
++		if *req.Status != configstoreTables.TenantStatusActive && *req.Status != configstoreTables.TenantStatusSuspended {
++			SendError(ctx, fasthttp.StatusBadRequest, "status must be 'active' or 'suspended'")
++			return
++		}
++		existing.Status = *req.Status
++	}
++	if req.Description != nil {
++		existing.Description = *req.Description
++	}
++
++	if err := h.configStore.UpdateTenant(ctx, existing); err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, "failed to update tenant")
++		return
++	}
++	SendJSON(ctx, map[string]interface{}{
++		"message": "tenant updated successfully",
++		"tenant":  existing,
++	})
++}
++
++// deleteTenant — DELETE /api/platform/tenants/{tenant_id}
++//
++// Refuses (409) if the tenant is reserved (default) or still owns
++// governance / config rows. Operators wanting "stop billing" semantics
++// should PUT status=suspended instead.
++func (h *TenantsHandler) deleteTenant(ctx *fasthttp.RequestCtx) {
++	id, ok := ctx.UserValue("tenant_id").(string)
++	if !ok || id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "tenant_id is required")
++		return
++	}
++	if err := h.configStore.DeleteTenant(ctx, id); err != nil {
++		switch {
++		case errors.Is(err, configstore.ErrNotFound):
++			SendError(ctx, fasthttp.StatusNotFound, "tenant not found")
++		case errors.Is(err, configstore.ErrReservedTenant):
++			SendError(ctx, fasthttp.StatusConflict, "default tenant cannot be deleted")
++		case errors.Is(err, configstore.ErrTenantNotEmpty):
++			SendError(ctx, fasthttp.StatusConflict, err.Error())
++		default:
++			SendError(ctx, fasthttp.StatusInternalServerError, "failed to delete tenant")
++		}
++		return
++	}
++	SendJSON(ctx, map[string]interface{}{"message": "tenant deleted successfully"})
++}
+diff --git a/transports/bifrost-http/handlers/tenants_test.go b/transports/bifrost-http/handlers/tenants_test.go
+new file mode 100644
+index 000000000..17722524c
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenants_test.go
+@@ -0,0 +1,274 @@
++package handlers
++
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"path/filepath"
++	"testing"
++
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/valyala/fasthttp"
++)
++
++// newRequestCtx mirrors newTestRequestCtx in pricing_override_test.go — a
++// bare &fasthttp.RequestCtx{} panics on Done() because its internal Server
++// reference is nil, and gorm.Begin reads Done() before issuing the
++// transaction. ctx.Init wires a valid remote-addr so Done() works.
++func newRequestCtx(method, body string) *fasthttp.RequestCtx {
++	var req fasthttp.Request
++	req.Header.SetMethod(method)
++	if body != "" {
++		req.SetBodyString(body)
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	return ctx
++}
++
++// newTenantsTestHandler spins up a fresh SQLite-backed ConfigStore + handler
++// for a single test. The migration chain seeds the default tenant.
++func newTenantsTestHandler(t *testing.T) (*TenantsHandler, configstore.ConfigStore) {
++	t.Helper()
++	SetLogger(&mockLogger{})
++
++	dbPath := filepath.Join(t.TempDir(), "tenants.db")
++	store, err := configstore.NewConfigStore(context.Background(), &configstore.Config{
++		Enabled: true,
++		Type:    configstore.ConfigStoreTypeSQLite,
++		Config:  &configstore.SQLiteConfig{Path: dbPath},
++	}, &mockLogger{})
++	require.NoError(t, err)
++
++	h, err := NewTenantsHandler(store)
++	require.NoError(t, err)
++	return h, store
++}
++
++func decodeTenantsBody[T any](t *testing.T, ctx *fasthttp.RequestCtx) T {
++	t.Helper()
++	var out T
++	require.NoError(t, json.Unmarshal(ctx.Response.Body(), &out))
++	return out
++}
++
++func TestTenantsHandler_Create_Success(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++
++	ctx := newRequestCtx(fasthttp.MethodPost, `{"id":"acme","name":"Acme Corp"}`)
++	h.createTenant(ctx)
++
++	require.Equal(t, fasthttp.StatusCreated, ctx.Response.StatusCode(),
++		"body: %s", string(ctx.Response.Body()))
++	body := decodeTenantsBody[struct {
++		Message string                       `json:"message"`
++		Tenant  configstoreTables.TableTenant `json:"tenant"`
++	}](t, ctx)
++	assert.Equal(t, "acme", body.Tenant.ID)
++	assert.Equal(t, "Acme Corp", body.Tenant.Name)
++	assert.Equal(t, configstoreTables.TenantStatusActive, body.Tenant.Status,
++		"status should default to active when omitted")
++}
++
++func TestTenantsHandler_Create_MissingFields(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++
++	cases := []struct {
++		name string
++		body string
++	}{
++		{"missing id", `{"name":"x"}`},
++		{"missing name", `{"id":"x"}`},
++		{"invalid status", `{"id":"x","name":"x","status":"frozen"}`},
++		{"malformed json", `{`},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx := newRequestCtx(fasthttp.MethodPost, tc.body)
++			h.createTenant(ctx)
++			assert.Equal(t, fasthttp.StatusBadRequest, ctx.Response.StatusCode())
++		})
++	}
++}
++
++func TestTenantsHandler_Create_Duplicate(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++
++	ctx1 := newRequestCtx(fasthttp.MethodPost, `{"id":"acme","name":"Acme"}`)
++	h.createTenant(ctx1)
++	require.Equal(t, fasthttp.StatusCreated, ctx1.Response.StatusCode())
++
++	ctx2 := newRequestCtx(fasthttp.MethodPost, `{"id":"acme","name":"Acme Again"}`)
++	h.createTenant(ctx2)
++	assert.Equal(t, fasthttp.StatusConflict, ctx2.Response.StatusCode())
++}
++
++func TestTenantsHandler_Get(t *testing.T) {
++	h, store := newTenantsTestHandler(t)
++
++	require.NoError(t, store.CreateTenant(context.Background(), &configstoreTables.TableTenant{
++		ID:     "acme",
++		Name:   "Acme",
++		Status: configstoreTables.TenantStatusActive,
++	}))
++
++	ctx := newRequestCtx(fasthttp.MethodGet, "")
++	ctx.SetUserValue("tenant_id", "acme")
++	h.getTenant(ctx)
++	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
++	body := decodeTenantsBody[struct {
++		Tenant configstoreTables.TableTenant `json:"tenant"`
++	}](t, ctx)
++	assert.Equal(t, "acme", body.Tenant.ID)
++}
++
++func TestTenantsHandler_Get_NotFound(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++	ctx := newRequestCtx(fasthttp.MethodGet, "")
++	ctx.SetUserValue("tenant_id", "nope")
++	h.getTenant(ctx)
++	assert.Equal(t, fasthttp.StatusNotFound, ctx.Response.StatusCode())
++}
++
++func TestTenantsHandler_List_PagingAndFilters(t *testing.T) {
++	h, store := newTenantsTestHandler(t)
++	bg := context.Background()
++
++	for _, id := range []string{"alpha", "beta", "gamma"} {
++		require.NoError(t, store.CreateTenant(bg, &configstoreTables.TableTenant{
++			ID: id, Name: id, Status: configstoreTables.TenantStatusActive,
++		}))
++	}
++	// Flip beta to suspended.
++	beta, err := store.GetTenant(bg, "beta")
++	require.NoError(t, err)
++	beta.Status = configstoreTables.TenantStatusSuspended
++	require.NoError(t, store.UpdateTenant(bg, beta))
++
++	// All — default + 3 we created.
++	ctx := newRequestCtx(fasthttp.MethodGet, "")
++	h.listTenants(ctx)
++	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
++	type listResp struct {
++		Tenants    []configstoreTables.TableTenant `json:"tenants"`
++		Count      int                             `json:"count"`
++		TotalCount int                             `json:"total_count"`
++	}
++	body := decodeTenantsBody[listResp](t, ctx)
++	assert.GreaterOrEqual(t, body.TotalCount, 4)
++
++	// Status filter.
++	ctx2 := newRequestCtx(fasthttp.MethodGet, "")
++	ctx2.QueryArgs().Add("status", configstoreTables.TenantStatusSuspended)
++	h.listTenants(ctx2)
++	require.Equal(t, fasthttp.StatusOK, ctx2.Response.StatusCode())
++	body2 := decodeTenantsBody[listResp](t, ctx2)
++	require.Equal(t, 1, body2.Count)
++	assert.Equal(t, "beta", body2.Tenants[0].ID)
++
++	// Search.
++	ctx3 := newRequestCtx(fasthttp.MethodGet, "")
++	ctx3.QueryArgs().Add("search", "alph")
++	h.listTenants(ctx3)
++	require.Equal(t, fasthttp.StatusOK, ctx3.Response.StatusCode())
++	body3 := decodeTenantsBody[listResp](t, ctx3)
++	require.Equal(t, 1, body3.Count)
++	assert.Equal(t, "alpha", body3.Tenants[0].ID)
++}
++
++func TestTenantsHandler_Update(t *testing.T) {
++	h, store := newTenantsTestHandler(t)
++	bg := context.Background()
++	require.NoError(t, store.CreateTenant(bg, &configstoreTables.TableTenant{
++		ID: "acme", Name: "Acme", Status: configstoreTables.TenantStatusActive,
++	}))
++
++	ctx := newRequestCtx(fasthttp.MethodPut, `{"name":"Acme (renamed)","status":"suspended","description":"on hold"}`)
++	ctx.SetUserValue("tenant_id", "acme")
++	h.updateTenant(ctx)
++	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode(),
++		"body: %s", string(ctx.Response.Body()))
++
++	got, err := store.GetTenant(bg, "acme")
++	require.NoError(t, err)
++	assert.Equal(t, "Acme (renamed)", got.Name)
++	assert.Equal(t, configstoreTables.TenantStatusSuspended, got.Status)
++	assert.Equal(t, "on hold", got.Description)
++}
++
++func TestTenantsHandler_Update_NotFound(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++	ctx := newRequestCtx(fasthttp.MethodPut, `{"name":"x"}`)
++	ctx.SetUserValue("tenant_id", "nope")
++	h.updateTenant(ctx)
++	assert.Equal(t, fasthttp.StatusNotFound, ctx.Response.StatusCode())
++}
++
++func TestTenantsHandler_Update_InvalidStatus(t *testing.T) {
++	h, store := newTenantsTestHandler(t)
++	require.NoError(t, store.CreateTenant(context.Background(), &configstoreTables.TableTenant{
++		ID: "acme", Name: "Acme", Status: configstoreTables.TenantStatusActive,
++	}))
++
++	ctx := newRequestCtx(fasthttp.MethodPut, `{"status":"frozen"}`)
++	ctx.SetUserValue("tenant_id", "acme")
++	h.updateTenant(ctx)
++	assert.Equal(t, fasthttp.StatusBadRequest, ctx.Response.StatusCode())
++}
++
++func TestTenantsHandler_Delete_Empty(t *testing.T) {
++	h, store := newTenantsTestHandler(t)
++	require.NoError(t, store.CreateTenant(context.Background(), &configstoreTables.TableTenant{
++		ID: "acme", Name: "Acme", Status: configstoreTables.TenantStatusActive,
++	}))
++
++	ctx := newRequestCtx(fasthttp.MethodDelete, "")
++	ctx.SetUserValue("tenant_id", "acme")
++	h.deleteTenant(ctx)
++	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
++
++	_, err := store.GetTenant(context.Background(), "acme")
++	assert.ErrorIs(t, err, configstore.ErrNotFound)
++}
++
++func TestTenantsHandler_Delete_Default_Refused(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++	ctx := newRequestCtx(fasthttp.MethodDelete, "")
++	ctx.SetUserValue("tenant_id", configstoreTables.DefaultTenantID)
++	h.deleteTenant(ctx)
++	assert.Equal(t, fasthttp.StatusConflict, ctx.Response.StatusCode())
++}
++
++func TestTenantsHandler_Delete_NotEmpty_Refused(t *testing.T) {
++	h, store := newTenantsTestHandler(t)
++	bg := context.Background()
++	require.NoError(t, store.CreateTenant(bg, &configstoreTables.TableTenant{
++		ID: "owns-stuff", Name: "Owns Stuff", Status: configstoreTables.TenantStatusActive,
++	}))
++	require.NoError(t, store.CreateCustomer(bg, &configstoreTables.TableCustomer{
++		ID: "cust-1", Name: "Cust", TenantID: "owns-stuff",
++	}))
++
++	ctx := newRequestCtx(fasthttp.MethodDelete, "")
++	ctx.SetUserValue("tenant_id", "owns-stuff")
++	h.deleteTenant(ctx)
++	assert.Equal(t, fasthttp.StatusConflict, ctx.Response.StatusCode())
++
++	// Cleaning the customer up unblocks delete.
++	require.NoError(t, store.DeleteCustomer(bg, "cust-1"))
++	ctx2 := newRequestCtx(fasthttp.MethodDelete, "")
++	ctx2.SetUserValue("tenant_id", "owns-stuff")
++	h.deleteTenant(ctx2)
++	assert.Equal(t, fasthttp.StatusOK, ctx2.Response.StatusCode())
++}
++
++func TestTenantsHandler_Delete_NotFound(t *testing.T) {
++	h, _ := newTenantsTestHandler(t)
++	ctx := newRequestCtx(fasthttp.MethodDelete, "")
++	ctx.SetUserValue("tenant_id", "nope")
++	h.deleteTenant(ctx)
++	assert.Equal(t, fasthttp.StatusNotFound, ctx.Response.StatusCode())
++}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index fe81ea986..e1f492e0b 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1160,6 +1160,16 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 	sessionHandler := handlers.NewSessionHandler(s.Config.ConfigStore, s.WSTicketStore)
+ 	promptsHandler := handlers.NewPromptsHandler(s.Config.ConfigStore, promptsReloader)
+ 	featureFlagsHandler := handlers.NewFeatureFlagsHandler(s.Config.FeatureFlags, s.Config.ConfigStore)
++	// Platform-admin tenants API — mounted under /api/platform/tenants.
++	// Tenants live above the governance hierarchy; the per-tenant Bifrost
++	// runtime registry dispatches inference requests based on the tenant_id
++	// resolved from the inbound VK. The middlewares chain applied below
++	// gates the API; until the platform-admin-only middleware lands, this
++	// API is reachable by the same auth as the other /api endpoints.
++	tenantsHandler, err := handlers.NewTenantsHandler(s.Config.ConfigStore)
++	if err != nil {
++		return fmt.Errorf("failed to initialize tenants handler: %v", err)
++	}
+ 	// Going ahead with API handlers
+ 	healthHandler.RegisterRoutes(s.Router, middlewares...)
+ 	providerHandler.RegisterRoutes(s.Router, middlewares...)
+@@ -1183,6 +1193,9 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 	if governanceHandler != nil {
+ 		governanceHandler.RegisterRoutes(s.Router, middlewares...)
+ 	}
++	if tenantsHandler != nil {
++		tenantsHandler.RegisterRoutes(s.Router, middlewares...)
++	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+ 	}
+-- 
+2.51.0
+
