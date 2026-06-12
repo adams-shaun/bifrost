@@ -1,7 +1,7 @@
-From f3965fc243b437ab54f000d82c6b2167d89f9268 Mon Sep 17 00:00:00 2001
+From 0ff57dd922520e4a1837102f77d5e3878a8a27b9 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Thu, 11 Jun 2026 18:55:37 -0600
-Subject: [PATCH] transports: add /api/platform/tenants admin handlers
+Subject: [PATCH 08/14] transports: add /api/platform/tenants admin handlers
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

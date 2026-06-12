@@ -1,8 +1,8 @@
-From ec762957e7141ea460b9365ce636e80d51fcdec5 Mon Sep 17 00:00:00 2001
+From 22a6caf0618646bdabac926be894517dce140771 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Fri, 12 Jun 2026 11:57:59 -0600
-Subject: [PATCH] transports/handlers: route inference through BifrostRouter
- (per-request runtime acquire)
+Subject: [PATCH 14/14] transports/handlers: route inference through
+ BifrostRouter (per-request runtime acquire)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

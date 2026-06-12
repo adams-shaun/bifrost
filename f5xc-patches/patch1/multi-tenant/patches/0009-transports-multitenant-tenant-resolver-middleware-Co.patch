@@ -1,258 +1,342 @@
-From 0313a24197a0425057029c3e3880b4e426fe2f10 Mon Sep 17 00:00:00 2001
+From 914559b05386b5c9d5a7d26cb6f9ffb4aff4d41a Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
-Date: Thu, 11 Jun 2026 14:52:34 -0600
-Subject: [PATCH 4/7] multitenant: measure per-tenant cost with telemetry
- plugin loaded
+Date: Thu, 11 Jun 2026 20:20:15 -0600
+Subject: [PATCH 09/14] transports+multitenant: tenant resolver middleware +
+ ConfigStoreVKResolver
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-Extends the spike with a second loader that constructs the
-plugins/telemetry Prometheus plugin per tenant — fresh registry and
-~20 metric vectors each. Compares against the no-plugin baseline.
+First load-bearing wiring of the tenant_id concept into the request
+path. Three pieces, all behind interfaces so the per-tenant Bifrost
+dispatcher (next patch) plugs in without further surgery.
 
-Per-tenant heap delta: 8.6 KiB (no plugins) → 31.7 KiB (with telemetry).
-Cold-start: 22-87 us → 152-195 us. Goroutine count unchanged at 5.
-Extrapolated to 10k tenants: ~320 MiB heap, ~50k goroutines.
+1) multitenant.BifrostContextKeyTenantID — the context key under
+   which the resolved tenant id is stored. Defined as a
+   schemas.BifrostContextKey constant so any consumer can read it
+   without importing multitenant beyond the constant.
 
-go.mod adds plugins/telemetry v1.5.18 require; no replace directives.
-The workspace go.work resolves cross-module imports locally as
-documented in AGENTS.md ("Cross-module imports resolve via workspace
-locally, but need explicit require in go.mod for releases").
+2) multitenant.ConfigStoreVKResolver — implements VKResolver by
+   looking up the VK in framework/configstore's
+   governance_virtual_keys table via GetVirtualKeyByValue. Wraps
+   nicely in CachedVKResolver for the production hot path:
+       cached := NewCachedVKResolver(NewConfigStoreVKResolver(store), 60*time.Second)
 
-SPIKE_FINDINGS.md updated with the comparison table; risk list now
-flags heavier plugins (semantic cache, governance, OTEL) as the next
-spike target before Phase 1.
+   Semantics:
+     - empty VK / not found / IsActive=false → ErrUnknownVK
+       (collapsed so callers can't time-distinguish "wrong" vs
+       "disabled")
+     - empty TenantID on the row → real error (signals a row that
+       escaped the backfill — should be noticed, not silently
+       routed to "")
+     - DB error → wrapped and returned (caller decides)
+
+3) handlers.TenantResolverMiddleware(resolver) — fasthttp middleware
+   that extracts the VK from the request (same header shapes as
+   lib/ctx.go: x-bf-vk, Authorization Bearer sk-bf-*, x-api-key,
+   x-goog-api-key) and writes the resolved tenant id onto the
+   RequestCtx UserValue under BifrostContextKeyTenantID. Downstream
+   BifrostContext construction in lib/ctx.go will lift it onto the
+   inference context where the per-tenant dispatcher reads it.
+
+   Fail-open by design at this layer:
+     - missing VK / unknown VK / DB outage → no tenant id set,
+       request still flows. The governance plugin owns the 401 path
+       (single source of truth for VK auth/authz).
+     - skip paths: /health and /api/platform/* (no VK lookup
+       needed on platform-admin or health probes)
+     - nil resolver → noop (the deployment hasn't wired one yet)
+
+Tests:
+  - 7 in multitenant/configstore_resolver_test.go covering happy path,
+    unknown / empty / inactive VKs, missing TenantID, DB errors,
+    nil-store panic
+  - 8 in transports/bifrost-http/handlers/tenant_resolver_test.go
+    covering each header shape, missing VK pass-through, unknown VK
+    pass-through, resolver-error pass-through, skip paths, and nil
+    resolver
+
+NOT in this patch (deliberately): wiring the middleware into the
+server.go middleware chain. That patch also lands the per-tenant
+Bifrost runtime dispatch in the inference path, so both halves of the
+end-to-end story ship together. Until then this code is dead-but-
+testable scaffolding.
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
- multitenant/SPIKE_FINDINGS.md |  58 +++--
- multitenant/cmd/spike/main.go |  81 ++++++-
- multitenant/go.mod            | 164 +++++++++++++-
- multitenant/go.sum            | 407 ++++++++++++++++++++++++++++++++++
- 4 files changed, 683 insertions(+), 27 deletions(-)
+ multitenant/configstore_resolver.go           |  97 +++++
+ multitenant/configstore_resolver_test.go      | 129 ++++++
+ multitenant/go.mod                            | 156 ++++++-
+ multitenant/go.sum                            | 387 ++++++++++++++++++
+ multitenant/tenant.go                         |   6 +
+ .../bifrost-http/handlers/tenant_resolver.go  | 123 ++++++
+ .../handlers/tenant_resolver_test.go          | 198 +++++++++
+ 7 files changed, 1095 insertions(+), 1 deletion(-)
+ create mode 100644 multitenant/configstore_resolver.go
+ create mode 100644 multitenant/configstore_resolver_test.go
  create mode 100644 multitenant/go.sum
+ create mode 100644 transports/bifrost-http/handlers/tenant_resolver.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_resolver_test.go
 
-diff --git a/multitenant/SPIKE_FINDINGS.md b/multitenant/SPIKE_FINDINGS.md
-index 3591fd3b5..3211c5776 100644
---- a/multitenant/SPIKE_FINDINGS.md
-+++ b/multitenant/SPIKE_FINDINGS.md
-@@ -20,31 +20,39 @@ Run: `cd multitenant && go build -o /tmp/bf-spike ./cmd/spike && /tmp/bf-spike`
- 
- ## Headline numbers (indicative, NOT a benchmark)
- 
--| Metric | Value | Notes |
-+| Metric | No plugins | With telemetry plugin |
- |---|---|---|
--| Cold-start `Acquire→Init` | 25–65 µs | tiny pool, no MCP, no plugins |
--| Per-tenant heap (avg, 3 tenants) | ~10 KiB | same caveat |
--| Per-tenant goroutines | 5 | 4 workers + queue mgmt |
--| LRU eviction + Acquire #4 | ~50 µs | with cap=3, one idle victim |
--| VK resolve, cached | 42 ns/op | cache overhead vs. raw map |
--| VK resolve, uncached | 3 ns/op | direct map lookup; prod will be a DB hit |
--| Manager.Shutdown (3 tenants) | 20 µs | no in-flight refs |
-+| Cold-start `Acquire→Init` (avg) | 22–87 µs | 152–195 µs |
-+| Per-tenant heap (avg, 3 tenants) | ~8.6 KiB | ~31.7 KiB |
-+| Per-tenant goroutines | 5 | 5 |
-+| LRU eviction + Acquire #4 | ~50 µs | — |
-+| VK resolve, cached | 42 ns/op | — |
-+| VK resolve, uncached | 3 ns/op | — |
-+| Manager.Shutdown | 20 µs | 24 µs |
- 
- Configuration used per tenant: `Concurrency=4`, `BufferSize=16`,
--`InitialPoolSize=32`. No MCP, no plugins, no observability plugin, no
--semantic cache.
-+`InitialPoolSize=32`. No MCP. The telemetry pass loads `plugins/telemetry`
-+with a fresh `*prometheus.Registry` per tenant; ~20 metric vectors get
-+registered each time.
- 
--## What's still unproven — risks that survive the spike
-+**Reading the delta:** telemetry alone adds ~23 KiB per tenant (3× the
-+no-plugin baseline) and ~3× the cold-start latency. Extrapolating to 10k
-+tenants × telemetry-only = ~320 MiB heap, ~50k goroutines — tractable on
-+a modern host. Cost will grow ~linearly as each additional plugin loads.
- 
--The numbers above are dramatically smaller than the original plan's
--back-of-envelope (5–50 MiB / tenant). That's because the spike uses **tuned
--multi-tenant settings**, not defaults. The plan's risk list still stands:
-+## What's still unproven — risks that survive the spike
- 
--1. **Plugin footprint.** Governance, semantic cache, OTEL, telemetry, maxim,
--   compat, prompts — none of these were loaded. A per-tenant plugin instance
--   that holds e.g. a Redis pool for semantic cache will dominate the 10 KiB
--   baseline. **Next step:** load governance + semantic cache per tenant and
--   re-measure.
-+The numbers above are smaller than the original plan's back-of-envelope
-+(5–50 MiB / tenant) because the spike uses **tuned multi-tenant
-+settings**, not defaults, and only loads one of the lightest plugins.
+diff --git a/multitenant/configstore_resolver.go b/multitenant/configstore_resolver.go
+new file mode 100644
+index 000000000..72bd201a6
+--- /dev/null
++++ b/multitenant/configstore_resolver.go
+@@ -0,0 +1,97 @@
++package multitenant
 +
-+1. **Heavier plugins.** Telemetry is at the cheap end of the spectrum (just
-+   counter/histogram vectors). Semantic cache holds a Redis pool and an
-+   embedding client per tenant — likely 1–2 MiB each. Governance holds an
-+   in-memory store sourced from Postgres — also significant. OTEL holds a
-+   gRPC exporter client. **Next step:** measure each of the heavier plugins
-+   in isolation, then together. Telemetry as a baseline gives us 31 KiB to
-+   compare against.
- 2. **MCP manager.** Not initialized in the spike (`MCPConfig=nil`). MCP
-    subprocess spawning and connection pools are the single biggest unknown
-    for per-tenant cost. **Next step:** spike a tenant with 2-3 MCP clients
-@@ -89,11 +97,15 @@ multi-tenant settings**, not defaults. The plan's risk list still stands:
- 
- ## Recommendation for next iteration
- 
--Don't move to Phase 1 (DB schema) yet. Two follow-up spikes first:
-+Don't move to Phase 1 (DB schema) yet. The telemetry pass landed cleanly
-+inside our 5 MiB budget per tenant; remaining plugin spikes are the next
-+deciding signal.
- 
--1. **Plugin spike.** Load governance + semantic cache + telemetry per
--   tenant. Measure heap + goroutines + FD per tenant. This is where the
--   real number lives.
-+1. **Heavier plugin spike.** Add governance and semantic cache. Both
-+   require state stores: governance reads/writes Postgres (configstore
-+   interface — bring up SQLite for the spike), semantic cache opens a
-+   Redis pool. Real numbers here decide whether per-tenant plugin
-+   instances need pool-sharing or not.
- 2. **MCP spike.** Add one MCP config per tenant (something small, e.g. a
-    stub HTTP MCP server). Measure connection count + process count.
- 
-diff --git a/multitenant/cmd/spike/main.go b/multitenant/cmd/spike/main.go
-index a8a53d385..7f6c519b0 100644
---- a/multitenant/cmd/spike/main.go
-+++ b/multitenant/cmd/spike/main.go
-@@ -27,6 +27,8 @@ import (
- 	bifrost "github.com/maximhq/bifrost/core"
- 	"github.com/maximhq/bifrost/core/schemas"
- 	"github.com/maximhq/bifrost/multitenant"
-+	"github.com/maximhq/bifrost/plugins/telemetry"
-+	"github.com/prometheus/client_golang/prometheus"
- )
- 
- // makeStaticAccount returns a per-tenant Account configured with a single
-@@ -63,6 +65,28 @@ func loader(_ context.Context, tid multitenant.TenantID) (schemas.BifrostConfig,
- 	}, nil
- }
- 
-+// loaderWithTelemetry adds a per-tenant Prometheus telemetry plugin. Each
-+// tenant gets its own *prometheus.Registry and its own metric vectors — that
-+// isolation is the whole point of multi-tenancy but the registry footprint is
-+// the cost we're measuring.
-+func loaderWithTelemetry(_ context.Context, tid multitenant.TenantID) (schemas.BifrostConfig, error) {
-+	logger := bifrost.NewDefaultLogger(schemas.LogLevelWarn)
-+	// Each tenant gets a fresh registry so its metric series don't collide.
-+	reg := prometheus.NewRegistry()
-+	plug, err := telemetry.Init(&telemetry.Config{
-+		Registry: reg,
-+	}, nil /* pricingManager */, logger)
-+	if err != nil {
-+		return schemas.BifrostConfig{}, fmt.Errorf("telemetry.Init for %s: %w", tid, err)
-+	}
-+	return schemas.BifrostConfig{
-+		Account:         makeStaticAccount(tid),
-+		InitialPoolSize: 32,
-+		Logger:          logger,
-+		LLMPlugins:      []schemas.LLMPlugin{plug},
-+	}, nil
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/maximhq/bifrost/framework/configstore"
++)
++
++// vkLookup is the minimal slice of the configstore.ConfigStore API that
++// ConfigStoreVKResolver needs. We accept this interface (rather than the
++// whole ConfigStore) so unit tests can mock it without standing up a real
++// SQLite-backed store.
++//
++// The single method matches configstore.ConfigStore.GetVirtualKeyByValue.
++type vkLookup interface {
++	GetVirtualKeyByValue(ctx context.Context, value string) (*virtualKeyMinimal, error)
 +}
 +
- // heapBytes returns current resident heap size after a GC cycle so the
- // measurement is comparable across snapshots.
- func heapBytes() uint64 {
-@@ -225,16 +249,69 @@ func run() error {
- 	fmt.Printf("    cached:   %v / lookup  (%d iters)\n", cachedAvg, resolverIters)
- 	fmt.Printf("    uncached: %v / lookup  (%d iters)\n", uncachedAvg, resolverIters)
- 
-+	// Section 6: Steady-state cost WITH telemetry plugin loaded per tenant.
-+	// We tear down the existing manager and create a fresh one so the heap
-+	// delta is attributable to the plugin alone.
-+	fmt.Println("\n[6] Steady-state memory per tenant — with telemetry plugin")
-+	for _, h := range heldHandles {
-+		h.Release()
-+	}
-+	heldHandles = heldHandles[:0]
-+	if err := mgr.Shutdown(ctx); err != nil {
-+		return fmt.Errorf("Shutdown before plugin pass: %w", err)
-+	}
-+	preHeap6 := heapBytes()
-+	preGo6 := goroutines()
-+	fmt.Printf("    pre-plugin heap: %s  goroutines: %d\n", human(preHeap6), preGo6)
++// virtualKeyMinimal is the subset of tables.TableVirtualKey that the
++// resolver reads. Defined separately so the interface contract stays small.
++type virtualKeyMinimal struct {
++	ID       string
++	TenantID string
++	IsActive *bool
++}
 +
-+	mgr2, err := multitenant.NewManager(ctx, multitenant.ManagerConfig{
-+		Loader:            loaderWithTelemetry,
-+		MaxActiveRuntimes: maxActive,
-+		Logger:            bifrost.NewDefaultLogger(schemas.LogLevelWarn),
-+	})
++// ConfigStoreVKResolver looks up a virtual key in framework/configstore's
++// governance_virtual_keys table and returns its tenant_id. Wrap it in a
++// CachedVKResolver to keep the hot path off the DB; the standard production
++// pattern is:
++//
++//	memResolver := multitenant.NewConfigStoreVKResolver(store)
++//	cached := multitenant.NewCachedVKResolver(memResolver, 60*time.Second)
++//
++// Returns ErrUnknownVK for keys that don't exist OR are marked inactive —
++// these are treated identically so callers can't distinguish "wrong VK" from
++// "disabled VK" via timing or error type.
++type ConfigStoreVKResolver struct {
++	store vkLookup
++}
++
++// NewConfigStoreVKResolver constructs a resolver backed by a ConfigStore.
++// Passing nil panics — the resolver is useless without a backing store.
++func NewConfigStoreVKResolver(store configstore.ConfigStore) *ConfigStoreVKResolver {
++	if store == nil {
++		panic("multitenant: nil ConfigStore passed to NewConfigStoreVKResolver")
++	}
++	return &ConfigStoreVKResolver{store: configStoreLookup{cs: store}}
++}
++
++// newConfigStoreVKResolverWithLookup is the test-only constructor that
++// accepts a custom vkLookup so a mock can be substituted for the SQLite
++// store. Kept unexported.
++func newConfigStoreVKResolverWithLookup(lookup vkLookup) *ConfigStoreVKResolver {
++	return &ConfigStoreVKResolver{store: lookup}
++}
++
++// ResolveVK implements VKResolver.
++func (r *ConfigStoreVKResolver) ResolveVK(ctx context.Context, vk string) (TenantID, error) {
++	if vk == "" {
++		return "", ErrUnknownVK
++	}
++	row, err := r.store.GetVirtualKeyByValue(ctx, vk)
 +	if err != nil {
-+		return fmt.Errorf("NewManager (with telemetry): %w", err)
++		if errors.Is(err, configstore.ErrNotFound) {
++			return "", ErrUnknownVK
++		}
++		return "", fmt.Errorf("resolve VK: %w", err)
++	}
++	if row.IsActive != nil && !*row.IsActive {
++		return "", ErrUnknownVK
++	}
++	if row.TenantID == "" {
++		return "", fmt.Errorf("VK %q has no tenant_id (likely a pre-migration row that escaped the backfill)", row.ID)
++	}
++	return TenantID(row.TenantID), nil
++}
++
++// configStoreLookup adapts the full configstore.ConfigStore down to the
++// narrower vkLookup interface, copying just the fields the resolver needs.
++type configStoreLookup struct {
++	cs configstore.ConfigStore
++}
++
++func (a configStoreLookup) GetVirtualKeyByValue(ctx context.Context, value string) (*virtualKeyMinimal, error) {
++	row, err := a.cs.GetVirtualKeyByValue(ctx, value)
++	if err != nil {
++		return nil, err
++	}
++	return &virtualKeyMinimal{
++		ID:       row.ID,
++		TenantID: row.TenantID,
++		IsActive: row.IsActive,
++	}, nil
++}
+diff --git a/multitenant/configstore_resolver_test.go b/multitenant/configstore_resolver_test.go
+new file mode 100644
+index 000000000..613344b3e
+--- /dev/null
++++ b/multitenant/configstore_resolver_test.go
+@@ -0,0 +1,129 @@
++package multitenant
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/maximhq/bifrost/framework/configstore"
++)
++
++// stubLookup is a vkLookup that returns canned rows / errors keyed by VK
++// value. It lets us drive ConfigStoreVKResolver without standing up a real
++// SQLite store.
++type stubLookup struct {
++	byValue map[string]*virtualKeyMinimal
++	err     error
++}
++
++func (s *stubLookup) GetVirtualKeyByValue(_ context.Context, value string) (*virtualKeyMinimal, error) {
++	if s.err != nil {
++		return nil, s.err
++	}
++	row, ok := s.byValue[value]
++	if !ok {
++		return nil, configstore.ErrNotFound
++	}
++	return row, nil
++}
++
++func boolPtr(b bool) *bool { return &b }
++
++func TestConfigStoreVKResolver_HappyPath(t *testing.T) {
++	lookup := &stubLookup{byValue: map[string]*virtualKeyMinimal{
++		"sk-bf-good": {ID: "vk-1", TenantID: "acme"},
++	}}
++	r := newConfigStoreVKResolverWithLookup(lookup)
++
++	tid, err := r.ResolveVK(context.Background(), "sk-bf-good")
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if tid != "acme" {
++		t.Fatalf("got tid=%q want %q", tid, "acme")
++	}
++}
++
++func TestConfigStoreVKResolver_UnknownVK(t *testing.T) {
++	r := newConfigStoreVKResolverWithLookup(&stubLookup{byValue: map[string]*virtualKeyMinimal{}})
++	if _, err := r.ResolveVK(context.Background(), "sk-bf-missing"); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("expected ErrUnknownVK, got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_EmptyVK(t *testing.T) {
++	r := newConfigStoreVKResolverWithLookup(&stubLookup{})
++	if _, err := r.ResolveVK(context.Background(), ""); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("empty VK should return ErrUnknownVK, got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_InactiveVK(t *testing.T) {
++	lookup := &stubLookup{byValue: map[string]*virtualKeyMinimal{
++		"sk-bf-disabled": {ID: "vk-d", TenantID: "acme", IsActive: boolPtr(false)},
++	}}
++	r := newConfigStoreVKResolverWithLookup(lookup)
++
++	// IsActive=false collapses into ErrUnknownVK so callers can't tell
++	// "wrong VK" from "disabled VK" by error type.
++	if _, err := r.ResolveVK(context.Background(), "sk-bf-disabled"); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("inactive VK should return ErrUnknownVK, got %v", err)
 +	}
 +
-+	pluginTenants := []multitenant.TenantID{"p-alpha", "p-beta", "p-gamma"}
-+	plugColdMax := time.Duration(0)
-+	plugColdSum := time.Duration(0)
-+	for _, tid := range pluginTenants {
-+		t0 := time.Now()
-+		h, err := mgr2.Acquire(ctx, tid)
-+		dt := time.Since(t0)
-+		if err != nil {
-+			return fmt.Errorf("Acquire(%s) with plugin: %w", tid, err)
-+		}
-+		plugColdSum += dt
-+		if dt > plugColdMax {
-+			plugColdMax = dt
-+		}
-+		heldHandles = append(heldHandles, h)
++	// IsActive=true is normal.
++	lookup.byValue["sk-bf-on"] = &virtualKeyMinimal{ID: "vk-on", TenantID: "acme", IsActive: boolPtr(true)}
++	tid, err := r.ResolveVK(context.Background(), "sk-bf-on")
++	if err != nil || tid != "acme" {
++		t.Fatalf("active VK with IsActive=true should resolve, got tid=%q err=%v", tid, err)
 +	}
-+	postHeap6 := heapBytes()
-+	postGo6 := goroutines()
-+	dHeap6 := int64(postHeap6) - int64(preHeap6)
-+	dGo6 := postGo6 - preGo6
-+	perTHeap6 := dHeap6 / int64(len(pluginTenants))
-+	perTGo6 := dGo6 / len(pluginTenants)
-+	fmt.Printf("    post-plugin heap: %s  goroutines: %d  (held %d)\n",
-+		human(postHeap6), postGo6, len(pluginTenants))
-+	fmt.Printf("    delta heap: %s  delta goroutines: %d\n", human(uint64(dHeap6)), dGo6)
-+	fmt.Printf("    per-tenant heap (avg):       %s\n", human(uint64(perTHeap6)))
-+	fmt.Printf("    per-tenant goroutines (avg): %d\n", perTGo6)
-+	fmt.Printf("    cold-start avg=%v  max=%v\n", plugColdSum/time.Duration(len(pluginTenants)), plugColdMax)
 +
- 	// Section 5: Graceful shutdown.
- 	fmt.Println("\n[5] Graceful shutdown")
- 	for _, h := range heldHandles {
- 		h.Release()
- 	}
- 	t0 = time.Now()
--	if err := mgr.Shutdown(ctx); err != nil {
-+	if err := mgr2.Shutdown(ctx); err != nil {
- 		return fmt.Errorf("Shutdown: %w", err)
- 	}
--	fmt.Printf("    Shutdown took %v  active=%d\n", time.Since(t0), mgr.ActiveRuntimes())
-+	fmt.Printf("    Shutdown took %v  active=%d\n", time.Since(t0), mgr2.ActiveRuntimes())
- 
- 	finalHeap := heapBytes()
- 	finalGo := goroutines()
++	// IsActive=nil is treated as active (DB default behaviour).
++	lookup.byValue["sk-bf-nil"] = &virtualKeyMinimal{ID: "vk-nil", TenantID: "acme"}
++	tid, err = r.ResolveVK(context.Background(), "sk-bf-nil")
++	if err != nil || tid != "acme" {
++		t.Fatalf("IsActive=nil should be treated as active, got tid=%q err=%v", tid, err)
++	}
++}
++
++func TestConfigStoreVKResolver_MissingTenantIDIsAnError(t *testing.T) {
++	// VK exists but TenantID is empty — that's a corrupted row (pre-migration
++	// data that escaped the backfill). Surface a real error so it gets noticed
++	// rather than silently routing to "" tenant.
++	lookup := &stubLookup{byValue: map[string]*virtualKeyMinimal{
++		"sk-bf-orphan": {ID: "vk-orphan", TenantID: ""},
++	}}
++	r := newConfigStoreVKResolverWithLookup(lookup)
++
++	_, err := r.ResolveVK(context.Background(), "sk-bf-orphan")
++	if err == nil {
++		t.Fatal("expected an error for missing tenant_id")
++	}
++	if errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("missing tenant_id should NOT collapse to ErrUnknownVK; got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_LookupErrorPropagates(t *testing.T) {
++	wantErr := errors.New("db borked")
++	r := newConfigStoreVKResolverWithLookup(&stubLookup{err: wantErr})
++
++	_, err := r.ResolveVK(context.Background(), "sk-bf-anything")
++	if err == nil {
++		t.Fatal("expected backing error to propagate")
++	}
++	if errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("backing DB error should NOT collapse to ErrUnknownVK; got %v", err)
++	}
++	if !errors.Is(err, wantErr) {
++		t.Fatalf("expected wrapped DB error, got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_NilConfigStorePanics(t *testing.T) {
++	defer func() {
++		if recover() == nil {
++			t.Fatal("expected panic on nil ConfigStore")
++		}
++	}()
++	_ = NewConfigStoreVKResolver(nil)
++}
 diff --git a/multitenant/go.mod b/multitenant/go.mod
-index 5317b3d1f..0e5659510 100644
+index 5317b3d1f..04e944ee4 100644
 --- a/multitenant/go.mod
 +++ b/multitenant/go.mod
-@@ -2,6 +2,166 @@ module github.com/maximhq/bifrost/multitenant
+@@ -2,6 +2,160 @@ module github.com/maximhq/bifrost/multitenant
  
  go 1.26.4
  
 -require github.com/maximhq/bifrost/core v0.0.0
 +require (
-+	github.com/maximhq/bifrost/core v1.5.18
-+	github.com/maximhq/bifrost/plugins/telemetry v1.5.18
-+	github.com/prometheus/client_golang v1.23.2
++	github.com/maximhq/bifrost/core v1.5.19
++	github.com/maximhq/bifrost/framework v1.3.19
 +)
- 
--replace github.com/maximhq/bifrost/core => ../core
++
 +require (
 +	cel.dev/expr v0.25.1 // indirect
 +	cloud.google.com/go v0.123.0 // indirect
 +	cloud.google.com/go/auth v0.20.0 // indirect
 +	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 +	cloud.google.com/go/compute/metadata v0.9.0 // indirect
-+	cloud.google.com/go/iam v1.5.3 // indirect
++	cloud.google.com/go/iam v1.7.0 // indirect
 +	cloud.google.com/go/monitoring v1.24.3 // indirect
 +	cloud.google.com/go/storage v1.61.3 // indirect
 +	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0 // indirect
@@ -264,13 +348,13 @@ index 5317b3d1f..0e5659510 100644
 +	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect
 +	github.com/andybalholm/brotli v1.2.1 // indirect
 +	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
-+	github.com/aws/aws-sdk-go-v2 v1.41.7 // indirect
++	github.com/aws/aws-sdk-go-v2 v1.41.12 // indirect
 +	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10 // indirect
 +	github.com/aws/aws-sdk-go-v2/config v1.32.11 // indirect
 +	github.com/aws/aws-sdk-go-v2/credentials v1.19.14 // indirect
 +	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21 // indirect
-+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
-+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.28 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.28 // indirect
 +	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.5 // indirect
 +	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.22 // indirect
 +	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.7 // indirect
@@ -282,9 +366,8 @@ index 5317b3d1f..0e5659510 100644
 +	github.com/aws/aws-sdk-go-v2/service/sso v1.30.15 // indirect
 +	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.19 // indirect
 +	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10 // indirect
-+	github.com/aws/smithy-go v1.25.1 // indirect
++	github.com/aws/smithy-go v1.27.1 // indirect
 +	github.com/bahlo/generic-list-go v0.2.0 // indirect
-+	github.com/beorn7/perks v1.0.1 // indirect
 +	github.com/buger/jsonparser v1.1.2 // indirect
 +	github.com/bytedance/gopkg v0.1.3 // indirect
 +	github.com/bytedance/sonic v1.15.1 // indirect
@@ -342,8 +425,6 @@ index 5317b3d1f..0e5659510 100644
 +	github.com/mattn/go-colorable v0.1.14 // indirect
 +	github.com/mattn/go-isatty v0.0.20 // indirect
 +	github.com/mattn/go-sqlite3 v1.14.32 // indirect
-+	github.com/maximhq/bifrost/framework v1.3.18 // indirect
-+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 +	github.com/oapi-codegen/runtime v1.1.1 // indirect
 +	github.com/oklog/ulid v1.3.1 // indirect
 +	github.com/pinecone-io/go-pinecone/v5 v5.3.0 // indirect
@@ -351,9 +432,6 @@ index 5317b3d1f..0e5659510 100644
 +	github.com/pkg/errors v0.9.1 // indirect
 +	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 +	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-+	github.com/prometheus/client_model v0.6.2 // indirect
-+	github.com/prometheus/common v0.67.5 // indirect
-+	github.com/prometheus/procfs v0.19.2 // indirect
 +	github.com/qdrant/go-client v1.16.2 // indirect
 +	github.com/redis/go-redis/v9 v9.17.2 // indirect
 +	github.com/rs/zerolog v1.34.0 // indirect
@@ -382,7 +460,6 @@ index 5317b3d1f..0e5659510 100644
 +	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
 +	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 +	go.starlark.net v0.0.0-20260102030733-3fee463870c9 // indirect
-+	go.yaml.in/yaml/v2 v2.4.3 // indirect
 +	go.yaml.in/yaml/v3 v3.0.4 // indirect
 +	golang.org/x/arch v0.23.0 // indirect
 +	golang.org/x/crypto v0.52.0 // indirect
@@ -403,12 +480,14 @@ index 5317b3d1f..0e5659510 100644
 +	gorm.io/driver/sqlite v1.6.0 // indirect
 +	gorm.io/gorm v1.31.1 // indirect
 +)
+ 
+ replace github.com/maximhq/bifrost/core => ../core
 diff --git a/multitenant/go.sum b/multitenant/go.sum
 new file mode 100644
-index 000000000..44b0f155f
+index 000000000..3e2e88122
 --- /dev/null
 +++ b/multitenant/go.sum
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,387 @@
 +cel.dev/expr v0.25.1 h1:1KrZg61W6TWSxuNZ37Xy49ps13NUovb66QLprthtwi4=
 +cel.dev/expr v0.25.1/go.mod h1:hrXvqGP6G6gyx8UAHSHJ5RGk//1Oj5nXQ2NI02Nrsg4=
 +cloud.google.com/go v0.123.0 h1:2NAUJwPR47q+E35uaJeYoNhuNEM9kM8SjgRgdeOJUSE=
@@ -419,8 +498,8 @@ index 000000000..44b0f155f
 +cloud.google.com/go/auth/oauth2adapt v0.2.8/go.mod h1:XQ9y31RkqZCcwJWNSx2Xvric3RrU88hAYYbjDWYDL+c=
 +cloud.google.com/go/compute/metadata v0.9.0 h1:pDUj4QMoPejqq20dK0Pg2N4yG9zIkYGdBtwLoEkH9Zs=
 +cloud.google.com/go/compute/metadata v0.9.0/go.mod h1:E0bWwX5wTnLPedCKqk3pJmVgCBSM6qQI1yTBdEb3C10=
-+cloud.google.com/go/iam v1.5.3 h1:+vMINPiDF2ognBJ97ABAYYwRgsaqxPbQDlMnbHMjolc=
-+cloud.google.com/go/iam v1.5.3/go.mod h1:MR3v9oLkZCTlaqljW6Eb2d3HGDGK5/bDv93jhfISFvU=
++cloud.google.com/go/iam v1.7.0 h1:JD3zh0C6LHl16aCn5Akff0+GELdp1+4hmh6ndoFLl8U=
++cloud.google.com/go/iam v1.7.0/go.mod h1:tetWZW1PD/m6vcuY2Zj/aU0eCHNPuxedbnbRTyKXvdY=
 +cloud.google.com/go/logging v1.13.2 h1:qqlHCBvieJT9Cdq4QqYx1KPadCQ2noD4FK02eNqHAjA=
 +cloud.google.com/go/logging v1.13.2/go.mod h1:zaybliM3yun1J8mU2dVQ1/qDzjbOqEijZCn6hSBtKak=
 +cloud.google.com/go/longrunning v0.8.0 h1:LiKK77J3bx5gDLi4SMViHixjD2ohlkwBi+mKA7EhfW8=
@@ -456,8 +535,8 @@ index 000000000..44b0f155f
 +github.com/andybalholm/brotli v1.2.1/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 +github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
 +github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
-+github.com/aws/aws-sdk-go-v2 v1.41.7 h1:DWpAJt66FmnnaRIOT/8ASTucrvuDPZASqhhLey6tLY8=
-+github.com/aws/aws-sdk-go-v2 v1.41.7/go.mod h1:4LAfZOPHNVNQEckOACQx60Y8pSRjIkNZQz1w92xpMJc=
++github.com/aws/aws-sdk-go-v2 v1.41.12 h1:DIKX2c31ekm9RA2D9FBj1EWXx++9AdAqRw+e78Tq2Ck=
++github.com/aws/aws-sdk-go-v2 v1.41.12/go.mod h1:27+ACypSLljLAEKsCYOmrjKh83vuTRkuAe9Uv/3A4bg=
 +github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10 h1:gx1AwW1Iyk9Z9dD9F4akX5gnN3QZwUB20GGKH/I+Rho=
 +github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10/go.mod h1:qqY157uZoqm5OXq/amuaBJyC9hgBCBQnsaWnPe905GY=
 +github.com/aws/aws-sdk-go-v2/config v1.32.11 h1:ftxI5sgz8jZkckuUHXfC/wMUc8u3fG1vQS0plr2F2Zs=
@@ -466,10 +545,10 @@ index 000000000..44b0f155f
 +github.com/aws/aws-sdk-go-v2/credentials v1.19.14/go.mod h1:cJKuyWB59Mqi0jM3nFYQRmnHVQIcgoxjEMAbLkpr62w=
 +github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21 h1:NUS3K4BTDArQqNu2ih7yeDLaS3bmHD0YndtA6UP884g=
 +github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21/go.mod h1:YWNWJQNjKigKY1RHVJCuupeWDrrHjRqHm0N9rdrWzYI=
-+github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 h1:GpT/TrnBYuE5gan2cZbTtvP+JlHsutdmlV2YfEyNde0=
-+github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23/go.mod h1:xYWD6BS9ywC5bS3sz9Xh04whO/hzK2plt2Zkyrp4JuA=
-+github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 h1:bpd8vxhlQi2r1hiueOw02f/duEPTMK59Q4QMAoTTtTo=
-+github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23/go.mod h1:15DfR2nw+CRHIk0tqNyifu3G1YdAOy68RftkhMDDwYk=
++github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.28 h1:Xf2j7NdVcUKomlZ4iihOP4AZ3Fzlr8h4yKpXeP+OFPg=
++github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.28/go.mod h1:O8cDo1dW63jU7ki//kRe1z+tLGcpnD1jrouitsQddDw=
++github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.28 h1:KqIfN9kpkKkcBqBbNpNGTIrXO6ExTUvFKvXkC+YAzVo=
++github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.28/go.mod h1:uxtQiKvLtNS4iXVsH2McVD/ls8FKN/uUhe1hGxPjrw0=
 +github.com/aws/aws-sdk-go-v2/internal/ini v1.8.5 h1:clHU5fm//kWS1C2HgtgWxfQbFbx4b6rx+5jzhgX9HrI=
 +github.com/aws/aws-sdk-go-v2/internal/ini v1.8.5/go.mod h1:O3h0IK87yXci+kg6flUKzJnWeziQUKciKrLjcatSNcY=
 +github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.22 h1:rWyie/PxDRIdhNf4DzRk0lvjVOqFJuNnO8WwaIRVxzQ=
@@ -492,12 +571,10 @@ index 000000000..44b0f155f
 +github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.19/go.mod h1:YO8TrYtFdl5w/4vmjL8zaBSsiNp3w0L1FfKVKenZT7w=
 +github.com/aws/aws-sdk-go-v2/service/sts v1.41.10 h1:p8ogvvLugcR/zLBXTXrTkj0RYBUdErbMnAFFp12Lm/U=
 +github.com/aws/aws-sdk-go-v2/service/sts v1.41.10/go.mod h1:60dv0eZJfeVXfbT1tFJinbHrDfSJ2GZl4Q//OSSNAVw=
-+github.com/aws/smithy-go v1.25.1 h1:J8ERsGSU7d+aCmdQur5Txg6bVoYelvQJgtZehD12GkI=
-+github.com/aws/smithy-go v1.25.1/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
++github.com/aws/smithy-go v1.27.1 h1:4T340VFndXtADGF52gYa1POyL7s9E4Z1OeZ1hCscIw8=
++github.com/aws/smithy-go v1.27.1/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
 +github.com/bahlo/generic-list-go v0.2.0 h1:5sz/EEAK+ls5wF+NeqDpk5+iNdMDXrh3z3nPnH1Wvgk=
 +github.com/bahlo/generic-list-go v0.2.0/go.mod h1:2KvAjgMlE5NNynlg/5iLrrCCZ2+5xWbdbCW3pNTGyYg=
-+github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
-+github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 +github.com/bmatcuk/doublestar v1.1.1/go.mod h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w=
 +github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
 +github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
@@ -654,14 +731,8 @@ index 000000000..44b0f155f
 +github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 +github.com/mattn/go-sqlite3 v1.14.32 h1:JD12Ag3oLy1zQA+BNn74xRgaBbdhbNIDYvQUEuuErjs=
 +github.com/mattn/go-sqlite3 v1.14.32/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
-+github.com/maximhq/bifrost/core v1.5.18 h1:f1lX3sPesKTScUJHv+K9tWpd1wLLjd7CAzJY0BpbAaE=
-+github.com/maximhq/bifrost/core v1.5.18/go.mod h1:7vry9xB5kmjT3smAVVQ2+mtfTmmeSN+7N1b8r1buaTI=
-+github.com/maximhq/bifrost/framework v1.3.18 h1:74f7Do5cSsjvqqBKq/s1OMSebt/7VUNf/Wosa37X8Wc=
-+github.com/maximhq/bifrost/framework v1.3.18/go.mod h1:8L+vIF+0zFixHsmS1GZF+WbZZu0GBSKsGhnbBbTYIJw=
-+github.com/maximhq/bifrost/plugins/telemetry v1.5.18 h1:wbquaXZucd+InZ7RnqLZBEt21SBev/FcGnV5ythcLQ8=
-+github.com/maximhq/bifrost/plugins/telemetry v1.5.18/go.mod h1:HMw+mI30+emdq5T7QzYZ3geEev5rJ+wJS6BNHrQHlz8=
-+github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
-+github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
++github.com/maximhq/bifrost/framework v1.3.19 h1:m8opPeElM4ifakESAj8zCgl/irkUZ8VmmmLsF9RbB9w=
++github.com/maximhq/bifrost/framework v1.3.19/go.mod h1:pdjCMzVaGwRNqnwW2K5cmM6UB0ic80Padt5VHRo6SFE=
 +github.com/oapi-codegen/runtime v1.1.1 h1:EXLHh0DXIJnWhdRPN2w4MXAzFyE4CskzhNLUmtpMYro=
 +github.com/oapi-codegen/runtime v1.1.1/go.mod h1:SK9X900oXmPWilYR5/WKPzt3Kqxn/uS/+lbpREv+eCg=
 +github.com/oklog/ulid v1.3.1 h1:EGfNDEx6MqHz8B3uNV6QAib1UR2Lm97sHi3ocA6ESJ4=
@@ -677,14 +748,6 @@ index 000000000..44b0f155f
 +github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 +github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRIccs7FGNTlIRMkT8wgtp5eCXdBlqhYGL6U=
 +github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-+github.com/prometheus/client_golang v1.23.2 h1:Je96obch5RDVy3FDMndoUsjAhG5Edi49h0RJWRi/o0o=
-+github.com/prometheus/client_golang v1.23.2/go.mod h1:Tb1a6LWHB3/SPIzCoaDXI4I8UHKeFTEQ1YCr+0Gyqmg=
-+github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=
-+github.com/prometheus/client_model v0.6.2/go.mod h1:y3m2F6Gdpfy6Ut/GBsUqTWZqCUvMVzSfMLjcu6wAwpE=
-+github.com/prometheus/common v0.67.5 h1:pIgK94WWlQt1WLwAC5j2ynLaBRDiinoAb86HZHTUGI4=
-+github.com/prometheus/common v0.67.5/go.mod h1:SjE/0MzDEEAyrdr5Gqc6G+sXI67maCxzaT3A2+HqjUw=
-+github.com/prometheus/procfs v0.19.2 h1:zUMhqEW66Ex7OXIiDkll3tl9a1ZdilUOd/F6ZXw4Vws=
-+github.com/prometheus/procfs v0.19.2/go.mod h1:M0aotyiemPhBCM0z5w87kL22CxfcH05ZpYlu+b4J7mw=
 +github.com/qdrant/go-client v1.16.2 h1:UUMJJfvXTByhwhH1DwWdbkhZ2cTdvSqVkXSIfBrVWSg=
 +github.com/qdrant/go-client v1.16.2/go.mod h1:I+EL3h4HRoRTeHtbfOd/4kDXwCukZfkd41j/9wryGkw=
 +github.com/redis/go-redis/v9 v9.17.2 h1:P2EGsA4qVIM3Pp+aPocCJ7DguDHhqrXNhVcEp4ViluI=
@@ -764,10 +827,6 @@ index 000000000..44b0f155f
 +go.opentelemetry.io/otel/trace v1.43.0/go.mod h1:/QJhyVBUUswCphDVxq+8mld+AvhXZLhe+8WVFxiFff0=
 +go.starlark.net v0.0.0-20260102030733-3fee463870c9 h1:nV1OyvU+0CYrp5eKfQ3rD03TpFYYhH08z31NK1HmtTk=
 +go.starlark.net v0.0.0-20260102030733-3fee463870c9/go.mod h1:YKMCv9b1WrfWmeqdV5MAuEHWsu5iC+fe6kYl2sQjdI8=
-+go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
-+go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
-+go.yaml.in/yaml/v2 v2.4.3 h1:6gvOSjQoTB3vt1l+CU+tSyi/HOjfOjRLJ4YwYZGwRO0=
-+go.yaml.in/yaml/v2 v2.4.3/go.mod h1:zSxWcmIDjOzPXpjlTTbAsKokqkDNAVtZO0WOMiT90s8=
 +go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
 +go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
 +golang.org/x/arch v0.23.0 h1:lKF64A2jF6Zd8L0knGltUnegD62JMFBiCPBmQpToHhg=
@@ -816,6 +875,356 @@ index 000000000..44b0f155f
 +gorm.io/driver/sqlite v1.6.0/go.mod h1:AO9V1qIQddBESngQUKWL9yoH93HIeA1X6V633rBwyT8=
 +gorm.io/gorm v1.31.1 h1:7CA8FTFz/gRfgqgpeKIBcervUn3xSyPUmr6B2WXJ7kg=
 +gorm.io/gorm v1.31.1/go.mod h1:XyQVbO2k6YkOis7C2437jSit3SsDK72s7n7rsSHd+Gs=
+diff --git a/multitenant/tenant.go b/multitenant/tenant.go
+index b48707d0f..ee1e4466c 100644
+--- a/multitenant/tenant.go
++++ b/multitenant/tenant.go
+@@ -17,6 +17,12 @@ import (
+ // downstream code (DB IDs, ULIDs, UUIDs, slugs) can pick a representation.
+ type TenantID string
+ 
++// BifrostContextKeyTenantID is the BifrostContext key under which the resolved
++// tenant id is stored. The tenant-resolver middleware sets it after looking
++// up the inbound virtual key; downstream plugins / the multi-tenant
++// dispatcher read it via ctx.Value(BifrostContextKeyTenantID).
++const BifrostContextKeyTenantID schemas.BifrostContextKey = "bf-tenant-id"
++
+ // TenantLoader is the user-supplied callback that produces a BifrostConfig for
+ // a given tenant. The loader is invoked exactly once per tenant runtime per
+ // process lifetime (or until the runtime is evicted and re-acquired).
+diff --git a/transports/bifrost-http/handlers/tenant_resolver.go b/transports/bifrost-http/handlers/tenant_resolver.go
+new file mode 100644
+index 000000000..56b3b1aa1
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_resolver.go
+@@ -0,0 +1,123 @@
++package handlers
++
++import (
++	"strings"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantResolverMiddleware extracts the inbound virtual key from the request,
++// resolves it to a tenant id via the supplied multitenant.VKResolver, and
++// stashes the result on the fasthttp RequestCtx under
++// multitenant.BifrostContextKeyTenantID. Downstream BifrostContext
++// construction (lib/ctx.go) lifts that user-value onto the BifrostContext,
++// where the per-tenant Bifrost dispatcher reads it.
++//
++// Behaviour:
++//
++//   - VK header missing: pass through unchanged. The downstream pipeline
++//     still has the option to attribute the request to the default tenant.
++//   - VK present but unknown / inactive: still pass through; we DO NOT reject
++//     here so the existing governance plugin keeps owning auth/authz errors
++//     with a single source of truth. The tenant id is simply not set.
++//   - Resolver error (DB outage, etc.): logged at debug level, request still
++//     passes through without a tenant id. Failing closed at this layer would
++//     translate every transient DB blip into 500s for inference; the
++//     dispatcher can decide its own fail-open / fail-closed policy.
++//
++// Skip paths: requests under /api/platform/* never carry a tenant context
++// (platform-admin APIs are cross-tenant); /health is too noisy to look up.
++//
++// The middleware reads the same VK header shapes as lib/ctx.go's
++// BifrostContext construction (x-bf-vk, Authorization: Bearer sk-bf-...,
++// x-api-key, x-goog-api-key) so behaviour stays aligned with the existing
++// governance plugin's VK source of truth.
++func TenantResolverMiddleware(resolver multitenant.VKResolver) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			if resolver == nil {
++				next(ctx)
++				return
++			}
++			path := string(ctx.RequestURI())
++			if shouldSkipTenantResolve(path) {
++				next(ctx)
++				return
++			}
++
++			vk := extractVKFromHeaders(&ctx.Request.Header)
++			if vk == "" {
++				next(ctx)
++				return
++			}
++
++			tid, err := resolver.ResolveVK(ctx, vk)
++			if err != nil {
++				// Unknown / inactive VK / DB error all fall through without a
++				// tenant id. Governance still owns the rejection path.
++				if logger != nil {
++					logger.Debug("tenant resolver: VK lookup failed (vk=%q err=%v) — request continues without tenant_id", redactVK(vk), err)
++				}
++				next(ctx)
++				return
++			}
++
++			ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), string(tid))
++			next(ctx)
++		}
++	}
++}
++
++// shouldSkipTenantResolve returns true for paths that have no per-tenant
++// dispatch and so don't benefit from a VK lookup. Keep this list short —
++// every entry is a per-request VK lookup we avoid.
++func shouldSkipTenantResolve(path string) bool {
++	if path == "/health" {
++		return true
++	}
++	if strings.HasPrefix(path, "/api/platform/") {
++		return true
++	}
++	return false
++}
++
++// extractVKFromHeaders mirrors the VK ingestion logic in lib/ctx.go so the
++// resolver sees the same VK the governance plugin will later see. It only
++// returns a non-empty value when the candidate clearly looks like a virtual
++// key (x-bf-vk is the dedicated header; the other shapes are accepted only
++// when the value starts with the governance VK prefix).
++func extractVKFromHeaders(h *fasthttp.RequestHeader) string {
++	if v := string(h.Peek("x-bf-vk")); v != "" {
++		return v
++	}
++	if v := string(h.Peek("Authorization")); v != "" {
++		if strings.HasPrefix(strings.ToLower(v), "bearer ") {
++			cand := strings.TrimSpace(v[7:])
++			if strings.HasPrefix(strings.ToLower(cand), virtualKeyPrefix) {
++				return cand
++			}
++		}
++	}
++	if v := string(h.Peek("x-api-key")); v != "" && strings.HasPrefix(strings.ToLower(v), virtualKeyPrefix) {
++		return v
++	}
++	if v := string(h.Peek("x-goog-api-key")); v != "" && strings.HasPrefix(strings.ToLower(v), virtualKeyPrefix) {
++		return v
++	}
++	return ""
++}
++
++// virtualKeyPrefix duplicates governance.VirtualKeyPrefix so this file does
++// not pull in the governance plugin import for a single constant. Keep in
++// sync; the value is governance-spec-stable.
++const virtualKeyPrefix = "sk-bf-"
++
++// redactVK trims a VK down to a stable prefix + last 4 chars for logging.
++func redactVK(vk string) string {
++	if len(vk) <= 8 {
++		return "redacted"
++	}
++	return vk[:6] + "…" + vk[len(vk)-4:]
++}
+diff --git a/transports/bifrost-http/handlers/tenant_resolver_test.go b/transports/bifrost-http/handlers/tenant_resolver_test.go
+new file mode 100644
+index 000000000..6b3f11f75
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_resolver_test.go
+@@ -0,0 +1,198 @@
++package handlers
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// stubVKResolver is a multitenant.VKResolver that returns canned answers
++// keyed by exact VK match.
++type stubVKResolver struct {
++	mapping map[string]multitenant.TenantID
++	err     error
++	calls   int
++}
++
++func (s *stubVKResolver) ResolveVK(_ context.Context, vk string) (multitenant.TenantID, error) {
++	s.calls++
++	if s.err != nil {
++		return "", s.err
++	}
++	tid, ok := s.mapping[vk]
++	if !ok {
++		return "", multitenant.ErrUnknownVK
++	}
++	return tid, nil
++}
++
++// newResolverTestCtx builds a properly-initialized RequestCtx with the given
++// path + optional VK header. Path defaults to /api/inference if empty.
++func newResolverTestCtx(t *testing.T, path string, hdr map[string]string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	if path == "" {
++		path = "/api/inference/chat"
++	}
++	req.SetRequestURI(path)
++	for k, v := range hdr {
++		req.Header.Set(k, v)
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	return ctx
++}
++
++// nextHandler is a trivial fasthttp handler that records whether it was
++// called and exposes the ctx so tests can inspect UserValues after the
++// middleware ran.
++type nextHandler struct {
++	called bool
++}
++
++func (n *nextHandler) handle(ctx *fasthttp.RequestCtx) { n.called = true }
++
++func TestTenantResolverMiddleware_HappyPath(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{
++		"sk-bf-acme": "acme",
++	}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-acme"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next handler should have been called")
++	}
++	if resolver.calls != 1 {
++		t.Fatalf("resolver should be called exactly once, got %d", resolver.calls)
++	}
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("tenant id should be set on ctx; got %q", tid)
++	}
++}
++
++func TestTenantResolverMiddleware_ReadsBearer(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{
++		"sk-bf-acme": "acme",
++	}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"Authorization": "Bearer sk-bf-acme"})
++	mw(ctx)
++
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("Bearer-token VK should be picked up; got tid=%q", tid)
++	}
++}
++
++func TestTenantResolverMiddleware_BearerNonVKIgnored(t *testing.T) {
++	resolver := &stubVKResolver{}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	// Authorization without the sk-bf- prefix is some other auth scheme,
++	// not a virtual key. Don't even call the resolver.
++	ctx := newResolverTestCtx(t, "", map[string]string{"Authorization": "Bearer ya29-google-token"})
++	mw(ctx)
++
++	if resolver.calls != 0 {
++		t.Fatalf("non-VK Authorization should not trigger resolver, got %d calls", resolver.calls)
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_MissingVKPassesThrough(t *testing.T) {
++	resolver := &stubVKResolver{}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", nil)
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next handler should still run when VK is absent")
++	}
++	if resolver.calls != 0 {
++		t.Fatal("resolver should not be called when no VK is present")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_UnknownVKPassesThrough(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-bogus"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next handler should still run on unknown VK; governance owns the 401")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set on unknown VK; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_ResolverErrorPassesThrough(t *testing.T) {
++	resolver := &stubVKResolver{err: errors.New("db borked")}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-anything"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("DB outage should not block the request — fail open at this layer")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set on resolver error; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_SkipsPlatformAndHealth(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{
++		"sk-bf-acme": "acme",
++	}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	for _, path := range []string{"/health", "/api/platform/tenants", "/api/platform/tenants/acme"} {
++		ctx := newResolverTestCtx(t, path, map[string]string{"x-bf-vk": "sk-bf-acme"})
++		mw(ctx)
++		if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++			t.Fatalf("path %s should be skipped; resolved tenant=%v", path, v)
++		}
++	}
++	if resolver.calls != 0 {
++		t.Fatalf("resolver should not be called on skip paths, got %d calls", resolver.calls)
++	}
++}
++
++func TestTenantResolverMiddleware_NilResolverIsNoop(t *testing.T) {
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(nil)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-acme"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("nil resolver should pass through")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set when resolver is nil; got %v", v)
++	}
++}
 -- 
 2.51.0
 

@@ -1,7 +1,8 @@
-From b9ec579f97b58ec2d737782ab0d1a04df9e718aa Mon Sep 17 00:00:00 2001
+From 50f79b05148e305ed5d4bcf78ac196f6fbd9f646 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Thu, 11 Jun 2026 14:41:44 -0600
-Subject: [PATCH 1/7] multitenant: scaffold per-tenant Bifrost runtime registry
+Subject: [PATCH 01/14] multitenant: scaffold per-tenant Bifrost runtime
+ registry
 
 Wraps the unchanged core/bifrost runtime in a tenant-keyed Manager that
 lazy-loads each tenant on first Acquire, refcounts in-flight Handles to

@@ -1,8 +1,8 @@
-From 52b7d58c743dbb4c0ce1e8def39c24299fbb574e Mon Sep 17 00:00:00 2001
+From 625516de991f01ac878e5f4f8e142ee38157ca57 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Fri, 12 Jun 2026 11:36:23 -0600
-Subject: [PATCH] transports: wire MultiTenantRouter + resolver middleware into
- inference path
+Subject: [PATCH 13/14] transports: wire MultiTenantRouter + resolver
+ middleware into inference path
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
