@@ -45,45 +45,45 @@ core.
 Each patch lives at `f5xc-patches/patch1/multi-tenant/patches/NNNN-*.patch`
 and carries a `Ref: https://jira.f5net.com/browse/XC-25496` trailer.
 
-### Phase 0 — multitenant package scaffold (spike → product)
+> **Note:** the series was renumbered from 18 patches to 14 after dropping
+> the spike research patches (see cleanup section below). Old patch numbers
+> are referenced in some prior commits and the project memory.
+
+### Phase 0 — multitenant package scaffold
 
 | #    | Subject                                                          | What it adds                                                                                                                                  |
 | ---- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | 0001 | multitenant: scaffold per-tenant Bifrost runtime registry        | `multitenant/` Go module — `Manager` (lazy load + refcount + LRU), `VKResolver`, `StaticAccount`, runtime/tenant/account types.                |
-| 0002 | multitenant: add cmd/spike binary and Phase 2 findings           | `multitenant/cmd/spike` binary + `SPIKE_FINDINGS.md` (per-tenant cost measurements — heap, goroutines, cold start).                            |
-| 0003 | multitenant: tests for Manager concurrency, eviction, …          | 9 race-clean tests covering concurrent Acquire/Release, LRU eviction under refcount pressure, expiration.                                      |
-| 0004 | multitenant: measure per-tenant cost with telemetry plugin       | Spike result: +telemetry plugin per tenant ≈ 36 KiB heap, 148 µs cold-start, 5 goroutines.                                                    |
-| 0005 | multitenant: measure per-tenant cost with governance plugin      | Spike result: per-tenant SQLite — 888 KiB / 60 ms (rejected). Shared SQLite — 24 KiB / 178 µs (accepted).                                     |
-| 0006 | multitenant: shared-configstore governance spike validation      | End-to-end harness proving shared store + per-tenant resolver/tracker/engine is viable.                                                       |
+| 0002 | multitenant: tests for Manager concurrency, eviction, …          | 9 race-clean tests covering concurrent Acquire/Release, LRU eviction under refcount pressure, expiration.                                      |
 
 ### Phase 1 — ConfigStore schema (tenant_id everywhere)
 
 | #    | Subject                                                          | What it adds                                                                                                                                  |
 | ---- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0007 | configstore: add TableTenant and customer.tenant_id              | New `bf_tenants` table; `DefaultTenantID = "default"`; gormigrate migration adding tenant_id to TableCustomer with backward-compat default.    |
-| 0008 | configstore: extend tenant_id to teams, VKs, budgets, rate …     | `tenant_id` on TableTeam, TableVirtualKey, TableBudget, TableRateLimit + migration.                                                            |
-| 0009 | configstore: extend tenant_id to providers, keys, MCP clients    | `tenant_id` on TableProvider, TableKey, TableMCPClient + migration.                                                                            |
-| 0010 | configstore: tenant-scope Name uniqueness on providers, keys, …  | Composite unique indexes `(tenant_id, name)` so two tenants can both have a provider named "openai".                                          |
-| 0011 | configstore: add TenantRepository CRUD on ConfigStore            | `TenantRepository` interface + GORM impl: Create/Get/List/Update/Delete tenants.                                                              |
+| 0003 | configstore: add TableTenant and customer.tenant_id              | New `bf_tenants` table; `DefaultTenantID = "default"`; gormigrate migration adding tenant_id to TableCustomer with backward-compat default.    |
+| 0004 | configstore: extend tenant_id to teams, VKs, budgets, rate …     | `tenant_id` on TableTeam, TableVirtualKey, TableBudget, TableRateLimit + migration.                                                            |
+| 0005 | configstore: extend tenant_id to providers, keys, MCP clients    | `tenant_id` on TableProvider, TableKey, TableMCPClient + migration.                                                                            |
+| 0006 | configstore: tenant-scope Name uniqueness on providers, keys, …  | Composite unique indexes `(tenant_id, name)` so two tenants can both have a provider named "openai".                                          |
+| 0007 | configstore: add TenantRepository CRUD on ConfigStore            | `TenantRepository` interface + GORM impl: Create/Get/List/Update/Delete tenants.                                                              |
 
 ### Phase 2 — Admin API + tenant resolution
 
 | #    | Subject                                                          | What it adds                                                                                                                                  |
 | ---- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0012 | transports: add /api/platform/tenants admin handlers             | REST CRUD at `/api/platform/tenants` for platform admins to create/list/update/delete tenants.                                                 |
-| 0013 | transports+multitenant: tenant resolver middleware + …           | `ConfigStoreVKResolver` (VK→tenant lookup via repo), fasthttp middleware that resolves tenant_id from the request VK and lifts it into ctx.   |
+| 0008 | transports: add /api/platform/tenants admin handlers             | REST CRUD at `/api/platform/tenants` for platform admins to create/list/update/delete tenants.                                                 |
+| 0009 | transports+multitenant: tenant resolver middleware + …           | `ConfigStoreVKResolver` (VK→tenant lookup via repo), fasthttp middleware that resolves tenant_id from the request VK and lifts it into ctx. Also wires `framework/configstore` into `multitenant/go.mod`. |
 
 ### Phase 3 — Per-request runtime dispatch
 
 | #    | Subject                                                          | What it adds                                                                                                                                  |
 | ---- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0014 | transports: introduce BifrostRouter interface + SingleTenant…    | `BifrostRouter.Acquire(ctx) → (*bifrost.Bifrost, release, error)`. `SingleTenantRouter` returns the shared client with a no-op release.       |
-| 0015 | configstore: add GetProvidersConfigByTenant for per-tenant …     | Tenant-scoped provider config loader the per-tenant runtime uses to populate its Account.                                                     |
-| 0016 | transports: TenantScopedAccount + MultiTenantRouter + ctx …      | `TenantScopedAccount` wraps the OSS Account interface with a tenant_id; `MultiTenantRouter` reads tenant_id from ctx, falls through to `FallbackTenant` then `FallbackClient`. |
-| 0017 | transports: wire MultiTenantRouter + resolver middleware into …  | `buildInferenceRouter` in server.go picks SingleTenantRouter or MultiTenantRouter based on `BIFROST_MULTI_TENANT_ENABLED`.                    |
-| 0018 | transports/handlers: route inference through BifrostRouter       | All HTTP inference entry points (`inference.go`, `asyncinference.go`, `mcpinference.go`) now `router.Acquire(ctx) + defer release` instead of `h.client.X`. Streaming threads release through `handleStreamingResponse` for SSE goroutine lifetime; async closures acquire at execution time. |
+| 0010 | transports: introduce BifrostRouter interface + SingleTenant…    | `BifrostRouter.Acquire(ctx) → (*bifrost.Bifrost, release, error)`. `SingleTenantRouter` returns the shared client with a no-op release.       |
+| 0011 | configstore: add GetProvidersConfigByTenant for per-tenant …     | Tenant-scoped provider config loader the per-tenant runtime uses to populate its Account.                                                     |
+| 0012 | transports: TenantScopedAccount + MultiTenantRouter + ctx …      | `TenantScopedAccount` wraps the OSS Account interface with a tenant_id; `MultiTenantRouter` reads tenant_id from ctx, falls through to `FallbackTenant` then `FallbackClient`. |
+| 0013 | transports: wire MultiTenantRouter + resolver middleware into …  | `buildInferenceRouter` in server.go picks SingleTenantRouter or MultiTenantRouter based on `BIFROST_MULTI_TENANT_ENABLED`.                    |
+| 0014 | transports/handlers: route inference through BifrostRouter       | All HTTP inference entry points (`inference.go`, `asyncinference.go`, `mcpinference.go`) now `router.Acquire(ctx) + defer release` instead of `h.client.X`. Streaming threads release through `handleStreamingResponse` for SSE goroutine lifetime; async closures acquire at execution time. |
 
-### Verification gates (all green at 0018)
+### Verification gates (all green at 0014)
 
 - `make verify-patches` — strict `git am` replay of all 18 patches.
 - `make clean-patches && make apply-patches` — round-trip rebuilds the
@@ -93,59 +93,43 @@ and carries a `Ref: https://jira.f5net.com/browse/XC-25496` trailer.
   `transports/bifrost-http/lib`, `transports/bifrost-http/server`,
   `multitenant`, `framework/configstore` (+tables), `plugins/governance`.
 
-## Planned cleanup: drop spike patches (0002, 0004, 0005, 0006)
+## History: spike-patch cleanup (done)
 
-Audit (confirmed by `grep` against the worktree at HEAD `ec762957e`):
-
-| Patch | Touches                                                                                    | Load-bearing?                  |
-| ----- | ------------------------------------------------------------------------------------------ | ------------------------------ |
-| 0002  | `multitenant/SPIKE_FINDINGS.md`, `multitenant/cmd/spike/main.go`                           | No — research artifacts only.  |
-| 0004  | spike binary + `multitenant/go.mod` (+ telemetry plugin require), `multitenant/go.sum`     | No — measurement only.         |
-| 0005  | spike binary + `multitenant/go.mod` (+ governance plugin require), `multitenant/go.sum`    | No — measurement only.         |
-| 0006  | spike binary + `multitenant/cmd/spike-shared/main.go`                                      | No — research artifact only.   |
-
-Runtime code (`multitenant/{manager,runtime,tenant,account,resolver,configstore_resolver}.go`)
-does **not** import `plugins/governance`, `plugins/telemetry`, or
-`prometheus/client_golang` — only the spike binaries do. The findings are
-preserved in [[enterprise-multitenant-plan]] (memory) and the OSS
+The series was originally 18 patches; patches 0002, 0004, 0005, 0006 were
+Phase 2 spike research — `cmd/spike` binaries, `SPIKE_FINDINGS.md`, and
+the `plugins/governance` / `plugins/telemetry` / `prometheus/client_golang`
+go.mod requires they pulled in for cost measurement. None of that code was
+reachable from the inference path; the runtime
+(`multitenant/{manager,runtime,tenant,account,resolver,configstore_resolver}.go`)
+imports none of those deps. The findings live in
+[[enterprise-multitenant-plan]] (memory) and the OSS
 `feat/multitenant-spike` branch.
 
-### Cleanup procedure
+The cleanup commit dropped the four spike patches, renumbered the 14
+survivors, and folded the `framework/configstore` go.mod require (originally
+bundled with old spike patch 0005) into the resolver patch (new 0009),
+where the dependency was actually introduced.
 
-1. In `.workspaces/multi-tenant/`, drop the spike commits (rebase -i over
-   the four commits or reset to before-spike and re-cherry-pick the rest).
-2. Regenerate the series — old 0003 becomes new 0002, old 0007 becomes
-   new 0003, and so on. After renumbering the 18-patch series becomes a
-   14-patch series:
+Old → new mapping:
 
-   | Old  | New  | Subject                                                          |
-   | ---- | ---- | ---------------------------------------------------------------- |
-   | 0001 | 0001 | multitenant: scaffold per-tenant Bifrost runtime registry        |
-   | 0003 | 0002 | multitenant: tests for Manager concurrency, eviction, …          |
-   | 0007 | 0003 | configstore: add TableTenant and customer.tenant_id              |
-   | 0008 | 0004 | configstore: extend tenant_id to teams, VKs, budgets, rate …     |
-   | 0009 | 0005 | configstore: extend tenant_id to providers, keys, MCP clients    |
-   | 0010 | 0006 | configstore: tenant-scope Name uniqueness                        |
-   | 0011 | 0007 | configstore: add TenantRepository CRUD                           |
-   | 0012 | 0008 | transports: add /api/platform/tenants admin handlers             |
-   | 0013 | 0009 | transports+multitenant: tenant resolver middleware + ConfigStoreVKResolver |
-   | 0014 | 0010 | transports: introduce BifrostRouter interface                    |
-   | 0015 | 0011 | configstore: add GetProvidersConfigByTenant                      |
-   | 0016 | 0012 | transports: TenantScopedAccount + MultiTenantRouter              |
-   | 0017 | 0013 | transports: wire MultiTenantRouter + resolver middleware         |
-   | 0018 | 0014 | transports/handlers: route inference through BifrostRouter       |
+| Old  | New  | Subject                                                          |
+| ---- | ---- | ---------------------------------------------------------------- |
+| 0001 | 0001 | multitenant: scaffold per-tenant Bifrost runtime registry        |
+| 0003 | 0002 | multitenant: tests for Manager concurrency, eviction, …          |
+| 0007 | 0003 | configstore: add TableTenant and customer.tenant_id              |
+| 0008 | 0004 | configstore: extend tenant_id to teams, VKs, budgets, rate …     |
+| 0009 | 0005 | configstore: extend tenant_id to providers, keys, MCP clients    |
+| 0010 | 0006 | configstore: tenant-scope Name uniqueness                        |
+| 0011 | 0007 | configstore: add TenantRepository CRUD                           |
+| 0012 | 0008 | transports: add /api/platform/tenants admin handlers             |
+| 0013 | 0009 | transports+multitenant: tenant resolver middleware + ConfigStoreVKResolver |
+| 0014 | 0010 | transports: introduce BifrostRouter interface                    |
+| 0015 | 0011 | configstore: add GetProvidersConfigByTenant                      |
+| 0016 | 0012 | transports: TenantScopedAccount + MultiTenantRouter              |
+| 0017 | 0013 | transports: wire MultiTenantRouter + resolver middleware         |
+| 0018 | 0014 | transports/handlers: route inference through BifrostRouter       |
 
-3. Trim `multitenant/go.mod`: drop `plugins/governance`, `plugins/telemetry`,
-   and the `prometheus/client_golang` direct require. `go mod tidy` in the
-   workspace will prune the indirect transitives.
-4. Verify: `make verify-patches && make clean-patches && make apply-patches`
-   plus the full test battery.
-5. Commit the renumbered series to `f5xc-patches/patch1/multi-tenant/patches/`
-   and push.
-
-Risk: zero — the spike code never wired into the inference path. Cost: one
-careful rebase. Schedule before any new feature patches so subsequent
-numbering stays stable.
+Dropped patches (no longer in the series): old 0002, 0004, 0005, 0006.
 
 ## Outstanding items
 
