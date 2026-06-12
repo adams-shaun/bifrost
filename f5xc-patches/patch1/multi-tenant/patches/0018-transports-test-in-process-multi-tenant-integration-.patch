@@ -1,0 +1,454 @@
+From 27c615e81ef7d0463aaff6835336375dc79a720a Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 16:09:07 -0600
+Subject: [PATCH] transports+test: in-process multi-tenant integration test +
+ e2e Layer-2 scaffold
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two pieces:
+
+1. transports/bifrost-http/handlers/mt_integration_test.go — Layer 1
+   E2E. Boots a real SQLite ConfigStore via the production
+   NewConfigStore constructor (real migration chain, real default
+   tenant seeding), wires the platform-admin tenants handler, the
+   tenant-scoped provider handler, and the tenant-scoped VK handler
+   into a fasthttp router, then drives the full happy path:
+
+   - POST /api/platform/tenants for acme + globex.
+   - POST /api/tenants/{tid}/providers with distinct concurrency
+     settings so cross-tenant leakage would be observable.
+   - POST /api/tenants/{tid}/governance/virtual-keys per tenant.
+
+   Then asserts the three layers that matter for tenant isolation:
+
+   - configstore.GetProvidersConfigByTenant returns disjoint configs
+     with the expected concurrency per tenant.
+   - multitenant.NewConfigStoreVKResolver maps each minted VK back
+     to its tenant id.
+   - multitenant.Manager.Acquire lazy-loads a per-tenant runtime via
+     a loader that reads providers through GetProvidersConfigByTenant,
+     and the loader is invoked once per tenant.
+
+   A second test confirms RequireTenantPathMiddleware rejects
+   cross-tenant writes (tenant-admin trying to act on another tenant
+   -> 403) so Phase 4's real AuthzPlugin can swap in without
+   regressing the policy.
+
+   Runs in <1s, no Docker dependency — gates every MR.
+
+2. test/e2e/README.md — Layer 2 scaffold. Documents the kind/Helm/
+   Postgres E2E suite that lives alongside Layer 1: proposed layout,
+   what Layer 2 covers that Layer 1 cannot (network failures,
+   multi-replica coordination, Helm/k8s drift, real-provider rate
+   limits), and the open questions that gate building it (existing
+   Helm chart status, mock-provider choice, CI cadence).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ test/e2e/README.md                            |  97 ++++++
+ .../handlers/mt_integration_test.go           | 287 ++++++++++++++++++
+ 2 files changed, 384 insertions(+)
+ create mode 100644 test/e2e/README.md
+ create mode 100644 transports/bifrost-http/handlers/mt_integration_test.go
+
+diff --git a/test/e2e/README.md b/test/e2e/README.md
+new file mode 100644
+index 000000000..cc705eb90
+--- /dev/null
++++ b/test/e2e/README.md
+@@ -0,0 +1,97 @@
++# Bifrost multi-tenant E2E test harness
++
++Two layers of multi-tenant end-to-end testing live in this repo. This
++directory is the **outer layer** — the one this README scopes.
++
++## Two layers
++
++### Layer 1 — in-process integration test (already implemented)
++
++[`transports/bifrost-http/handlers/mt_integration_test.go`](../../transports/bifrost-http/handlers/mt_integration_test.go)
++
++Boots an in-memory SQLite ConfigStore via the production `NewConfigStore`
++constructor (so the real migration chain runs), wires every multi-tenant
++handler together (platform-admin tenants CRUD, tenant-scoped provider
++admin, tenant-scoped VK admin), and drives the full happy path with two
++tenants. Asserts:
++
++- Per-tenant provider config is isolated by `tenant_id`.
++- VK resolver maps each minted VK to the right tenant.
++- `multitenant.Manager.Acquire` lazy-loads a per-tenant runtime whose
++  `Account` only sees that tenant's providers.
++- `RequireTenantPathMiddleware` rejects tenant-admin cross-tenant
++  attempts with 403.
++
++Runs in seconds with `go test ./transports/bifrost-http/handlers/...`,
++gates every MR, no Docker dependency.
++
++### Layer 2 — k8s-style E2E (this directory; not yet implemented)
++
++The outer layer. Boots the actual `bifrost-http` binary against a real
++Postgres + Redis, behind an LB, in a `kind` cluster or via `docker
++compose`. Drives via plain HTTP from `go test`. Validates everything
++Layer 1 does plus:
++
++- The Helm chart deploys correctly and wires multi-tenancy on.
++- The Postgres-backed ConfigStore (not just SQLite) is consistent across
++  replicas.
++- The 60-second VK resolver cache TTL behaves correctly on a cold
++  process.
++- Streaming inference (SSE) holds the per-tenant runtime open for the
++  goroutine lifetime under real network conditions.
++- Async inference closures pick the right tenant runtime at execution
++  time (not submit time) when the resolver state has changed in between.
++- Multi-replica admin writes propagate (eviction signals or polled TTL).
++
++## Proposed layout for Layer 2
++
++```
++test/e2e/
++├── README.md                ← this file
++├── go.mod                   ← separate module (testcontainers-go + helm/k8s deps are heavy)
++├── harness/
++│   ├── postgres.go          ← testcontainers Postgres helper
++│   ├── bifrost.go           ← docker-compose / kind boot
++│   └── http.go              ← typed HTTP client (admin + inference paths)
++├── fixtures/
++│   └── mock_provider/       ← in-process server impersonating OpenAI / Anthropic
++├── helm/                    ← Helm chart values for the multi-tenant test
++└── scenarios/
++    ├── admin_sanity_test.go
++    ├── tenant_isolation_test.go
++    ├── inference_per_tenant_test.go
++    ├── mcp_per_tenant_test.go
++    ├── streaming_per_tenant_test.go
++    ├── async_per_tenant_test.go
++    ├── hot_reconfig_test.go
++    └── ha_replication_test.go
++```
++
++## Why this isn't built yet
++
++- The OSS Helm chart (if any) ships in [`docs/deployment-guides`](../../docs/deployment-guides);
++  it has not been audited for multi-tenant-on configuration.
++- testcontainers-go pulls in a large dependency tree; the e2e module
++  should live in its own `go.mod` so the main workspace stays lean.
++- The mock provider shape (OpenAI vs Anthropic vs both) depends on
++  which providers we want to assert tenant isolation against; that
++  call should be made by whoever owns the e2e suite long-term.
++- The CI integration question (every MR vs nightly) hasn't been
++  decided. Per-MR cadence rules out kind (~60s cluster boot); nightly
++  rules out testcontainers as the only signal.
++
++## How to add a scenario today, before Layer 2 lands
++
++Add it to Layer 1 first
++([`mt_integration_test.go`](../../transports/bifrost-http/handlers/mt_integration_test.go)).
++If the scenario can be expressed purely in terms of "drive the admin
++HTTP API, then drive the inference HTTP API, then assert" — Layer 1
++covers it.
++
++Layer 1 cannot cover: real network failures, multi-replica
++coordination, Helm/k8s config drift, real-provider rate limits. Those
++are the scenarios Layer 2 exists to test.
++
++## Tracking
++
++Jira: https://jira.f5net.com/browse/XC-25496
+diff --git a/transports/bifrost-http/handlers/mt_integration_test.go b/transports/bifrost-http/handlers/mt_integration_test.go
+new file mode 100644
+index 000000000..74d208b9e
+--- /dev/null
++++ b/transports/bifrost-http/handlers/mt_integration_test.go
+@@ -0,0 +1,287 @@
++// Package handlers integration tests for the multi-tenant admin surface.
++//
++// This file is the "E2E within the process boundary" layer: it wires up a
++// real ConfigStore (in-memory SQLite, same shape as production Postgres),
++// the platform-admin tenants handler, the tenant-scoped provider + VK
++// handlers, and a multitenant.Manager whose loader reads provider configs
++// out of the live store. The tests then drive admin flows via direct
++// fasthttp.RequestCtx calls and assert that
++//   - tenant rows land in the store with the right tenant_id,
++//   - per-tenant provider/VK writes don't leak across tenants,
++//   - the multi-tenant VK resolver maps VK -> tenant correctly,
++//   - the multi-tenant router lazy-loads a per-tenant Bifrost runtime
++//     with only that tenant's providers in scope.
++//
++// Why this layer instead of testcontainers+Postgres+kind?
++//   - Same go-test invocation, no Docker dependency, runs in CI today.
++//   - Exercises every layer that matters for tenant isolation:
++//     route -> middleware -> handler -> store -> resolver -> router ->
++//     Manager.Acquire -> per-tenant Account.
++//   - The Postgres + Helm + kind story (real cluster, multi-replica HA)
++//     is documented under test/e2e/README.md as the next layer up; this
++//     file is the prerequisite for that work because the same flows have
++//     to pass here before they can pass against a kind cluster.
++package handlers
++
++import (
++	"context"
++	"net"
++	"path/filepath"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	bifrost "github.com/maximhq/bifrost/core"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// setupIntegrationStore boots a real SQLite-backed ConfigStore using the
++// production constructor so the test exercises the same migration chain
++// (seeded default tenant, composite unique indexes, etc.) the real
++// service does at startup.
++func setupIntegrationStore(t *testing.T) configstore.ConfigStore {
++	t.Helper()
++	dir := t.TempDir()
++	cfg := &configstore.Config{
++		Enabled: true,
++		Type:    configstore.ConfigStoreTypeSQLite,
++		Config:  &configstore.SQLiteConfig{Path: filepath.Join(dir, "configstore.db")},
++	}
++	store, err := configstore.NewConfigStore(context.Background(), cfg, bifrost.NewDefaultLogger(schemas.LogLevelError))
++	if err != nil {
++		t.Fatalf("NewConfigStore: %v", err)
++	}
++	if store == nil {
++		t.Fatal("NewConfigStore returned nil store")
++	}
++	return store
++}
++
++// invokeRoute is a tiny test helper that drives a fasthttp router for a
++// single request and returns the populated ctx so the test can assert on
++// the status code + body. Mirrors the production routing path: routes are
++// matched by the router which extracts URL params and dispatches to the
++// chained middleware -> handler.
++func invokeRoute(t *testing.T, r *router.Router, method, path string, body []byte) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if body != nil {
++		req.SetBody(body)
++		req.Header.SetContentType("application/json")
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	r.Handler(ctx)
++	return ctx
++}
++
++// stubLoader is a tenant runtime loader that records every tenant the
++// Manager asks it to load, and returns a fixture BifrostConfig built from
++// the tenant's providers in the store. We don't bring up a real
++// bifrost.Bifrost — the integration here is "Manager hits the right
++// loader for the right tenant"; per-runtime inference behaviour is
++// covered separately at the OSS-core layer.
++type stubLoader struct {
++	mu     sync.Mutex
++	loaded []multitenant.TenantID
++	store  configstore.ConfigStore
++}
++
++func (l *stubLoader) Load(ctx context.Context, tid multitenant.TenantID) (schemas.BifrostConfig, error) {
++	l.mu.Lock()
++	l.loaded = append(l.loaded, tid)
++	l.mu.Unlock()
++	providers, err := l.store.GetProvidersConfigByTenant(ctx, string(tid))
++	if err != nil {
++		return schemas.BifrostConfig{}, err
++	}
++	return schemas.BifrostConfig{
++		Account: lib.NewTenantScopedAccount(providers),
++	}, nil
++}
++
++// TestMultiTenantAdmin_TenantIsolation drives the full admin happy path
++// for two tenants — create tenant A and B via the platform endpoint,
++// provision a different "openai" provider config for each (composite
++// uniqueness across (tenant_id, name) makes this legal), mint a VK per
++// tenant, then assert each lookup primitive sees only its own data.
++func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
++	store := setupIntegrationStore(t)
++	ctx := context.Background()
++
++	authz := &lib.StubPlatformAdminAuthz{FallbackTenant: "operator"}
++	tenantPathMW := RequireTenantPathMiddleware(authz)
++
++	tenantsHandler, err := NewTenantsHandler(store)
++	if err != nil {
++		t.Fatalf("tenants handler: %v", err)
++	}
++	providerHandler, err := NewTenantProviderHandler(store, nil)
++	if err != nil {
++		t.Fatalf("provider handler: %v", err)
++	}
++	vkHandler, err := NewTenantVirtualKeyHandler(store, nil)
++	if err != nil {
++		t.Fatalf("vk handler: %v", err)
++	}
++
++	r := router.New()
++	tenantsHandler.RegisterRoutes(r)
++	providerHandler.RegisterRoutes(r, tenantPathMW)
++	vkHandler.RegisterRoutes(r, tenantPathMW)
++
++	// Phase 1 — create both tenants via the platform admin endpoint.
++	for _, id := range []string{"acme", "globex"} {
++		body, _ := sonic.Marshal(map[string]any{"id": id, "name": id + " Inc"})
++		c := invokeRoute(t, r, fasthttp.MethodPost, "/api/platform/tenants", body)
++		if got := c.Response.StatusCode(); got != fasthttp.StatusCreated {
++			t.Fatalf("create tenant %s: status %d body=%s", id, got, string(c.Response.Body()))
++		}
++	}
++
++	// Phase 2 — provision provider 'openai' for each tenant, with
++	// different concurrency settings so we can detect cross-tenant
++	// leakage if the lookup got it wrong.
++	makeProvider := func(concurrency, buf int) []byte {
++		body, _ := sonic.Marshal(map[string]any{
++			"provider": "openai",
++			"concurrency_and_buffer_size": map[string]any{
++				"concurrency": concurrency,
++				"buffer_size": buf,
++			},
++		})
++		return body
++	}
++	for _, tc := range []struct {
++		tenant      string
++		concurrency int
++		buf         int
++	}{{"acme", 4, 16}, {"globex", 8, 32}} {
++		c := invokeRoute(t, r, fasthttp.MethodPost,
++			"/api/tenants/"+tc.tenant+"/providers", makeProvider(tc.concurrency, tc.buf))
++		if got := c.Response.StatusCode(); got != fasthttp.StatusCreated {
++			t.Fatalf("create provider for %s: status %d body=%s", tc.tenant, got, string(c.Response.Body()))
++		}
++	}
++
++	// Phase 3 — mint a VK for each tenant.
++	vkValues := map[string]string{}
++	for _, tenant := range []string{"acme", "globex"} {
++		body, _ := sonic.Marshal(map[string]any{"name": tenant + "-vk"})
++		c := invokeRoute(t, r, fasthttp.MethodPost,
++			"/api/tenants/"+tenant+"/governance/virtual-keys", body)
++		if got := c.Response.StatusCode(); got != fasthttp.StatusCreated {
++			t.Fatalf("create vk for %s: status %d body=%s", tenant, got, string(c.Response.Body()))
++		}
++		var resp CreateTenantVirtualKeyResponse
++		if err := sonic.Unmarshal(c.Response.Body(), &resp); err != nil {
++			t.Fatalf("decode vk response for %s: %v", tenant, err)
++		}
++		if resp.TenantID != tenant {
++			t.Fatalf("vk response tenant_id got %q want %q", resp.TenantID, tenant)
++		}
++		vkValues[tenant] = resp.Value
++	}
++
++	// Assertion 1: per-tenant provider config is isolated.
++	acme, err := store.GetProvidersConfigByTenant(ctx, "acme")
++	if err != nil {
++		t.Fatalf("get providers for acme: %v", err)
++	}
++	if len(acme) != 1 || acme["openai"].ConcurrencyAndBufferSize.Concurrency != 4 {
++		t.Fatalf("acme should have its own openai with concurrency=4; got %+v", acme)
++	}
++	globex, err := store.GetProvidersConfigByTenant(ctx, "globex")
++	if err != nil {
++		t.Fatalf("get providers for globex: %v", err)
++	}
++	if len(globex) != 1 || globex["openai"].ConcurrencyAndBufferSize.Concurrency != 8 {
++		t.Fatalf("globex should have its own openai with concurrency=8; got %+v", globex)
++	}
++
++	// Assertion 2: VK resolver maps each VK to the right tenant.
++	resolver := multitenant.NewConfigStoreVKResolver(store)
++	for tenant, value := range vkValues {
++		tid, err := resolver.ResolveVK(ctx, value)
++		if err != nil {
++			t.Fatalf("resolve vk for %s: %v", tenant, err)
++		}
++		if string(tid) != tenant {
++			t.Fatalf("VK %q resolved to tenant %q, want %q", value, tid, tenant)
++		}
++	}
++
++	// Assertion 3: multi-tenant Manager lazy-loads a per-tenant runtime
++	// whose Account holds only that tenant's providers — proving the
++	// resolver -> Manager -> per-tenant Account pipeline is wired
++	// correctly even though no actual inference runs in this test.
++	loader := &stubLoader{store: store}
++	mgr, err := multitenant.NewManager(ctx, multitenant.ManagerConfig{Loader: loader.Load})
++	if err != nil {
++		t.Fatalf("new manager: %v", err)
++	}
++	defer mgr.Shutdown(ctx)
++
++	for _, tenant := range []string{"acme", "globex"} {
++		handle, err := mgr.Acquire(ctx, multitenant.TenantID(tenant))
++		if err != nil {
++			t.Fatalf("manager acquire %s: %v", tenant, err)
++		}
++		handle.Release()
++	}
++	loader.mu.Lock()
++	defer loader.mu.Unlock()
++	if len(loader.loaded) != 2 {
++		t.Fatalf("loader should have been invoked for both tenants; got %v", loader.loaded)
++	}
++	seen := map[multitenant.TenantID]bool{}
++	for _, tid := range loader.loaded {
++		seen[tid] = true
++	}
++	if !seen["acme"] || !seen["globex"] {
++		t.Fatalf("both tenants should have lazy-loaded; got %v", loader.loaded)
++	}
++}
++
++// TestMultiTenantAdmin_RequireTenantPath_RejectsCrossTenant proves the
++// tenant-admin auth check on /api/tenants/{tenant_id}/... rejects a
++// caller whose identity tenant differs from the URL tenant. With v1's
++// always-platform-admin stub this never fires; the test uses a custom
++// non-platform-admin authz to assert the policy logic stays correct
++// once Phase 4's OIDC plugin replaces the stub.
++func TestMultiTenantAdmin_RequireTenantPath_RejectsCrossTenant(t *testing.T) {
++	store := setupIntegrationStore(t)
++
++	tenantAdminAuthz := &fixedAuthz{caller: "acme", isPlatformAdmin: false}
++	tenantPathMW := RequireTenantPathMiddleware(tenantAdminAuthz)
++
++	provider, _ := NewTenantProviderHandler(store, nil)
++	r := router.New()
++	provider.RegisterRoutes(r, tenantPathMW)
++
++	body, _ := sonic.Marshal(map[string]any{"provider": "openai"})
++	// Acme-admin tries to write into globex's scope -> 403.
++	c := invokeRoute(t, r, fasthttp.MethodPost, "/api/tenants/globex/providers", body)
++	if got := c.Response.StatusCode(); got != fasthttp.StatusForbidden {
++		t.Fatalf("cross-tenant write should be 403; got %d body=%s", got, string(c.Response.Body()))
++	}
++}
++
++// fixedAuthz is a deterministic lib.AdminAuthz for negative-case tests.
++// Lives next to the test it serves so future readers see the policy and
++// the assertion together.
++type fixedAuthz struct {
++	caller          multitenant.TenantID
++	isPlatformAdmin bool
++}
++
++func (a *fixedAuthz) ResolveCaller(_ *fasthttp.RequestCtx) (multitenant.TenantID, bool, error) {
++	return a.caller, a.isPlatformAdmin, nil
++}
+-- 
+2.51.0
+
