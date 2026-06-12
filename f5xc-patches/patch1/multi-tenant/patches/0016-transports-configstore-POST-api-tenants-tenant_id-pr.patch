@@ -1,0 +1,651 @@
+From 4db393065415fdf410184cc4e0fd0ebba5989964 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 14:59:27 -0600
+Subject: [PATCH] transports+configstore: POST
+ /api/tenants/{tenant_id}/providers (admin create per-tenant provider)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The minimum-viable patch to provision per-tenant providers via the API
+so an E2E harness can boot a tenant, configure its OpenAI/Anthropic/etc
+provider, and immediately drive inference against that tenant's runtime.
+
+configstore additions:
+- ConfigStore.AddProviderForTenant(ctx, tenantID, provider, config) pins
+  tenant_id on the new TableProvider row (and on its TableKey rows) so
+  the result is only visible to GetProvidersConfigByTenant(tenantID).
+  Empty tenantID normalizes to tables.DefaultTenantID, matching the
+  existing GetProvidersConfigByTenant policy.
+- Legacy AddProvider now routes through addProviderInternal with
+  tenant_id=DefaultTenantID so the pre-multi-tenant single-tenant
+  callers stay correct (and don't accidentally land with tenant_id="").
+- Tests covering: tenant_id write isolation, two tenants same provider
+  name with composite uniqueness, empty-tenant normalization.
+
+Transport additions:
+- handlers.TenantProviderHandler with POST
+  /api/tenants/{tenant_id}/providers. Reads tenant_id from
+  multitenant.BifrostContextKeyTenantID (set by RequireTenantPathMiddleware
+  from patch 0015), validates the payload with the same rules as the
+  legacy /api/providers POST, calls AddProviderForTenant, then evicts
+  the per-tenant runtime via the new TenantRuntimeEvictor interface.
+- BifrostHTTPServer.multitenantManager stashes the Manager created in
+  buildInferenceRouter so RegisterAPIRoutes can pass it as the evictor.
+  RegisterAPIRoutes mounts the tenant-scoped routes only when the
+  manager is non-nil (i.e. BIFROST_MULTI_TENANT_ENABLED is on).
+- Tests covering: happy path with eviction, missing tenant ctx, missing
+  provider, nil evictor allowed, nil store rejected at construction,
+  store error mapping (ErrAlreadyExists -> 409).
+
+Out of scope (follow-on patches):
+- GET / PUT / DELETE on /api/tenants/{tenant_id}/providers/{provider}.
+- Provider keys CRUD under /api/tenants/{tenant_id}/providers/{provider}/keys.
+- Tenant-scoping the legacy /api/providers admin routes for tenant-admin
+  callers (requires AdminAuthz to resolve a real tenant from caller
+  identity — Phase 4).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  26 +++
+ framework/configstore/rdb_test.go             |  74 ++++++++
+ framework/configstore/store.go                |   8 +
+ .../bifrost-http/handlers/tenant_providers.go | 177 +++++++++++++++++
+ .../handlers/tenant_providers_test.go         | 178 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |   5 +
+ transports/bifrost-http/server/server.go      |  27 +++
+ 7 files changed, 495 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/tenant_providers.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_providers_test.go
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 087f07f4d..170373310 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1009,7 +1009,31 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
+ }
+ 
+ // AddProvider creates a new provider configuration in the database.
++// AddProviderForTenant is the tenant-scoped form of AddProvider. It writes
++// tenantID onto the new TableProvider row and onto every TableKey row
++// created with it, so the resulting provider is only visible to
++// GetProvidersConfigByTenant(tenantID).
++//
++// Empty tenantID is normalized to tables.DefaultTenantID so single-tenant
++// call sites that don't yet thread a tenant through fall onto the seeded
++// default tenant. This mirrors GetProvidersConfigByTenant's policy.
++func (s *RDBConfigStore) AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.addProviderInternal(ctx, tenantID, provider, config, tx...)
++}
++
++// AddProvider preserves the pre-multi-tenant single-tenant call shape.
++// The created TableProvider row gets tenant_id=DefaultTenantID via the
++// column default + addProviderInternal pinning it for consistency, so
++// callers that haven't migrated to AddProviderForTenant still land in
++// the seeded default tenant's scope.
+ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
++	return s.addProviderInternal(ctx, tables.DefaultTenantID, provider, config, tx...)
++}
++
++func (s *RDBConfigStore) addProviderInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
+ 	var txDB *gorm.DB
+ 	if len(tx) > 0 {
+ 		txDB = tx[0]
+@@ -1026,6 +1050,7 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
+ 	// Create new provider
+ 	dbProvider := tables.TableProvider{
+ 		Name:                     string(provider),
++		TenantID:                 tenantID,
+ 		NetworkConfig:            configCopy.NetworkConfig,
+ 		ConcurrencyAndBufferSize: configCopy.ConcurrencyAndBufferSize,
+ 		ProxyConfig:              configCopy.ProxyConfig,
+@@ -1045,6 +1070,7 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
+ 		dbKey := tables.TableKey{
+ 			Provider:           dbProvider.Name,
+ 			ProviderID:         dbProvider.ID,
++			TenantID:           tenantID,
+ 			KeyID:              key.ID,
+ 			Name:               key.Name,
+ 			Value:              key.Value,
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index c06dbd15a..b540aa807 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -1851,3 +1851,77 @@ func TestGetProvidersConfigByTenant_EmptyTenantNormalizesToDefault(t *testing.T)
+ 	require.NoError(t, err)
+ 	require.Len(t, got, 1)
+ }
++
++// TestAddProviderForTenant_WritesTenantID asserts the new mutator pins the
++// supplied tenant_id on the created TableProvider row (and on its keys)
++// rather than relying on the column default, so the resulting provider is
++// only visible to GetProvidersConfigByTenant for that tenant.
++func TestAddProviderForTenant_WritesTenantID(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	concurrency := 4
++	bufSize := 16
++	cfg := ProviderConfig{
++		Keys: []schemas.Key{
++			{ID: "key-acme-1", Name: "primary", Value: *schemas.NewEnvVar("sk-secret-acme")},
++		},
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency, BufferSize: bufSize},
++	}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", cfg))
++
++	acme, err := store.GetProvidersConfigByTenant(ctx, "acme")
++	require.NoError(t, err)
++	require.Len(t, acme, 1, "acme should see its own openai")
++	require.Len(t, acme["openai"].Keys, 1, "tenant-scoped read should include the key created with the provider")
++
++	def, err := store.GetProvidersConfigByTenant(ctx, tables.DefaultTenantID)
++	require.NoError(t, err)
++	assert.Empty(t, def, "default tenant must not see acme's provider")
++}
++
++// TestAddProviderForTenant_TwoTenantsSameName confirms (tenant_id, name)
++// composite uniqueness lets two tenants both register a provider named
++// "openai" without colliding, and reads stay isolated.
++func TestAddProviderForTenant_TwoTenantsSameName(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	concurrency := 1
++	bufSize := 4
++	makeCfg := func(keyValue string) ProviderConfig {
++		return ProviderConfig{
++			Keys:                     []schemas.Key{{ID: keyValue, Name: keyValue, Value: *schemas.NewEnvVar(keyValue)}},
++			ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency, BufferSize: bufSize},
++		}
++	}
++
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", makeCfg("acme-key")))
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", makeCfg("globex-key")))
++
++	acme, err := store.GetProvidersConfigByTenant(ctx, "acme")
++	require.NoError(t, err)
++	require.Len(t, acme["openai"].Keys, 1)
++	assert.Equal(t, "acme-key", acme["openai"].Keys[0].ID, "acme's key must not bleed into globex")
++
++	globex, err := store.GetProvidersConfigByTenant(ctx, "globex")
++	require.NoError(t, err)
++	require.Len(t, globex["openai"].Keys, 1)
++	assert.Equal(t, "globex-key", globex["openai"].Keys[0].ID, "globex's key must not bleed into acme")
++}
++
++// TestAddProviderForTenant_EmptyTenantNormalizesToDefault confirms that
++// callers passing "" (e.g. a single-tenant deployment that hasn't been
++// migrated to thread tenant_id yet) land on the seeded default tenant,
++// matching GetProvidersConfigByTenant's normalisation.
++func TestAddProviderForTenant_EmptyTenantNormalizesToDefault(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	cfg := ProviderConfig{Keys: []schemas.Key{{ID: "k1", Value: *schemas.NewEnvVar("sk-x")}}}
++	require.NoError(t, store.AddProviderForTenant(ctx, "", "openai", cfg))
++
++	def, err := store.GetProvidersConfigByTenant(ctx, tables.DefaultTenantID)
++	require.NoError(t, err)
++	require.Len(t, def, 1, "empty tenant id should land in the default tenant scope")
++}
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index dcff56cd6..a36dfe7d9 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -121,6 +121,14 @@ type ConfigStore interface {
+ 	// Provider config CRUD
+ 	UpdateProvidersConfig(ctx context.Context, providers map[schemas.ModelProvider]ProviderConfig, tx ...*gorm.DB) error
+ 	AddProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
++	// AddProviderForTenant is the tenant-scoped form of AddProvider used by
++	// the /api/tenants/{tenant_id}/providers admin route. tenant_id is
++	// written onto the new TableProvider row (and its keys) so it is
++	// visible only to GetProvidersConfigByTenant(tenantID). An empty
++	// tenantID is normalized to tables.DefaultTenantID so callers that
++	// haven't been routed through the resolver yet land on the seeded
++	// default tenant.
++	AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error
+ 	GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error)
+diff --git a/transports/bifrost-http/handlers/tenant_providers.go b/transports/bifrost-http/handlers/tenant_providers.go
+new file mode 100644
+index 000000000..c72159781
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_providers.go
+@@ -0,0 +1,177 @@
++// Package handlers — tenant-scoped provider admin.
++//
++// This file mounts the /api/tenants/{tenant_id}/providers route family used
++// by platform-admins to provision per-tenant provider configurations in
++// multi-tenant deployments. The handlers read tenant_id from
++// multitenant.BifrostContextKeyTenantID (populated by
++// handlers.RequireTenantPathMiddleware) and call the *ForTenant variants
++// on the ConfigStore so the row's tenant_id is pinned explicitly rather
++// than relying on the column default.
++//
++// v1 ships POST only — the literal minimum for E2E to provision a per-tenant
++// provider. GET/PUT/DELETE and provider keys follow in subsequent patches.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	bifrost "github.com/maximhq/bifrost/core"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantRuntimeEvictor is the narrow contract TenantProviderHandler needs
++// from a multitenant.Manager so it can evict a tenant's cached Bifrost
++// runtime after its config changes. Defined as an interface so tests can
++// stub it without spinning up a real Manager.
++type TenantRuntimeEvictor interface {
++	Evict(tid multitenant.TenantID) bool
++}
++
++// TenantProviderHandler implements POST /api/tenants/{tenant_id}/providers
++// — the minimum surface E2E needs to provision per-tenant providers.
++type TenantProviderHandler struct {
++	configStore configstore.ConfigStore
++	evictor     TenantRuntimeEvictor
++}
++
++// NewTenantProviderHandler constructs a TenantProviderHandler.
++//
++// configStore is required; if nil, RegisterRoutes is a no-op so single-tenant
++// deployments without a persistent store don't accidentally expose a broken
++// route. evictor may be nil — when absent, mutations write to the store but
++// do not bust the per-tenant runtime cache, so the next request for that
++// tenant sees the new config only after natural LRU eviction.
++func NewTenantProviderHandler(configStore configstore.ConfigStore, evictor TenantRuntimeEvictor) (*TenantProviderHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantProviderHandler{configStore: configStore, evictor: evictor}, nil
++}
++
++// RegisterRoutes mounts the tenant-scoped provider admin routes. The
++// supplied middlewares MUST include handlers.RequireTenantPathMiddleware
++// (or an equivalent that lifts tenant_id onto the ctx) and a
++// platform-admin authorization check.
++func (h *TenantProviderHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.POST("/api/tenants/{tenant_id}/providers", lib.ChainMiddlewares(h.createProvider, middlewares...))
++}
++
++// createProvider — POST /api/tenants/{tenant_id}/providers
++//
++// Validates the payload using the same rules as the legacy
++// ProviderHandler.addProvider (custom provider checks, concurrency >= 1,
++// retry backoff), then persists via ConfigStore.AddProviderForTenant with
++// the tenant_id resolved from ctx. On success, evicts the tenant's cached
++// Bifrost runtime so the next inference request lazy-loads with the new
++// provider in scope.
++func (h *TenantProviderHandler) createProvider(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++
++	var payload providerCreatePayload
++	if err := sonic.Unmarshal(ctx.PostBody(), &payload); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if payload.Provider == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "Missing provider")
++		return
++	}
++	if payload.CustomProviderConfig != nil {
++		if bifrost.IsStandardProvider(payload.Provider) {
++			SendError(ctx, fasthttp.StatusBadRequest, "Custom provider cannot be same as a standard provider")
++			return
++		}
++		if payload.CustomProviderConfig.BaseProviderType == "" {
++			SendError(ctx, fasthttp.StatusBadRequest, "BaseProviderType is required when CustomProviderConfig is provided")
++			return
++		}
++		if !bifrost.IsSupportedBaseProvider(payload.CustomProviderConfig.BaseProviderType) {
++			SendError(ctx, fasthttp.StatusBadRequest, "BaseProviderType must be a standard provider")
++			return
++		}
++	}
++	if payload.ConcurrencyAndBufferSize != nil {
++		cb := payload.ConcurrencyAndBufferSize
++		if cb.Concurrency == 0 {
++			SendError(ctx, fasthttp.StatusBadRequest, "Concurrency must be greater than 0")
++			return
++		}
++		if cb.BufferSize == 0 {
++			SendError(ctx, fasthttp.StatusBadRequest, "Buffer size must be greater than 0")
++			return
++		}
++		if cb.Concurrency > cb.BufferSize {
++			SendError(ctx, fasthttp.StatusBadRequest, "Concurrency must be less than or equal to buffer size")
++			return
++		}
++	}
++	if payload.NetworkConfig != nil {
++		if err := validateRetryBackoff(payload.NetworkConfig); err != nil {
++			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid retry backoff: %v", err))
++			return
++		}
++	}
++
++	config := configstore.ProviderConfig{
++		NetworkConfig:            payload.NetworkConfig,
++		ProxyConfig:              payload.ProxyConfig,
++		ConcurrencyAndBufferSize: payload.ConcurrencyAndBufferSize,
++		SendBackRawRequest:       payload.SendBackRawRequest != nil && *payload.SendBackRawRequest,
++		SendBackRawResponse:      payload.SendBackRawResponse != nil && *payload.SendBackRawResponse,
++		StoreRawRequestResponse:  payload.StoreRawRequestResponse != nil && *payload.StoreRawRequestResponse,
++		CustomProviderConfig:     payload.CustomProviderConfig,
++		OpenAIConfig:             payload.OpenAIConfig,
++	}
++	if err := lib.ValidateCustomProvider(config, payload.Provider); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid custom provider config: %v", err))
++		return
++	}
++
++	if err := h.configStore.AddProviderForTenant(ctx, string(tid), payload.Provider, config); err != nil {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for tenant %s", payload.Provider, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
++		return
++	}
++
++	// Evict the cached per-tenant Bifrost runtime so the next inference
++	// request for this tenant lazy-loads with the new provider visible.
++	// Best-effort: a missing evictor or a tenant with no live runtime are
++	// not errors — they just mean there is nothing to invalidate.
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++
++	SendJSONWithStatus(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"provider":  string(payload.Provider),
++	}, fasthttp.StatusCreated)
++}
++
++// tenantIDFromCtx pulls the tenant_id off the fasthttp ctx, returning
++// (tid, false) when missing. Centralised here so callers don't repeat the
++// user-value lookup + type assertion.
++func tenantIDFromCtx(ctx *fasthttp.RequestCtx) (multitenant.TenantID, bool) {
++	v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID))
++	s, ok := v.(string)
++	if !ok || s == "" {
++		return "", false
++	}
++	return multitenant.TenantID(s), true
++}
+diff --git a/transports/bifrost-http/handlers/tenant_providers_test.go b/transports/bifrost-http/handlers/tenant_providers_test.go
+new file mode 100644
+index 000000000..79c044357
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_providers_test.go
+@@ -0,0 +1,178 @@
++package handlers
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
++)
++
++// stubProviderStore is the minimum ConfigStore surface this handler needs.
++// All other methods panic; tests should never hit them.
++type stubProviderStore struct {
++	configstore.ConfigStore // embeds nil → unimplemented methods panic
++	mu                      sync.Mutex
++	calls                   []addProviderForTenantCall
++	addErr                  error
++}
++
++type addProviderForTenantCall struct {
++	tenantID string
++	provider schemas.ModelProvider
++	config   configstore.ProviderConfig
++}
++
++func (s *stubProviderStore) AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.calls = append(s.calls, addProviderForTenantCall{tenantID: tenantID, provider: provider, config: config})
++	return s.addErr
++}
++
++type stubEvictor struct {
++	mu     sync.Mutex
++	called []multitenant.TenantID
++}
++
++func (e *stubEvictor) Evict(tid multitenant.TenantID) bool {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.called = append(e.called, tid)
++	return true
++}
++
++func newTenantProviderCtx(t *testing.T, body string, tid string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/" + tid + "/providers")
++	req.Header.SetMethod(fasthttp.MethodPost)
++	req.SetBodyString(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	return ctx
++}
++
++func TestTenantProviderHandler_CreateProvider_HappyPath(t *testing.T) {
++	store := &stubProviderStore{}
++	evictor := &stubEvictor{}
++	h, err := NewTenantProviderHandler(store, evictor)
++	if err != nil {
++		t.Fatalf("NewTenantProviderHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{
++		"provider": "openai",
++		"concurrency_and_buffer_size": map[string]any{
++			"concurrency": 4,
++			"buffer_size": 16,
++		},
++	})
++	ctx := newTenantProviderCtx(t, string(body), "acme")
++
++	h.createProvider(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if got := len(store.calls); got != 1 {
++		t.Fatalf("AddProviderForTenant calls got %d want 1", got)
++	}
++	if got, want := store.calls[0].tenantID, "acme"; got != want {
++		t.Fatalf("tenant id got %q want %q", got, want)
++	}
++	if got, want := string(store.calls[0].provider), "openai"; got != want {
++		t.Fatalf("provider got %q want %q", got, want)
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if got := len(evictor.called); got != 1 {
++		t.Fatalf("Evict calls got %d want 1", got)
++	}
++	if got, want := evictor.called[0], multitenant.TenantID("acme"); got != want {
++		t.Fatalf("evicted tid got %q want %q", got, want)
++	}
++}
++
++func TestTenantProviderHandler_CreateProvider_MissingTenantCtx(t *testing.T) {
++	store := &stubProviderStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"provider": "openai"})
++	ctx := newTenantProviderCtx(t, string(body), "") // no tenant_id on ctx
++
++	h.createProvider(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusInternalServerError {
++		t.Fatalf("status got %d want 500", got)
++	}
++	if len(store.calls) != 0 {
++		t.Fatal("store must not be called when tenant_id missing")
++	}
++}
++
++func TestTenantProviderHandler_CreateProvider_MissingProvider(t *testing.T) {
++	store := &stubProviderStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	ctx := newTenantProviderCtx(t, `{}`, "acme")
++
++	h.createProvider(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("status got %d want 400", got)
++	}
++	if len(store.calls) != 0 {
++		t.Fatal("store must not be called when payload invalid")
++	}
++}
++
++func TestTenantProviderHandler_CreateProvider_NilEvictorIsAllowed(t *testing.T) {
++	store := &stubProviderStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{
++		"provider": "openai",
++	})
++	ctx := newTenantProviderCtx(t, string(body), "acme")
++
++	h.createProvider(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	if len(store.calls) != 1 {
++		t.Fatalf("store should still receive the write; got %d calls", len(store.calls))
++	}
++}
++
++func TestTenantProviderHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantProviderHandler(nil, nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
++
++func TestTenantProviderHandler_CreateProvider_StoreError(t *testing.T) {
++	store := &stubProviderStore{addErr: configstore.ErrAlreadyExists}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"provider": "openai"})
++	ctx := newTenantProviderCtx(t, string(body), "acme")
++
++	h.createProvider(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusConflict {
++		t.Fatalf("ErrAlreadyExists should map to 409, got %d", got)
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index 5104fc200..e1ff0b18a 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -491,6 +491,11 @@ func (m *MockConfigStore) AddProvider(ctx context.Context, provider schemas.Mode
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
++	m.providers[provider] = config
++	return nil
++}
++
+ func (m *MockConfigStore) UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
+ 	m.providers[provider] = config
+ 	return nil
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index be9d38a1a..7fd272ad2 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -142,6 +142,14 @@ type BifrostHTTPServer struct {
+ 	TempTokens           *temptoken.Service
+ 	TempTokenSweepWorker *temptoken.SweepWorker
+ 
++	// multitenantManager is non-nil only when buildInferenceRouter spun up
++	// a multitenant.Manager — i.e. BIFROST_MULTI_TENANT_ENABLED was set
++	// when the server started. RegisterAPIRoutes consults this field to
++	// decide whether to mount the /api/tenants/{tenant_id}/... route
++	// family and to pass an evictor into the tenant-scoped admin
++	// handlers so config mutations bust the per-tenant runtime cache.
++	multitenantManager *multitenant.Manager
++
+ 	wsPool *bfws.Pool
+ }
+ 
+@@ -1177,6 +1185,9 @@ func (s *BifrostHTTPServer) buildInferenceRouter(ctx context.Context, middleware
+ 	if err != nil {
+ 		return nil, nil, fmt.Errorf("init multi-tenant manager: %w", err)
+ 	}
++	// Stash on the server so RegisterAPIRoutes can pass an evictor
++	// into the tenant-scoped admin handlers.
++	s.multitenantManager = mgr
+ 
+ 	resolver := multitenant.NewCachedVKResolver(
+ 		multitenant.NewConfigStoreVKResolver(store),
+@@ -1308,6 +1319,22 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 	if tenantsHandler != nil {
+ 		tenantsHandler.RegisterRoutes(s.Router, middlewares...)
+ 	}
++	// Tenant-scoped admin routes /api/tenants/{tenant_id}/... are mounted
++	// only when multi-tenant is enabled. The AdminAuthz stub treats every
++	// caller as a platform-admin; Phase 4 swaps in the OIDC-backed
++	// authorization plugin. The path middleware lifts the URL's
++	// {tenant_id} onto ctx before the handler runs.
++	if s.multitenantManager != nil {
++		adminAuthz := lib.NewStubPlatformAdminAuthz()
++		tenantPathMW := handlers.RequireTenantPathMiddleware(adminAuthz)
++		tenantAdminMiddlewares := append([]schemas.BifrostHTTPMiddleware{tenantPathMW}, middlewares...)
++
++		tenantProviderHandler, err := handlers.NewTenantProviderHandler(s.Config.ConfigStore, s.multitenantManager)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant provider handler: %v", err)
++		}
++		tenantProviderHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+ 	}
+-- 
+2.51.0
+
