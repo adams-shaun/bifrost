@@ -1,0 +1,272 @@
+From 52b7d58c743dbb4c0ce1e8def39c24299fbb574e Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 11:36:23 -0600
+Subject: [PATCH] transports: wire MultiTenantRouter + resolver middleware into
+ inference path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Activates the per-tenant routing pieces from patches 0011-0016 in the
+server boot path, gated by the env var BIFROST_MULTI_TENANT_ENABLED
+so existing single-tenant deployments observe no behavior change.
+
+Reorganises RegisterInferenceRoutes around a new
+buildInferenceRouter(ctx, middlewares) helper:
+
+  off (default):
+    returns lib.NewSingleTenantRouter(s.Client) + the unmodified
+    middleware chain. No new code path runs for OSS / single-tenant
+    deployments.
+
+  on (BIFROST_MULTI_TENANT_ENABLED=true|1|yes|on):
+    1. builds a TenantLoader closure that queries
+       configstore.GetProvidersConfigByTenant (patch 0015) and
+       constructs a lib.TenantScopedAccount (patch 0016) per tenant
+    2. spawns a multitenant.Manager rooted at s.Ctx so per-tenant
+       runtimes drain automatically on shutdown via the Manager's
+       built-in ctx-cancel goroutine
+    3. wraps the Manager in a lib.MultiTenantRouter with
+       FallbackClient=s.Client so requests without a resolved tenant
+       id (health probes, /api/platform admin endpoints the resolver
+       skips) still serve from the global runtime
+    4. prepends handlers.TenantResolverMiddleware (with a 60s
+       CachedVKResolver over ConfigStoreVKResolver) so VK→tenant
+       lookup happens before every inference middleware downstream
+
+CompletionHandler / AsyncHandler / MCPInferenceHandler are wired
+through their *WithRouter constructors added in patch 0014, passing
+the resolved router in. The handlers' per-request inference path
+still uses h.client directly — the next patch (0018) refactors the
+~50 entry-point methods to use h.router.Acquire + defer release so
+the Manager's refcount actually pins per-tenant runtimes during
+request flight.
+
+Tests:
+  4 TestMultiTenantEnabled_* covering the default-off contract,
+  truthy variants (1/true/yes/on, case-insensitive), falsy variants
+  (0/false/no/off/empty), and surrounding-whitespace tolerance. The
+  default-off test is the load-bearing assertion that a future code
+  edit can't silently flip the flag on.
+
+Full framework/configstore + plugins/governance + multitenant +
+transports/bifrost-http/{handlers,lib,server} test suites pass.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../server/multitenant_wiring_test.go         |  47 +++++++
+ transports/bifrost-http/server/server.go      | 128 ++++++++++++++++--
+ 2 files changed, 167 insertions(+), 8 deletions(-)
+ create mode 100644 transports/bifrost-http/server/multitenant_wiring_test.go
+
+diff --git a/transports/bifrost-http/server/multitenant_wiring_test.go b/transports/bifrost-http/server/multitenant_wiring_test.go
+new file mode 100644
+index 000000000..f7281b50d
+--- /dev/null
++++ b/transports/bifrost-http/server/multitenant_wiring_test.go
+@@ -0,0 +1,47 @@
++package server
++
++import (
++	"testing"
++)
++
++// TestMultiTenantEnabled_DefaultOff is the load-bearing assertion that
++// existing single-tenant deployments observe no behavior change from
++// this patch: with the env var unset, buildInferenceRouter returns a
++// SingleTenantRouter and the unmodified middleware chain. This test
++// pins the default-off contract so a future code edit can't silently
++// flip it on.
++func TestMultiTenantEnabled_DefaultOff(t *testing.T) {
++	t.Setenv("BIFROST_MULTI_TENANT_ENABLED", "")
++	if multiTenantEnabled() {
++		t.Fatal("multi-tenant routing must be OFF when the env var is unset")
++	}
++}
++
++func TestMultiTenantEnabled_TruthyValues(t *testing.T) {
++	for _, v := range []string{"1", "true", "yes", "on", "TRUE", "On"} {
++		t.Run(v, func(t *testing.T) {
++			t.Setenv("BIFROST_MULTI_TENANT_ENABLED", v)
++			if !multiTenantEnabled() {
++				t.Fatalf("value %q must enable multi-tenant routing", v)
++			}
++		})
++	}
++}
++
++func TestMultiTenantEnabled_FalsyValues(t *testing.T) {
++	for _, v := range []string{"0", "false", "no", "off", "", "FALSE"} {
++		t.Run(v, func(t *testing.T) {
++			t.Setenv("BIFROST_MULTI_TENANT_ENABLED", v)
++			if multiTenantEnabled() {
++				t.Fatalf("value %q must NOT enable multi-tenant routing", v)
++			}
++		})
++	}
++}
++
++func TestMultiTenantEnabled_WhitespaceTrimmed(t *testing.T) {
++	t.Setenv("BIFROST_MULTI_TENANT_ENABLED", "  true  ")
++	if !multiTenantEnabled() {
++		t.Fatal("whitespace around a truthy value must not disable it")
++	}
++}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index e1f492e0b..be9d38a1a 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -25,6 +25,7 @@ import (
+ 	dynamicPlugins "github.com/maximhq/bifrost/framework/plugins"
+ 	"github.com/maximhq/bifrost/framework/temptoken"
+ 	"github.com/maximhq/bifrost/framework/tracing"
++	"github.com/maximhq/bifrost/multitenant"
+ 	"github.com/maximhq/bifrost/plugins/governance"
+ 	"github.com/maximhq/bifrost/plugins/logging"
+ 	"github.com/maximhq/bifrost/plugins/prompts"
+@@ -1086,23 +1087,134 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
+ 	webrtcRealtimeHandler := handlers.NewWebRTCRealtimeHandler(s.Client, s.Config)
+ 	realtimeClientSecretsHandler := handlers.NewRealtimeClientSecretsHandler(s.Client, s.Config)
+ 
+-	inferenceHandler := handlers.NewInferenceHandler(s.Client, s.Config)
++	// Multi-tenant routing — gated by BIFROST_MULTI_TENANT_ENABLED so
++	// existing single-tenant deployments observe no behavior change.
++	// When enabled, build a MultiTenantBifrost Manager, wire the VK→tenant
++	// resolver middleware into the inference chain, and route inference
++	// requests through a MultiTenantRouter. The global s.Client stays as
++	// the FallbackClient for requests that don't carry a tenant id
++	// (health probes, /api/platform admin endpoints) so the migration
++	// stays incremental.
++	inferenceRouter, inferenceMiddlewares, err := s.buildInferenceRouter(ctx, middlewares)
++	if err != nil {
++		return fmt.Errorf("failed to build inference router: %v", err)
++	}
++
++	inferenceHandler := handlers.NewInferenceHandlerWithRouter(inferenceRouter, s.Client, s.Config)
+ 	s.IntegrationHandler = handlers.NewIntegrationHandler(s.Client, s.Config, wsResponsesHandler, wsRealtimeHandler, webrtcRealtimeHandler, realtimeClientSecretsHandler)
+-	mcpInferenceHandler := handlers.NewMCPInferenceHandler(s.Client, s.Config)
++	mcpInferenceHandler := handlers.NewMCPInferenceHandlerWithRouter(inferenceRouter, s.Client, s.Config)
+ 	mcpServerHandler, err := handlers.NewMCPServerHandler(ctx, s.Config, s)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to initialize mcp server handler: %v", err)
+ 	}
+ 	s.MCPServerHandler = mcpServerHandler
+-	asyncHandler := handlers.NewAsyncHandler(s.Client, s.Config)
+-	s.IntegrationHandler.RegisterRoutes(s.Router, middlewares...)
+-	inferenceHandler.RegisterRoutes(s.Router, middlewares...)
+-	asyncHandler.RegisterRoutes(s.Router, middlewares...)
+-	mcpInferenceHandler.RegisterRoutes(s.Router, middlewares...)
+-	s.MCPServerHandler.RegisterRoutes(s.Router, middlewares...)
++	asyncHandler := handlers.NewAsyncHandlerWithRouter(inferenceRouter, s.Client, s.Config)
++	s.IntegrationHandler.RegisterRoutes(s.Router, inferenceMiddlewares...)
++	inferenceHandler.RegisterRoutes(s.Router, inferenceMiddlewares...)
++	asyncHandler.RegisterRoutes(s.Router, inferenceMiddlewares...)
++	mcpInferenceHandler.RegisterRoutes(s.Router, inferenceMiddlewares...)
++	s.MCPServerHandler.RegisterRoutes(s.Router, inferenceMiddlewares...)
+ 	return nil
+ }
+ 
++// buildInferenceRouter is the inference-routes-only branch point between
++// single-tenant and multi-tenant operation. Reads BIFROST_MULTI_TENANT_ENABLED:
++//
++//   - off (default): returns a SingleTenantRouter wrapping s.Client and
++//     the caller's middleware chain unchanged. Existing single-tenant
++//     deployments observe no behavior change.
++//
++//   - on: builds a multitenant.Manager whose loader queries
++//     configstore.GetProvidersConfigByTenant + constructs a
++//     lib.TenantScopedAccount per tenant; wraps that in a
++//     MultiTenantRouter (with FallbackClient=s.Client so non-tenant
++//     paths still serve); and prepends the TenantResolverMiddleware to
++//     the caller's middlewares so the VK→tenant lookup happens before
++//     dispatch.
++//
++// The flag is intentionally an env var (not a config field) so it can
++// be toggled per process without touching config.json. A follow-up
++// patch will promote it to a proper ClientConfig field once the
++// integration is exercised in production.
++func (s *BifrostHTTPServer) buildInferenceRouter(ctx context.Context, middlewares []schemas.BifrostHTTPMiddleware) (lib.BifrostRouter, []schemas.BifrostHTTPMiddleware, error) {
++	if !multiTenantEnabled() {
++		return lib.NewSingleTenantRouter(s.Client), middlewares, nil
++	}
++
++	store := s.Config.ConfigStore
++	if store == nil {
++		return nil, nil, fmt.Errorf("multi-tenant routing requires a ConfigStore")
++	}
++
++	// Tenant loader: queries the per-tenant provider snapshot, builds
++	// a TenantScopedAccount, and returns the BifrostConfig the Manager
++	// hands to bifrost.Init. Provider configs are loaded eagerly at
++	// acquire time — the Manager caches the runtime so subsequent
++	// requests for the same tenant skip the query.
++	tenantLoader := func(ctx context.Context, tid multitenant.TenantID) (schemas.BifrostConfig, error) {
++		providers, err := store.GetProvidersConfigByTenant(ctx, string(tid))
++		if err != nil {
++			return schemas.BifrostConfig{}, fmt.Errorf("load providers for tenant %q: %w", tid, err)
++		}
++		return schemas.BifrostConfig{
++			Account: lib.NewTenantScopedAccount(providers),
++			// InitialPoolSize / DropExcessRequests / etc. intentionally
++			// left at their bifrost.Init defaults. A future patch will
++			// extract those from per-tenant settings.
++		}, nil
++	}
++
++	// Tie the Manager's root context to the server's so per-tenant
++	// runtimes drain automatically on shutdown — multitenant.Manager
++	// owns a goroutine that calls Shutdown when its root ctx is
++	// canceled, matching the cancel s.Ctx triggers on server stop.
++	mgr, err := multitenant.NewManager(s.Ctx, multitenant.ManagerConfig{
++		Loader: tenantLoader,
++		// MaxActiveRuntimes intentionally left at zero (unbounded) —
++		// LRU eviction tuning lands in the same patch that promotes the
++		// flag to a config field.
++	})
++	if err != nil {
++		return nil, nil, fmt.Errorf("init multi-tenant manager: %w", err)
++	}
++
++	resolver := multitenant.NewCachedVKResolver(
++		multitenant.NewConfigStoreVKResolver(store),
++		60*time.Second,
++	)
++	tenantMiddleware := handlers.TenantResolverMiddleware(resolver)
++
++	router := lib.NewMultiTenantRouter(lib.MultiTenantRouterConfig{
++		Manager: mgr,
++		// FallbackClient covers requests that don't carry a tenant id
++		// (e.g. health probes, /api/platform admin endpoints that the
++		// resolver explicitly skips). Once every inference path is
++		// guaranteed to carry a tenant id via the resolver, we can drop
++		// this and surface 5xx for unscoped requests.
++		FallbackClient: s.Client,
++	})
++
++	// Tenant resolver runs BEFORE everything else so all downstream
++	// middlewares and the handler see the same tenant id on the ctx.
++	chained := make([]schemas.BifrostHTTPMiddleware, 0, len(middlewares)+1)
++	chained = append(chained, tenantMiddleware)
++	chained = append(chained, middlewares...)
++
++	return router, chained, nil
++}
++
++// multiTenantEnabled returns true when the env var
++// BIFROST_MULTI_TENANT_ENABLED is set to a truthy value. See
++// buildInferenceRouter for the contract.
++func multiTenantEnabled() bool {
++	v := strings.ToLower(strings.TrimSpace(os.Getenv("BIFROST_MULTI_TENANT_ENABLED")))
++	switch v {
++	case "1", "true", "yes", "on":
++		return true
++	}
++	return false
++}
++
+ // RegisterAPIRoutes initializes the routes for the Bifrost HTTP server.
+ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks ServerCallbacks, middlewares ...schemas.BifrostHTTPMiddleware) error {
+ 	var err error
+-- 
+2.51.0
+
