@@ -1632,7 +1632,14 @@ setup-workspace: ## Set up Go workspace with all local modules for development
 	@$(ECHO) "$(YELLOW)Cleaning existing workspace...$(NC)"
 	@rm -f go.work go.work.sum || true
 	@$(ECHO) "$(YELLOW)Initializing new workspace...$(NC)"
-	@go work init ./cli ./core ./framework ./multitenant ./transports
+	@# Always-present upstream modules go straight into init; F5XC-added
+	@# multitenant module gets the same existence-check pattern as the
+	@# plugins/* loop below, so a run before `apply-patches` doesn't break.
+	@go work init ./cli ./core ./framework ./transports
+	@if [ -d ./multitenant ] && [ -f ./multitenant/go.mod ]; then \
+		$(ECHO) "  Adding f5xc module: multitenant"; \
+		go work use ./multitenant; \
+	fi
 	@$(ECHO) "$(YELLOW)Adding plugin modules...$(NC)"
 	@for plugin_dir in ./plugins/*/; do \
 		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
@@ -2099,7 +2106,16 @@ cmd-build-ui-enterprise: ## Build UI for enterprise container (requires Node.js)
 cmd-setup-workspace-ci: ## Set up Go workspace for CI builds (resolves local module dependencies)
 	@$(ECHO) "$(GREEN)Setting up Go workspace for CI build...$(NC)"
 	@rm -f go.work go.work.sum || true
-	@go work init ./cli ./core ./framework ./multitenant ./transports
+	@# Always-present upstream modules go straight into init. F5XC-added
+	@# modules (multitenant — introduced by the multi-tenant patch series)
+	@# go through the same existence-check pattern as plugins/* below: a
+	@# module that only exists after `apply-patches` shouldn't break the
+	@# workspace setup when called independently, or when Make schedules
+	@# this target before apply-patches under -j>1.
+	@go work init ./cli ./core ./framework ./transports
+	@if [ -d ./multitenant ] && [ -f ./multitenant/go.mod ]; then \
+		go work use ./multitenant; \
+	fi
 	@for plugin_dir in ./plugins/*/; do \
 		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
 			go work use "$$plugin_dir"; \
