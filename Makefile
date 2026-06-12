@@ -12,7 +12,7 @@ GOTESTSUM_FORMAT ?= standard-verbose
 COVERAGE_DIR ?= coverage_out
 # Go module roots covered by `make cmd-unittest` (mirrors the test-all scope):
 # core, framework, every plugins/* module, the bifrost-http transport, and the CLI.
-GO_COVER_MODULES ?= core framework $(patsubst %/,%,$(dir $(wildcard plugins/*/go.mod))) transports/bifrost-http cli
+GO_COVER_MODULES ?= core framework multitenant $(patsubst %/,%,$(dir $(wildcard plugins/*/go.mod))) transports/bifrost-http cli
 # Packages EXCLUDED from `make cmd-unittest`: live-integration suites that need
 # provider API keys or running services (Redis/Weaviate/Qdrant/MCP servers).
 # The CI test stage runs without those secrets; run them locally via the
@@ -1632,7 +1632,7 @@ setup-workspace: ## Set up Go workspace with all local modules for development
 	@$(ECHO) "$(YELLOW)Cleaning existing workspace...$(NC)"
 	@rm -f go.work go.work.sum || true
 	@$(ECHO) "$(YELLOW)Initializing new workspace...$(NC)"
-	@go work init ./cli ./core ./framework ./transports
+	@go work init ./cli ./core ./framework ./multitenant ./transports
 	@$(ECHO) "$(YELLOW)Adding plugin modules...$(NC)"
 	@for plugin_dir in ./plugins/*/; do \
 		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
@@ -2099,7 +2099,7 @@ cmd-build-ui-enterprise: ## Build UI for enterprise container (requires Node.js)
 cmd-setup-workspace-ci: ## Set up Go workspace for CI builds (resolves local module dependencies)
 	@$(ECHO) "$(GREEN)Setting up Go workspace for CI build...$(NC)"
 	@rm -f go.work go.work.sum || true
-	@go work init ./cli ./core ./framework ./transports
+	@go work init ./cli ./core ./framework ./multitenant ./transports
 	@for plugin_dir in ./plugins/*/; do \
 		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
 			go work use "$$plugin_dir"; \
