@@ -1,0 +1,465 @@
+From 489408125f003ef89ffaa2f80f24c11ebe90e285 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 22:37:34 -0600
+Subject: [PATCH] transports: introduce BifrostRouter interface +
+ SingleTenantRouter scaffolding
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First half of the per-tenant Bifrost dispatch work, split off from the
+multi-tenant activation patch for review tractability.
+
+Adds:
+  - lib.BifrostRouter — one-method interface, Acquire(ctx) → (*Bifrost,
+    release, error). The contract pairs Acquire with a mandatory
+    release() so a future multi-tenant router can decrement its
+    per-tenant refcount via defer in the entry-point handlers.
+  - lib.SingleTenantRouter — trivial impl that always serves the same
+    *bifrost.Bifrost with a noop release. Used by OSS / single-tenant
+    deployments; multi-tenant deployments will inject their own router
+    in the next patch.
+
+Plumbs the router into the three inference handler structs:
+  - CompletionHandler
+  - AsyncHandler
+  - MCPInferenceHandler
+
+Each gains a `router lib.BifrostRouter` field initialized to a
+SingleTenantRouter, plus a *WithRouter constructor variant that lets
+callers inject a custom router. The legacy `client *bifrost.Bifrost`
+field is preserved as a back-pointer for hot-reload / shutdown paths
+that read the runtime directly; the per-request inference path is
+NOT rewritten in this patch (call sites stay on h.client.X for now).
+The next patch swaps the per-request path to use router.Acquire +
+defer release alongside the multi-tenant activation.
+
+Two fix-ups folded in:
+  - MockConfigStore in lib/config_test.go gets the 6 tenant CRUD
+    methods added by patch 0011 (it was missing them — the lib test
+    suite didn't compile against the post-0011 ConfigStore
+    interface).
+  - TestConfigSchemaSync's exclusion list gains `tenant_id` on each
+    tenant-scoped table (patches 0007/0008) and `source_id` on
+    TableTeam (pre-existing vesdev field). tenant_id is internal DB
+    scoping, never appears in config.json.
+
+Tests:
+  - lib/router_test.go: 5 new TestSingleTenantRouter_* covering happy
+    path, concurrent Acquire safety, SetClient swap, nil-client panics
+  - lib + handler test suites pass after the changes
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../bifrost-http/handlers/asyncinference.go   | 18 +++-
+ transports/bifrost-http/handlers/inference.go | 49 +++++++++-
+ .../bifrost-http/handlers/mcpinference.go     | 14 ++-
+ transports/bifrost-http/lib/config_test.go    | 29 ++++++
+ transports/bifrost-http/lib/router.go         | 80 ++++++++++++++++
+ transports/bifrost-http/lib/router_test.go    | 96 +++++++++++++++++++
+ 6 files changed, 281 insertions(+), 5 deletions(-)
+ create mode 100644 transports/bifrost-http/lib/router.go
+ create mode 100644 transports/bifrost-http/lib/router_test.go
+
+diff --git a/transports/bifrost-http/handlers/asyncinference.go b/transports/bifrost-http/handlers/asyncinference.go
+index 1a4f07e74..13fb4e256 100644
+--- a/transports/bifrost-http/handlers/asyncinference.go
++++ b/transports/bifrost-http/handlers/asyncinference.go
+@@ -16,7 +16,8 @@ import (
+ 
+ // AsyncHandler handles async job HTTP endpoints.
+ type AsyncHandler struct {
+-	client       *bifrost.Bifrost
++	router       lib.BifrostRouter // per-request runtime resolver (single-tenant by default)
++	client       *bifrost.Bifrost  // legacy back-pointer for hot-reload / shutdown coordination
+ 	executor     *logstore.AsyncJobExecutor
+ 	handlerStore lib.HandlerStore
+ 	config       *lib.Config
+@@ -54,6 +55,21 @@ func RegisterAsyncRequestTypeMiddleware(next fasthttp.RequestHandler) fasthttp.R
+ // the handler is created with a nil executor and RegisterRoutes will skip async route registration.
+ func NewAsyncHandler(client *bifrost.Bifrost, config *lib.Config) *AsyncHandler {
+ 	return &AsyncHandler{
++		router:       lib.NewSingleTenantRouter(client),
++		client:       client,
++		executor:     config.GetAsyncJobExecutor(),
++		handlerStore: config,
++		config:       config,
++	}
++}
++
++// NewAsyncHandlerWithRouter is the router-aware constructor for callers
++// that want to inject a multi-tenant BifrostRouter. client is still
++// passed for hot-reload back-compat; it should be the same Bifrost the
++// router hands out by default.
++func NewAsyncHandlerWithRouter(router lib.BifrostRouter, client *bifrost.Bifrost, config *lib.Config) *AsyncHandler {
++	return &AsyncHandler{
++		router:       router,
+ 		client:       client,
+ 		executor:     config.GetAsyncJobExecutor(),
+ 		handlerStore: config,
+diff --git a/transports/bifrost-http/handlers/inference.go b/transports/bifrost-http/handlers/inference.go
+index c5b1f1d28..71aaffe51 100644
+--- a/transports/bifrost-http/handlers/inference.go
++++ b/transports/bifrost-http/handlers/inference.go
+@@ -42,20 +42,63 @@ func forwardProviderHeadersFromContext(ctx *fasthttp.RequestCtx, bifrostCtx *sch
+ 	}
+ }
+ 
+-// CompletionHandler manages HTTP requests for completion operations
++// CompletionHandler manages HTTP requests for completion operations.
++//
++// The handler resolves the Bifrost runtime to use for each request via the
++// router rather than holding a direct *bifrost.Bifrost reference. OSS /
++// single-tenant deployments inject a lib.SingleTenantRouter that always
++// returns the same runtime; multi-tenant deployments inject a router that
++// dispatches to a per-tenant runtime based on the resolved tenant id on
++// the request context.
++//
++// The .client field is a back-compat shortcut for the legacy path (held
++// for shutdown / hot-reload coordination); per-request inference MUST go
++// through h.router.Acquire so the multi-tenant Acquire/Release refcount
++// stays balanced.
+ type CompletionHandler struct {
+-	client *bifrost.Bifrost
++	router lib.BifrostRouter
++	client *bifrost.Bifrost // legacy / hot-reload back-pointer; do NOT use in the request path
+ 	config *lib.Config
+ }
+ 
+-// NewInferenceHandler creates a new completion handler instance
++// NewInferenceHandler creates a new completion handler instance.
++// Accepts the BifrostRouter the handler will dispatch through. The
++// router-aware constructor lets the same handler code serve both
++// single-tenant (SingleTenantRouter) and multi-tenant (next patch)
++// deployments without per-request branching.
++//
++// client is kept on the struct only for back-compat with the existing
++// hot-reload paths that grab the runtime directly (e.g. Shutdown,
++// ReloadConfig). Inference MUST go through router.Acquire.
+ func NewInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *CompletionHandler {
+ 	return &CompletionHandler{
++		router: lib.NewSingleTenantRouter(client),
+ 		client: client,
+ 		config: config,
+ 	}
+ }
+ 
++// NewInferenceHandlerWithRouter is the explicit constructor for callers
++// that want to inject a custom BifrostRouter (e.g. the multi-tenant
++// dispatcher in the f5xc multi-tenant series). client is still required
++// for hot-reload back-compat — pass the same Bifrost the router will
++// hand out by default.
++func NewInferenceHandlerWithRouter(router lib.BifrostRouter, client *bifrost.Bifrost, config *lib.Config) *CompletionHandler {
++	return &CompletionHandler{
++		router: router,
++		client: client,
++		config: config,
++	}
++}
++
++// acquireBifrost is the per-request shortcut every inference entry point
++// uses: it returns the *bifrost.Bifrost to dispatch through and a release
++// func that MUST be deferred. Errors are terminal; the entry point should
++// send a 500 and return without invoking the runtime.
++func (h *CompletionHandler) acquireBifrost(ctx context.Context) (*bifrost.Bifrost, func(), error) {
++	return h.router.Acquire(ctx)
++}
++
+ // resolveModelAndProvider parses the model string, validates it, and resolves
+ // the provider via model catalog when no provider prefix is present. Stores
+ // resolution metadata on the fasthttp context for ConvertToBifrostContext to
+diff --git a/transports/bifrost-http/handlers/mcpinference.go b/transports/bifrost-http/handlers/mcpinference.go
+index a3f8d6594..c49301364 100644
+--- a/transports/bifrost-http/handlers/mcpinference.go
++++ b/transports/bifrost-http/handlers/mcpinference.go
+@@ -13,13 +13,25 @@ import (
+ )
+ 
+ type MCPInferenceHandler struct {
+-	client *bifrost.Bifrost
++	router lib.BifrostRouter // per-request runtime resolver (single-tenant by default)
++	client *bifrost.Bifrost  // legacy back-pointer for hot-reload / shutdown coordination
+ 	config *lib.Config
+ }
+ 
+ // NewMCPInferenceHandler creates a new MCP inference handler instance
+ func NewMCPInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *MCPInferenceHandler {
+ 	return &MCPInferenceHandler{
++		router: lib.NewSingleTenantRouter(client),
++		client: client,
++		config: config,
++	}
++}
++
++// NewMCPInferenceHandlerWithRouter is the router-aware constructor for
++// callers that want to inject a multi-tenant BifrostRouter.
++func NewMCPInferenceHandlerWithRouter(router lib.BifrostRouter, client *bifrost.Bifrost, config *lib.Config) *MCPInferenceHandler {
++	return &MCPInferenceHandler{
++		router: router,
+ 		client: client,
+ 		config: config,
+ 	}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index c52951e04..d7475ce9e 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -751,6 +751,29 @@ func (m *MockConfigStore) GetCustomersPaginated(ctx context.Context, params conf
+ 	return nil, 0, nil
+ }
+ 
++// Tenant CRUD — added in the multi-tenant patch series. The mock is
++// intentionally minimal: no in-memory state, just satisfy the interface so
++// test-only callers compile. Tenant-CRUD-specific tests live next to the
++// real RDBConfigStore impl in framework/configstore.
++func (m *MockConfigStore) GetTenants(ctx context.Context) ([]tables.TableTenant, error) {
++	return nil, nil
++}
++func (m *MockConfigStore) GetTenantsPaginated(ctx context.Context, params configstore.TenantsQueryParams) ([]tables.TableTenant, int64, error) {
++	return nil, 0, nil
++}
++func (m *MockConfigStore) GetTenant(ctx context.Context, id string) (*tables.TableTenant, error) {
++	return nil, configstore.ErrNotFound
++}
++func (m *MockConfigStore) CreateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
++	return nil
++}
++func (m *MockConfigStore) UpdateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
++	return nil
++}
++func (m *MockConfigStore) DeleteTenant(ctx context.Context, id string) error {
++	return nil
++}
++
+ func (m *MockConfigStore) CreateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error {
+ 	if m.governanceConfig == nil {
+ 		m.governanceConfig = &configstore.GovernanceConfig{}
+@@ -15732,11 +15755,13 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"updated_at":         true,
+ 		"virtual_key_id":     true, // Internal DB FK for multi-budget ownership
+ 		"provider_config_id": true, // Internal DB FK for multi-budget ownership
++		"tenant_id":          true, // Multi-tenant scoping; not user-facing config
+ 	},
+ 	"tables.TableRateLimit": {
+ 		"config_hash": true,
+ 		"created_at":  true,
+ 		"updated_at":  true,
++		"tenant_id":   true, // Multi-tenant scoping; not user-facing config
+ 	},
+ 	"tables.TableCustomer": {
+ 		"config_hash":  true,
+@@ -15746,6 +15771,7 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"rate_limit":   true, // GORM relation
+ 		"teams":        true, // GORM relation
+ 		"virtual_keys": true, // GORM relation
++		"tenant_id":    true, // Multi-tenant scoping; not user-facing config
+ 	},
+ 	"tables.TableTeam": {
+ 		"config_hash":  true,
+@@ -15755,6 +15781,8 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"rate_limit":   true, // GORM relation
+ 		"customer":     true, // GORM relation
+ 		"virtual_keys": true, // GORM relation
++		"source_id":    true, // IdP / SCIM sync identifier; not user-facing config
++		"tenant_id":    true, // Multi-tenant scoping; not user-facing config
+ 	},
+ 	"tables.TableVirtualKey": {
+ 		"config_hash": true,
+@@ -15764,6 +15792,7 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"rate_limit":  true, // GORM relation
+ 		"team":        true, // GORM relation
+ 		"customer":    true, // GORM relation
++		"tenant_id":   true, // Multi-tenant scoping; not user-facing config
+ 	},
+ 	"tables.TableVirtualKeyProviderConfig": {
+ 		"rate_limit":     true, // GORM relation
+diff --git a/transports/bifrost-http/lib/router.go b/transports/bifrost-http/lib/router.go
+new file mode 100644
+index 000000000..601f96751
+--- /dev/null
++++ b/transports/bifrost-http/lib/router.go
+@@ -0,0 +1,80 @@
++package lib
++
++import (
++	"context"
++
++	bifrost "github.com/maximhq/bifrost/core"
++)
++
++// BifrostRouter resolves a per-request *bifrost.Bifrost to use for an
++// inbound inference call.
++//
++// In OSS / single-tenant deployments there's exactly one Bifrost runtime
++// per process; Acquire is a trivial pass-through. In multi-tenant
++// deployments Acquire reads the resolved tenant id off the context and
++// returns the per-tenant runtime, pinning it via refcount until the
++// returned release function is invoked.
++//
++// Calling code must ALWAYS pair Acquire with a release(), typically via
++// defer — failing to release will leak refcount holds and prevent
++// the multi-tenant Manager from evicting idle tenants.
++//
++// The contract is intentionally minimal — one method, returning the
++// runtime and the release. Anything richer (per-method routing,
++// streaming-friendly release semantics) is layered on top inside the
++// router implementations rather than the interface.
++type BifrostRouter interface {
++	// Acquire returns the *bifrost.Bifrost to use for this request and a
++	// release function that the caller MUST invoke (via defer) when done.
++	//
++	// The release semantics differ per implementation. SingleTenantRouter
++	// returns a noop release. MultiTenantRouter decrements the per-tenant
++	// runtime refcount so the LRU can evict.
++	//
++	// Errors from Acquire are terminal for the request: the handler
++	// should reply with 5xx without invoking the runtime. The OSS path
++	// never returns an error; the multi-tenant path may (DB outage,
++	// tenant suspended, etc.).
++	Acquire(ctx context.Context) (*bifrost.Bifrost, func(), error)
++}
++
++// SingleTenantRouter is the trivial BifrostRouter used by OSS / single-
++// tenant deployments. It always returns the same Bifrost runtime and a
++// noop release.
++type SingleTenantRouter struct {
++	client *bifrost.Bifrost
++}
++
++// NewSingleTenantRouter returns a router that always serves the given
++// Bifrost runtime. Passing nil panics — every deployment has at least
++// one Bifrost.
++func NewSingleTenantRouter(client *bifrost.Bifrost) *SingleTenantRouter {
++	if client == nil {
++		panic("lib: nil *bifrost.Bifrost passed to NewSingleTenantRouter")
++	}
++	return &SingleTenantRouter{client: client}
++}
++
++// Acquire implements BifrostRouter.
++func (r *SingleTenantRouter) Acquire(_ context.Context) (*bifrost.Bifrost, func(), error) {
++	return r.client, noopRelease, nil
++}
++
++// SetClient swaps the underlying runtime. Used at hot-reload time when
++// the Bifrost runtime is rebuilt (e.g. provider config changes); not
++// safe to call concurrently with Acquire, so callers must coordinate
++// via the existing reload locks.
++func (r *SingleTenantRouter) SetClient(client *bifrost.Bifrost) {
++	if client == nil {
++		panic("lib: nil *bifrost.Bifrost passed to SingleTenantRouter.SetClient")
++	}
++	r.client = client
++}
++
++// Client returns the current underlying runtime. Used by code paths
++// that need the raw runtime for non-routed operations (Shutdown,
++// ReloadConfig). Should NOT be used as a back-door around Acquire in
++// the request path.
++func (r *SingleTenantRouter) Client() *bifrost.Bifrost { return r.client }
++
++func noopRelease() {}
+diff --git a/transports/bifrost-http/lib/router_test.go b/transports/bifrost-http/lib/router_test.go
+new file mode 100644
+index 000000000..4de207a24
+--- /dev/null
++++ b/transports/bifrost-http/lib/router_test.go
+@@ -0,0 +1,96 @@
++package lib
++
++import (
++	"context"
++	"sync"
++	"testing"
++
++	bifrost "github.com/maximhq/bifrost/core"
++)
++
++// fakeBifrost is a stand-in for *bifrost.Bifrost — we only need the pointer
++// identity for SingleTenantRouter's tests; no methods are exercised.
++func fakeBifrost(t *testing.T) *bifrost.Bifrost {
++	t.Helper()
++	return &bifrost.Bifrost{}
++}
++
++func TestSingleTenantRouter_AcquireReturnsSameClient(t *testing.T) {
++	want := fakeBifrost(t)
++	r := NewSingleTenantRouter(want)
++
++	got, release, err := r.Acquire(context.Background())
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if got != want {
++		t.Fatalf("Acquire returned %p, want %p", got, want)
++	}
++	if release == nil {
++		t.Fatal("release must be non-nil")
++	}
++	// Release is a noop but must not panic.
++	release()
++}
++
++func TestSingleTenantRouter_ConcurrentAcquireSafe(t *testing.T) {
++	want := fakeBifrost(t)
++	r := NewSingleTenantRouter(want)
++
++	const N = 32
++	var wg sync.WaitGroup
++	wg.Add(N)
++	for i := 0; i < N; i++ {
++		go func() {
++			defer wg.Done()
++			got, release, err := r.Acquire(context.Background())
++			if err != nil {
++				t.Errorf("Acquire: %v", err)
++				return
++			}
++			if got != want {
++				t.Errorf("Acquire returned wrong client")
++			}
++			release()
++		}()
++	}
++	wg.Wait()
++}
++
++func TestSingleTenantRouter_SetClient(t *testing.T) {
++	first := fakeBifrost(t)
++	r := NewSingleTenantRouter(first)
++	if r.Client() != first {
++		t.Fatal("Client should return the constructor argument")
++	}
++
++	second := fakeBifrost(t)
++	r.SetClient(second)
++	if r.Client() != second {
++		t.Fatal("Client should return the most recent SetClient value")
++	}
++	got, release, _ := r.Acquire(context.Background())
++	defer release()
++	if got != second {
++		t.Fatal("Acquire should serve the most recent SetClient value")
++	}
++}
++
++func TestSingleTenantRouter_NilClientPanics(t *testing.T) {
++	defer func() {
++		if recover() == nil {
++			t.Fatal("expected panic on nil client")
++		}
++	}()
++	_ = NewSingleTenantRouter(nil)
++}
++
++func TestSingleTenantRouter_SetClientNilPanics(t *testing.T) {
++	r := NewSingleTenantRouter(fakeBifrost(t))
++	defer func() {
++		if recover() == nil {
++			t.Fatal("expected panic on SetClient(nil)")
++		}
++	}()
++	r.SetClient(nil)
++}
+-- 
+2.51.0
+
