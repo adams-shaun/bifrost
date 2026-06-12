@@ -1,0 +1,493 @@
+From 8d15a1ac2d5f69a05f7b404864e854ee7dc028e9 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 14:42:52 -0600
+Subject: [PATCH] transports/lib+handlers: AdminAuthz stub + tenant-scoped
+ admin middleware
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Foundation for the per-tenant admin interface. Defines a small AdminAuthz
+interface for resolving the calling identity into (callerTenant,
+isPlatformAdmin) so each admin handler can scope its DB reads/writes
+correctly. v1 ships StubPlatformAdminAuthz which treats every caller as a
+platform-admin whose own tenant is DefaultTenantID (overridable via
+BIFROST_ADMIN_DEFAULT_TENANT); Phase 4's OIDC-backed AuthzPlugin replaces
+this in place.
+
+Three middlewares for the admin route tree:
+
+- RequireTenantPathMiddleware(authz) — for the new
+  /api/tenants/{tenant_id}/... route family. Reads {tenant_id} from the
+  fasthttp URL param, authorizes via AdminAuthz (only platform-admin can
+  target a tenant other than their own), and lifts the resolved tenant id
+  onto ctx under multitenant.BifrostContextKeyTenantID. Tenant-admin
+  cross-tenant attempts get 403.
+
+- LegacyAdminTenantScopeMiddleware(authz) — for the existing /api/<entity>
+  routes. Lifts the caller's own tenant id (from AdminAuthz) onto ctx so
+  the same handler code automatically scopes tenant-admins to their own
+  data. Empty caller falls back to DefaultTenantID.
+
+- RequirePlatformAdminMiddleware(authz) — for /api/platform/*. Rejects
+  any caller that is not a platform-admin.
+
+Also adds multitenant.DefaultTenantID = "default" so call sites in
+lib/handlers don't have to import framework/configstore/tables just for
+the literal.
+
+Patch ships the middleware + AdminAuthz only; subsequent patches enforce
+tenant_id scoping inside the existing admin handlers (providers, MCP,
+governance entities) and add the parallel /api/tenants/{tid}/... routes.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ multitenant/tenant.go                         |   6 +
+ .../handlers/admin_tenant_middleware.go       |  96 +++++++++
+ .../handlers/admin_tenant_middleware_test.go  | 182 ++++++++++++++++++
+ transports/bifrost-http/lib/admin_authz.go    |  60 ++++++
+ .../bifrost-http/lib/admin_authz_test.go      |  56 ++++++
+ 5 files changed, 400 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/admin_tenant_middleware.go
+ create mode 100644 transports/bifrost-http/handlers/admin_tenant_middleware_test.go
+ create mode 100644 transports/bifrost-http/lib/admin_authz.go
+ create mode 100644 transports/bifrost-http/lib/admin_authz_test.go
+
+diff --git a/multitenant/tenant.go b/multitenant/tenant.go
+index ee1e4466c..1499a70ea 100644
+--- a/multitenant/tenant.go
++++ b/multitenant/tenant.go
+@@ -17,6 +17,12 @@ import (
+ // downstream code (DB IDs, ULIDs, UUIDs, slugs) can pick a representation.
+ type TenantID string
+ 
++// DefaultTenantID is the tenant attributed to all pre-multi-tenant data and
++// to callers in single-tenant deployments. It mirrors the constant of the
++// same name in framework/configstore/tables to avoid pulling the configstore
++// import into this package's call sites that just need the literal.
++const DefaultTenantID TenantID = "default"
++
+ // BifrostContextKeyTenantID is the BifrostContext key under which the resolved
+ // tenant id is stored. The tenant-resolver middleware sets it after looking
+ // up the inbound virtual key; downstream plugins / the multi-tenant
+diff --git a/transports/bifrost-http/handlers/admin_tenant_middleware.go b/transports/bifrost-http/handlers/admin_tenant_middleware.go
+new file mode 100644
+index 000000000..fccb00c29
+--- /dev/null
++++ b/transports/bifrost-http/handlers/admin_tenant_middleware.go
+@@ -0,0 +1,96 @@
++package handlers
++
++import (
++	"strings"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// RequireTenantPathMiddleware reads the {tenant_id} fasthttp URL param,
++// authorizes via the supplied lib.AdminAuthz, and lifts the tenant id onto
++// the request context under multitenant.BifrostContextKeyTenantID so all
++// downstream handlers / repo calls scope to that tenant.
++//
++// Policy:
++//   - {tenant_id} must be present and non-empty -> 400 otherwise.
++//   - AdminAuthz failure -> 401.
++//   - !isPlatformAdmin AND {tenant_id} != callerTenant -> 403.
++//   - Otherwise: set ctx user-value BifrostContextKeyTenantID = {tenant_id}
++//     and call next. Platform-admins targeting their own tenant fall through
++//     too — the policy is "platform-admin can target any tenant" not "only
++//     other tenants".
++//
++// Mounted on all /api/tenants/{tenant_id}/... routes.
++func RequireTenantPathMiddleware(authz lib.AdminAuthz) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			tidVal, _ := ctx.UserValue("tenant_id").(string)
++			tid := multitenant.TenantID(strings.TrimSpace(tidVal))
++			if tid == "" {
++				SendError(ctx, fasthttp.StatusBadRequest, "tenant_id is required")
++				return
++			}
++
++			caller, isPlatformAdmin, err := authz.ResolveCaller(ctx)
++			if err != nil {
++				SendError(ctx, fasthttp.StatusUnauthorized, "admin authz failed: "+err.Error())
++				return
++			}
++			if !isPlatformAdmin && caller != tid {
++				SendError(ctx, fasthttp.StatusForbidden, "tenant-admin cannot target a different tenant")
++				return
++			}
++
++			ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), string(tid))
++			next(ctx)
++		}
++	}
++}
++
++// LegacyAdminTenantScopeMiddleware resolves the caller via AdminAuthz and
++// lifts the caller's own tenant id onto the request context. Mount this on
++// the existing /api/<entity> admin routes so tenant-admins see only their
++// own data even though the URL has no {tenant_id} param.
++//
++// Platform-admins also get scoped to their own (FallbackTenant) tenant under
++// this middleware — they should use /api/tenants/{tenant_id}/... when they
++// need to act on a specific tenant.
++func LegacyAdminTenantScopeMiddleware(authz lib.AdminAuthz) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			caller, _, err := authz.ResolveCaller(ctx)
++			if err != nil {
++				SendError(ctx, fasthttp.StatusUnauthorized, "admin authz failed: "+err.Error())
++				return
++			}
++			if caller == "" {
++				caller = multitenant.DefaultTenantID
++			}
++			ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), string(caller))
++			next(ctx)
++		}
++	}
++}
++
++// RequirePlatformAdminMiddleware rejects any caller that isn't a platform
++// admin. Mount on /api/platform/* routes (cross-tenant admin: tenants CRUD,
++// global feature flags, audit log, etc.).
++func RequirePlatformAdminMiddleware(authz lib.AdminAuthz) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			_, isPlatformAdmin, err := authz.ResolveCaller(ctx)
++			if err != nil {
++				SendError(ctx, fasthttp.StatusUnauthorized, "admin authz failed: "+err.Error())
++				return
++			}
++			if !isPlatformAdmin {
++				SendError(ctx, fasthttp.StatusForbidden, "platform-admin only")
++				return
++			}
++			next(ctx)
++		}
++	}
++}
+diff --git a/transports/bifrost-http/handlers/admin_tenant_middleware_test.go b/transports/bifrost-http/handlers/admin_tenant_middleware_test.go
+new file mode 100644
+index 000000000..1496342ea
+--- /dev/null
++++ b/transports/bifrost-http/handlers/admin_tenant_middleware_test.go
+@@ -0,0 +1,182 @@
++package handlers
++
++import (
++	"errors"
++	"net"
++	"testing"
++
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// stubAdminAuthz is a test double for lib.AdminAuthz so this test file does
++// not pull in the lib package's import cycle considerations.
++type stubAdminAuthz struct {
++	caller          multitenant.TenantID
++	isPlatformAdmin bool
++	err             error
++}
++
++func (s *stubAdminAuthz) ResolveCaller(_ *fasthttp.RequestCtx) (multitenant.TenantID, bool, error) {
++	return s.caller, s.isPlatformAdmin, s.err
++}
++
++func newAdminCtx(t *testing.T, path string, tenantParam string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	if path == "" {
++		path = "/api/tenants/acme/providers"
++	}
++	req.SetRequestURI(path)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tenantParam != "" {
++		ctx.SetUserValue("tenant_id", tenantParam)
++	}
++	return ctx
++}
++
++func TestRequireTenantPathMiddleware_PlatformAdminAnyTenant(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "operator", isPlatformAdmin: true}
++	nh := &nextHandler{}
++	mw := RequireTenantPathMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "", "acme")
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next should be called for platform-admin")
++	}
++	if ctx.Response.StatusCode() == fasthttp.StatusForbidden {
++		t.Fatal("platform-admin must not get 403 targeting another tenant")
++	}
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("tenant_id should be set to path param; got %q", tid)
++	}
++}
++
++func TestRequireTenantPathMiddleware_TenantAdminOwnTenant(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "acme", isPlatformAdmin: false}
++	nh := &nextHandler{}
++	mw := RequireTenantPathMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "", "acme")
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("tenant-admin must be allowed on their own tenant path")
++	}
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("tenant_id should be set; got %q", tid)
++	}
++}
++
++func TestRequireTenantPathMiddleware_TenantAdminCrossTenant(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "acme", isPlatformAdmin: false}
++	nh := &nextHandler{}
++	mw := RequireTenantPathMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "", "globex")
++	mw(ctx)
++
++	if nh.called {
++		t.Fatal("tenant-admin must NOT be allowed to act on another tenant")
++	}
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusForbidden; got != want {
++		t.Fatalf("status got %d want %d", got, want)
++	}
++}
++
++func TestRequireTenantPathMiddleware_MissingTenantID(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "acme", isPlatformAdmin: true}
++	nh := &nextHandler{}
++	mw := RequireTenantPathMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "", "")
++	mw(ctx)
++
++	if nh.called {
++		t.Fatal("must reject when tenant_id is missing")
++	}
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusBadRequest; got != want {
++		t.Fatalf("status got %d want %d", got, want)
++	}
++}
++
++func TestRequireTenantPathMiddleware_AuthzError(t *testing.T) {
++	authz := &stubAdminAuthz{err: errors.New("upstream IdP down")}
++	nh := &nextHandler{}
++	mw := RequireTenantPathMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "", "acme")
++	mw(ctx)
++
++	if nh.called {
++		t.Fatal("authz error must short-circuit")
++	}
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusUnauthorized; got != want {
++		t.Fatalf("status got %d want %d", got, want)
++	}
++}
++
++func TestLegacyAdminTenantScopeMiddleware_LiftsCallerTenant(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "acme", isPlatformAdmin: false}
++	nh := &nextHandler{}
++	mw := LegacyAdminTenantScopeMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "/api/providers", "")
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next should be called on legacy admin route")
++	}
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("tenant_id should be lifted from caller; got %q", tid)
++	}
++}
++
++func TestLegacyAdminTenantScopeMiddleware_FallbackToDefaultOnEmpty(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "", isPlatformAdmin: true}
++	nh := &nextHandler{}
++	mw := LegacyAdminTenantScopeMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "/api/providers", "")
++	mw(ctx)
++
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != string(multitenant.DefaultTenantID) {
++		t.Fatalf("empty caller should fall back to DefaultTenantID; got %q", tid)
++	}
++}
++
++func TestRequirePlatformAdminMiddleware_RejectsTenantAdmin(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "acme", isPlatformAdmin: false}
++	nh := &nextHandler{}
++	mw := RequirePlatformAdminMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "/api/platform/tenants", "")
++	mw(ctx)
++
++	if nh.called {
++		t.Fatal("tenant-admin must not reach platform routes")
++	}
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusForbidden; got != want {
++		t.Fatalf("status got %d want %d", got, want)
++	}
++}
++
++func TestRequirePlatformAdminMiddleware_AllowsPlatformAdmin(t *testing.T) {
++	authz := &stubAdminAuthz{caller: "operator", isPlatformAdmin: true}
++	nh := &nextHandler{}
++	mw := RequirePlatformAdminMiddleware(authz)(nh.handle)
++
++	ctx := newAdminCtx(t, "/api/platform/tenants", "")
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("platform-admin must pass")
++	}
++}
+diff --git a/transports/bifrost-http/lib/admin_authz.go b/transports/bifrost-http/lib/admin_authz.go
+new file mode 100644
+index 000000000..81465e2c9
+--- /dev/null
++++ b/transports/bifrost-http/lib/admin_authz.go
+@@ -0,0 +1,60 @@
++package lib
++
++import (
++	"os"
++	"strings"
++
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// AdminAuthz resolves the calling identity for admin HTTP endpoints into
++// (caller_tenant_id, is_platform_admin). It is a deliberately small interface
++// so v1 can ship a stub and Phase 4's real AuthzPlugin (OIDC-backed) can
++// swap in without touching every admin handler.
++//
++// Semantics:
++//   - callerTenant: the tenant the caller belongs to. A tenant-admin's
++//     mutations to /api/<entity> apply to this tenant only. Empty string is
++//     only valid when isPlatformAdmin is true AND the route reads the target
++//     tenant from a path param (e.g. /api/tenants/{tenant_id}/...).
++//   - isPlatformAdmin: true if the caller is allowed to invoke
++//     /api/platform/* and /api/tenants/{tenant_id}/* with any tenant_id.
++//   - err: any error returned causes the calling middleware to write a 401.
++//     v1 stubs never error.
++type AdminAuthz interface {
++	ResolveCaller(ctx *fasthttp.RequestCtx) (callerTenant multitenant.TenantID, isPlatformAdmin bool, err error)
++}
++
++// StubPlatformAdminAuthz is the v1 stub: every admin caller is treated as a
++// platform-admin whose own tenant is FallbackTenant. This preserves the
++// current single-tenant operator experience while letting us ship the
++// tenant-scoped routing now. Phase 4 replaces this with an OIDC-backed
++// AdminAuthz that reads the caller's identity claims.
++//
++// FallbackTenant defaults to multitenant.DefaultTenantID; override only for
++// tests that want to assert tenant-admin behavior.
++type StubPlatformAdminAuthz struct {
++	FallbackTenant multitenant.TenantID
++}
++
++// NewStubPlatformAdminAuthz returns a StubPlatformAdminAuthz with the
++// fallback tenant resolved from the BIFROST_ADMIN_DEFAULT_TENANT env var,
++// falling back to multitenant.DefaultTenantID. The env var lets a single
++// process serve as a fixed tenant-admin in single-tenant deployments
++// (e.g. for CI fixtures or local-dev runs).
++func NewStubPlatformAdminAuthz() *StubPlatformAdminAuthz {
++	tid := multitenant.TenantID(strings.TrimSpace(os.Getenv("BIFROST_ADMIN_DEFAULT_TENANT")))
++	if tid == "" {
++		tid = multitenant.DefaultTenantID
++	}
++	return &StubPlatformAdminAuthz{FallbackTenant: tid}
++}
++
++func (s *StubPlatformAdminAuthz) ResolveCaller(_ *fasthttp.RequestCtx) (multitenant.TenantID, bool, error) {
++	tid := s.FallbackTenant
++	if tid == "" {
++		tid = multitenant.DefaultTenantID
++	}
++	return tid, true, nil
++}
+diff --git a/transports/bifrost-http/lib/admin_authz_test.go b/transports/bifrost-http/lib/admin_authz_test.go
+new file mode 100644
+index 000000000..aaccfda0f
+--- /dev/null
++++ b/transports/bifrost-http/lib/admin_authz_test.go
+@@ -0,0 +1,56 @@
++package lib
++
++import (
++	"net"
++	"testing"
++
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++func newAuthzCtx(t *testing.T) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI("/api/providers")
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	return ctx
++}
++
++func TestStubPlatformAdminAuthz_DefaultFallback(t *testing.T) {
++	authz := &StubPlatformAdminAuthz{}
++	tid, isPlatformAdmin, err := authz.ResolveCaller(newAuthzCtx(t))
++	if err != nil {
++		t.Fatalf("stub must never error; got %v", err)
++	}
++	if !isPlatformAdmin {
++		t.Fatal("stub must always say platform-admin")
++	}
++	if tid != multitenant.DefaultTenantID {
++		t.Fatalf("empty FallbackTenant should resolve to DefaultTenantID; got %q", tid)
++	}
++}
++
++func TestStubPlatformAdminAuthz_CustomFallback(t *testing.T) {
++	authz := &StubPlatformAdminAuthz{FallbackTenant: "acme"}
++	tid, _, _ := authz.ResolveCaller(newAuthzCtx(t))
++	if tid != "acme" {
++		t.Fatalf("custom FallbackTenant should win; got %q", tid)
++	}
++}
++
++func TestNewStubPlatformAdminAuthz_DefaultsToDefault(t *testing.T) {
++	t.Setenv("BIFROST_ADMIN_DEFAULT_TENANT", "")
++	authz := NewStubPlatformAdminAuthz()
++	if authz.FallbackTenant != multitenant.DefaultTenantID {
++		t.Fatalf("unset env should default to DefaultTenantID; got %q", authz.FallbackTenant)
++	}
++}
++
++func TestNewStubPlatformAdminAuthz_RespectsEnvVar(t *testing.T) {
++	t.Setenv("BIFROST_ADMIN_DEFAULT_TENANT", "  acme  ")
++	authz := NewStubPlatformAdminAuthz()
++	if authz.FallbackTenant != "acme" {
++		t.Fatalf("env var should be trimmed and used; got %q", authz.FallbackTenant)
++	}
++}
+-- 
+2.51.0
+
