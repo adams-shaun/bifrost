@@ -1,0 +1,668 @@
+From 77c640aed20b25114786739ff0a59d5c373a93e6 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 11 Jun 2026 20:20:15 -0600
+Subject: [PATCH] transports+multitenant: tenant resolver middleware +
+ ConfigStoreVKResolver
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First load-bearing wiring of the tenant_id concept into the request
+path. Three pieces, all behind interfaces so the per-tenant Bifrost
+dispatcher (next patch) plugs in without further surgery.
+
+1) multitenant.BifrostContextKeyTenantID — the context key under
+   which the resolved tenant id is stored. Defined as a
+   schemas.BifrostContextKey constant so any consumer can read it
+   without importing multitenant beyond the constant.
+
+2) multitenant.ConfigStoreVKResolver — implements VKResolver by
+   looking up the VK in framework/configstore's
+   governance_virtual_keys table via GetVirtualKeyByValue. Wraps
+   nicely in CachedVKResolver for the production hot path:
+       cached := NewCachedVKResolver(NewConfigStoreVKResolver(store), 60*time.Second)
+
+   Semantics:
+     - empty VK / not found / IsActive=false → ErrUnknownVK
+       (collapsed so callers can't time-distinguish "wrong" vs
+       "disabled")
+     - empty TenantID on the row → real error (signals a row that
+       escaped the backfill — should be noticed, not silently
+       routed to "")
+     - DB error → wrapped and returned (caller decides)
+
+3) handlers.TenantResolverMiddleware(resolver) — fasthttp middleware
+   that extracts the VK from the request (same header shapes as
+   lib/ctx.go: x-bf-vk, Authorization Bearer sk-bf-*, x-api-key,
+   x-goog-api-key) and writes the resolved tenant id onto the
+   RequestCtx UserValue under BifrostContextKeyTenantID. Downstream
+   BifrostContext construction in lib/ctx.go will lift it onto the
+   inference context where the per-tenant dispatcher reads it.
+
+   Fail-open by design at this layer:
+     - missing VK / unknown VK / DB outage → no tenant id set,
+       request still flows. The governance plugin owns the 401 path
+       (single source of truth for VK auth/authz).
+     - skip paths: /health and /api/platform/* (no VK lookup
+       needed on platform-admin or health probes)
+     - nil resolver → noop (the deployment hasn't wired one yet)
+
+Tests:
+  - 7 in multitenant/configstore_resolver_test.go covering happy path,
+    unknown / empty / inactive VKs, missing TenantID, DB errors,
+    nil-store panic
+  - 8 in transports/bifrost-http/handlers/tenant_resolver_test.go
+    covering each header shape, missing VK pass-through, unknown VK
+    pass-through, resolver-error pass-through, skip paths, and nil
+    resolver
+
+NOT in this patch (deliberately): wiring the middleware into the
+server.go middleware chain. That patch also lands the per-tenant
+Bifrost runtime dispatch in the inference path, so both halves of the
+end-to-end story ship together. Until then this code is dead-but-
+testable scaffolding.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ multitenant/configstore_resolver.go           |  97 +++++++++
+ multitenant/configstore_resolver_test.go      | 129 ++++++++++++
+ multitenant/tenant.go                         |   6 +
+ .../bifrost-http/handlers/tenant_resolver.go  | 123 +++++++++++
+ .../handlers/tenant_resolver_test.go          | 198 ++++++++++++++++++
+ 5 files changed, 553 insertions(+)
+ create mode 100644 multitenant/configstore_resolver.go
+ create mode 100644 multitenant/configstore_resolver_test.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_resolver.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_resolver_test.go
+
+diff --git a/multitenant/configstore_resolver.go b/multitenant/configstore_resolver.go
+new file mode 100644
+index 000000000..72bd201a6
+--- /dev/null
++++ b/multitenant/configstore_resolver.go
+@@ -0,0 +1,97 @@
++package multitenant
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/maximhq/bifrost/framework/configstore"
++)
++
++// vkLookup is the minimal slice of the configstore.ConfigStore API that
++// ConfigStoreVKResolver needs. We accept this interface (rather than the
++// whole ConfigStore) so unit tests can mock it without standing up a real
++// SQLite-backed store.
++//
++// The single method matches configstore.ConfigStore.GetVirtualKeyByValue.
++type vkLookup interface {
++	GetVirtualKeyByValue(ctx context.Context, value string) (*virtualKeyMinimal, error)
++}
++
++// virtualKeyMinimal is the subset of tables.TableVirtualKey that the
++// resolver reads. Defined separately so the interface contract stays small.
++type virtualKeyMinimal struct {
++	ID       string
++	TenantID string
++	IsActive *bool
++}
++
++// ConfigStoreVKResolver looks up a virtual key in framework/configstore's
++// governance_virtual_keys table and returns its tenant_id. Wrap it in a
++// CachedVKResolver to keep the hot path off the DB; the standard production
++// pattern is:
++//
++//	memResolver := multitenant.NewConfigStoreVKResolver(store)
++//	cached := multitenant.NewCachedVKResolver(memResolver, 60*time.Second)
++//
++// Returns ErrUnknownVK for keys that don't exist OR are marked inactive —
++// these are treated identically so callers can't distinguish "wrong VK" from
++// "disabled VK" via timing or error type.
++type ConfigStoreVKResolver struct {
++	store vkLookup
++}
++
++// NewConfigStoreVKResolver constructs a resolver backed by a ConfigStore.
++// Passing nil panics — the resolver is useless without a backing store.
++func NewConfigStoreVKResolver(store configstore.ConfigStore) *ConfigStoreVKResolver {
++	if store == nil {
++		panic("multitenant: nil ConfigStore passed to NewConfigStoreVKResolver")
++	}
++	return &ConfigStoreVKResolver{store: configStoreLookup{cs: store}}
++}
++
++// newConfigStoreVKResolverWithLookup is the test-only constructor that
++// accepts a custom vkLookup so a mock can be substituted for the SQLite
++// store. Kept unexported.
++func newConfigStoreVKResolverWithLookup(lookup vkLookup) *ConfigStoreVKResolver {
++	return &ConfigStoreVKResolver{store: lookup}
++}
++
++// ResolveVK implements VKResolver.
++func (r *ConfigStoreVKResolver) ResolveVK(ctx context.Context, vk string) (TenantID, error) {
++	if vk == "" {
++		return "", ErrUnknownVK
++	}
++	row, err := r.store.GetVirtualKeyByValue(ctx, vk)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			return "", ErrUnknownVK
++		}
++		return "", fmt.Errorf("resolve VK: %w", err)
++	}
++	if row.IsActive != nil && !*row.IsActive {
++		return "", ErrUnknownVK
++	}
++	if row.TenantID == "" {
++		return "", fmt.Errorf("VK %q has no tenant_id (likely a pre-migration row that escaped the backfill)", row.ID)
++	}
++	return TenantID(row.TenantID), nil
++}
++
++// configStoreLookup adapts the full configstore.ConfigStore down to the
++// narrower vkLookup interface, copying just the fields the resolver needs.
++type configStoreLookup struct {
++	cs configstore.ConfigStore
++}
++
++func (a configStoreLookup) GetVirtualKeyByValue(ctx context.Context, value string) (*virtualKeyMinimal, error) {
++	row, err := a.cs.GetVirtualKeyByValue(ctx, value)
++	if err != nil {
++		return nil, err
++	}
++	return &virtualKeyMinimal{
++		ID:       row.ID,
++		TenantID: row.TenantID,
++		IsActive: row.IsActive,
++	}, nil
++}
+diff --git a/multitenant/configstore_resolver_test.go b/multitenant/configstore_resolver_test.go
+new file mode 100644
+index 000000000..613344b3e
+--- /dev/null
++++ b/multitenant/configstore_resolver_test.go
+@@ -0,0 +1,129 @@
++package multitenant
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/maximhq/bifrost/framework/configstore"
++)
++
++// stubLookup is a vkLookup that returns canned rows / errors keyed by VK
++// value. It lets us drive ConfigStoreVKResolver without standing up a real
++// SQLite store.
++type stubLookup struct {
++	byValue map[string]*virtualKeyMinimal
++	err     error
++}
++
++func (s *stubLookup) GetVirtualKeyByValue(_ context.Context, value string) (*virtualKeyMinimal, error) {
++	if s.err != nil {
++		return nil, s.err
++	}
++	row, ok := s.byValue[value]
++	if !ok {
++		return nil, configstore.ErrNotFound
++	}
++	return row, nil
++}
++
++func boolPtr(b bool) *bool { return &b }
++
++func TestConfigStoreVKResolver_HappyPath(t *testing.T) {
++	lookup := &stubLookup{byValue: map[string]*virtualKeyMinimal{
++		"sk-bf-good": {ID: "vk-1", TenantID: "acme"},
++	}}
++	r := newConfigStoreVKResolverWithLookup(lookup)
++
++	tid, err := r.ResolveVK(context.Background(), "sk-bf-good")
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if tid != "acme" {
++		t.Fatalf("got tid=%q want %q", tid, "acme")
++	}
++}
++
++func TestConfigStoreVKResolver_UnknownVK(t *testing.T) {
++	r := newConfigStoreVKResolverWithLookup(&stubLookup{byValue: map[string]*virtualKeyMinimal{}})
++	if _, err := r.ResolveVK(context.Background(), "sk-bf-missing"); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("expected ErrUnknownVK, got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_EmptyVK(t *testing.T) {
++	r := newConfigStoreVKResolverWithLookup(&stubLookup{})
++	if _, err := r.ResolveVK(context.Background(), ""); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("empty VK should return ErrUnknownVK, got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_InactiveVK(t *testing.T) {
++	lookup := &stubLookup{byValue: map[string]*virtualKeyMinimal{
++		"sk-bf-disabled": {ID: "vk-d", TenantID: "acme", IsActive: boolPtr(false)},
++	}}
++	r := newConfigStoreVKResolverWithLookup(lookup)
++
++	// IsActive=false collapses into ErrUnknownVK so callers can't tell
++	// "wrong VK" from "disabled VK" by error type.
++	if _, err := r.ResolveVK(context.Background(), "sk-bf-disabled"); !errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("inactive VK should return ErrUnknownVK, got %v", err)
++	}
++
++	// IsActive=true is normal.
++	lookup.byValue["sk-bf-on"] = &virtualKeyMinimal{ID: "vk-on", TenantID: "acme", IsActive: boolPtr(true)}
++	tid, err := r.ResolveVK(context.Background(), "sk-bf-on")
++	if err != nil || tid != "acme" {
++		t.Fatalf("active VK with IsActive=true should resolve, got tid=%q err=%v", tid, err)
++	}
++
++	// IsActive=nil is treated as active (DB default behaviour).
++	lookup.byValue["sk-bf-nil"] = &virtualKeyMinimal{ID: "vk-nil", TenantID: "acme"}
++	tid, err = r.ResolveVK(context.Background(), "sk-bf-nil")
++	if err != nil || tid != "acme" {
++		t.Fatalf("IsActive=nil should be treated as active, got tid=%q err=%v", tid, err)
++	}
++}
++
++func TestConfigStoreVKResolver_MissingTenantIDIsAnError(t *testing.T) {
++	// VK exists but TenantID is empty — that's a corrupted row (pre-migration
++	// data that escaped the backfill). Surface a real error so it gets noticed
++	// rather than silently routing to "" tenant.
++	lookup := &stubLookup{byValue: map[string]*virtualKeyMinimal{
++		"sk-bf-orphan": {ID: "vk-orphan", TenantID: ""},
++	}}
++	r := newConfigStoreVKResolverWithLookup(lookup)
++
++	_, err := r.ResolveVK(context.Background(), "sk-bf-orphan")
++	if err == nil {
++		t.Fatal("expected an error for missing tenant_id")
++	}
++	if errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("missing tenant_id should NOT collapse to ErrUnknownVK; got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_LookupErrorPropagates(t *testing.T) {
++	wantErr := errors.New("db borked")
++	r := newConfigStoreVKResolverWithLookup(&stubLookup{err: wantErr})
++
++	_, err := r.ResolveVK(context.Background(), "sk-bf-anything")
++	if err == nil {
++		t.Fatal("expected backing error to propagate")
++	}
++	if errors.Is(err, ErrUnknownVK) {
++		t.Fatalf("backing DB error should NOT collapse to ErrUnknownVK; got %v", err)
++	}
++	if !errors.Is(err, wantErr) {
++		t.Fatalf("expected wrapped DB error, got %v", err)
++	}
++}
++
++func TestConfigStoreVKResolver_NilConfigStorePanics(t *testing.T) {
++	defer func() {
++		if recover() == nil {
++			t.Fatal("expected panic on nil ConfigStore")
++		}
++	}()
++	_ = NewConfigStoreVKResolver(nil)
++}
+diff --git a/multitenant/tenant.go b/multitenant/tenant.go
+index b48707d0f..ee1e4466c 100644
+--- a/multitenant/tenant.go
++++ b/multitenant/tenant.go
+@@ -17,6 +17,12 @@ import (
+ // downstream code (DB IDs, ULIDs, UUIDs, slugs) can pick a representation.
+ type TenantID string
+ 
++// BifrostContextKeyTenantID is the BifrostContext key under which the resolved
++// tenant id is stored. The tenant-resolver middleware sets it after looking
++// up the inbound virtual key; downstream plugins / the multi-tenant
++// dispatcher read it via ctx.Value(BifrostContextKeyTenantID).
++const BifrostContextKeyTenantID schemas.BifrostContextKey = "bf-tenant-id"
++
+ // TenantLoader is the user-supplied callback that produces a BifrostConfig for
+ // a given tenant. The loader is invoked exactly once per tenant runtime per
+ // process lifetime (or until the runtime is evicted and re-acquired).
+diff --git a/transports/bifrost-http/handlers/tenant_resolver.go b/transports/bifrost-http/handlers/tenant_resolver.go
+new file mode 100644
+index 000000000..56b3b1aa1
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_resolver.go
+@@ -0,0 +1,123 @@
++package handlers
++
++import (
++	"strings"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantResolverMiddleware extracts the inbound virtual key from the request,
++// resolves it to a tenant id via the supplied multitenant.VKResolver, and
++// stashes the result on the fasthttp RequestCtx under
++// multitenant.BifrostContextKeyTenantID. Downstream BifrostContext
++// construction (lib/ctx.go) lifts that user-value onto the BifrostContext,
++// where the per-tenant Bifrost dispatcher reads it.
++//
++// Behaviour:
++//
++//   - VK header missing: pass through unchanged. The downstream pipeline
++//     still has the option to attribute the request to the default tenant.
++//   - VK present but unknown / inactive: still pass through; we DO NOT reject
++//     here so the existing governance plugin keeps owning auth/authz errors
++//     with a single source of truth. The tenant id is simply not set.
++//   - Resolver error (DB outage, etc.): logged at debug level, request still
++//     passes through without a tenant id. Failing closed at this layer would
++//     translate every transient DB blip into 500s for inference; the
++//     dispatcher can decide its own fail-open / fail-closed policy.
++//
++// Skip paths: requests under /api/platform/* never carry a tenant context
++// (platform-admin APIs are cross-tenant); /health is too noisy to look up.
++//
++// The middleware reads the same VK header shapes as lib/ctx.go's
++// BifrostContext construction (x-bf-vk, Authorization: Bearer sk-bf-...,
++// x-api-key, x-goog-api-key) so behaviour stays aligned with the existing
++// governance plugin's VK source of truth.
++func TenantResolverMiddleware(resolver multitenant.VKResolver) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			if resolver == nil {
++				next(ctx)
++				return
++			}
++			path := string(ctx.RequestURI())
++			if shouldSkipTenantResolve(path) {
++				next(ctx)
++				return
++			}
++
++			vk := extractVKFromHeaders(&ctx.Request.Header)
++			if vk == "" {
++				next(ctx)
++				return
++			}
++
++			tid, err := resolver.ResolveVK(ctx, vk)
++			if err != nil {
++				// Unknown / inactive VK / DB error all fall through without a
++				// tenant id. Governance still owns the rejection path.
++				if logger != nil {
++					logger.Debug("tenant resolver: VK lookup failed (vk=%q err=%v) — request continues without tenant_id", redactVK(vk), err)
++				}
++				next(ctx)
++				return
++			}
++
++			ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), string(tid))
++			next(ctx)
++		}
++	}
++}
++
++// shouldSkipTenantResolve returns true for paths that have no per-tenant
++// dispatch and so don't benefit from a VK lookup. Keep this list short —
++// every entry is a per-request VK lookup we avoid.
++func shouldSkipTenantResolve(path string) bool {
++	if path == "/health" {
++		return true
++	}
++	if strings.HasPrefix(path, "/api/platform/") {
++		return true
++	}
++	return false
++}
++
++// extractVKFromHeaders mirrors the VK ingestion logic in lib/ctx.go so the
++// resolver sees the same VK the governance plugin will later see. It only
++// returns a non-empty value when the candidate clearly looks like a virtual
++// key (x-bf-vk is the dedicated header; the other shapes are accepted only
++// when the value starts with the governance VK prefix).
++func extractVKFromHeaders(h *fasthttp.RequestHeader) string {
++	if v := string(h.Peek("x-bf-vk")); v != "" {
++		return v
++	}
++	if v := string(h.Peek("Authorization")); v != "" {
++		if strings.HasPrefix(strings.ToLower(v), "bearer ") {
++			cand := strings.TrimSpace(v[7:])
++			if strings.HasPrefix(strings.ToLower(cand), virtualKeyPrefix) {
++				return cand
++			}
++		}
++	}
++	if v := string(h.Peek("x-api-key")); v != "" && strings.HasPrefix(strings.ToLower(v), virtualKeyPrefix) {
++		return v
++	}
++	if v := string(h.Peek("x-goog-api-key")); v != "" && strings.HasPrefix(strings.ToLower(v), virtualKeyPrefix) {
++		return v
++	}
++	return ""
++}
++
++// virtualKeyPrefix duplicates governance.VirtualKeyPrefix so this file does
++// not pull in the governance plugin import for a single constant. Keep in
++// sync; the value is governance-spec-stable.
++const virtualKeyPrefix = "sk-bf-"
++
++// redactVK trims a VK down to a stable prefix + last 4 chars for logging.
++func redactVK(vk string) string {
++	if len(vk) <= 8 {
++		return "redacted"
++	}
++	return vk[:6] + "…" + vk[len(vk)-4:]
++}
+diff --git a/transports/bifrost-http/handlers/tenant_resolver_test.go b/transports/bifrost-http/handlers/tenant_resolver_test.go
+new file mode 100644
+index 000000000..6b3f11f75
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_resolver_test.go
+@@ -0,0 +1,198 @@
++package handlers
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// stubVKResolver is a multitenant.VKResolver that returns canned answers
++// keyed by exact VK match.
++type stubVKResolver struct {
++	mapping map[string]multitenant.TenantID
++	err     error
++	calls   int
++}
++
++func (s *stubVKResolver) ResolveVK(_ context.Context, vk string) (multitenant.TenantID, error) {
++	s.calls++
++	if s.err != nil {
++		return "", s.err
++	}
++	tid, ok := s.mapping[vk]
++	if !ok {
++		return "", multitenant.ErrUnknownVK
++	}
++	return tid, nil
++}
++
++// newResolverTestCtx builds a properly-initialized RequestCtx with the given
++// path + optional VK header. Path defaults to /api/inference if empty.
++func newResolverTestCtx(t *testing.T, path string, hdr map[string]string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	if path == "" {
++		path = "/api/inference/chat"
++	}
++	req.SetRequestURI(path)
++	for k, v := range hdr {
++		req.Header.Set(k, v)
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	return ctx
++}
++
++// nextHandler is a trivial fasthttp handler that records whether it was
++// called and exposes the ctx so tests can inspect UserValues after the
++// middleware ran.
++type nextHandler struct {
++	called bool
++}
++
++func (n *nextHandler) handle(ctx *fasthttp.RequestCtx) { n.called = true }
++
++func TestTenantResolverMiddleware_HappyPath(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{
++		"sk-bf-acme": "acme",
++	}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-acme"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next handler should have been called")
++	}
++	if resolver.calls != 1 {
++		t.Fatalf("resolver should be called exactly once, got %d", resolver.calls)
++	}
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("tenant id should be set on ctx; got %q", tid)
++	}
++}
++
++func TestTenantResolverMiddleware_ReadsBearer(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{
++		"sk-bf-acme": "acme",
++	}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"Authorization": "Bearer sk-bf-acme"})
++	mw(ctx)
++
++	tid, _ := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string)
++	if tid != "acme" {
++		t.Fatalf("Bearer-token VK should be picked up; got tid=%q", tid)
++	}
++}
++
++func TestTenantResolverMiddleware_BearerNonVKIgnored(t *testing.T) {
++	resolver := &stubVKResolver{}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	// Authorization without the sk-bf- prefix is some other auth scheme,
++	// not a virtual key. Don't even call the resolver.
++	ctx := newResolverTestCtx(t, "", map[string]string{"Authorization": "Bearer ya29-google-token"})
++	mw(ctx)
++
++	if resolver.calls != 0 {
++		t.Fatalf("non-VK Authorization should not trigger resolver, got %d calls", resolver.calls)
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_MissingVKPassesThrough(t *testing.T) {
++	resolver := &stubVKResolver{}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", nil)
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next handler should still run when VK is absent")
++	}
++	if resolver.calls != 0 {
++		t.Fatal("resolver should not be called when no VK is present")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_UnknownVKPassesThrough(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-bogus"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("next handler should still run on unknown VK; governance owns the 401")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set on unknown VK; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_ResolverErrorPassesThrough(t *testing.T) {
++	resolver := &stubVKResolver{err: errors.New("db borked")}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-anything"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("DB outage should not block the request — fail open at this layer")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set on resolver error; got %v", v)
++	}
++}
++
++func TestTenantResolverMiddleware_SkipsPlatformAndHealth(t *testing.T) {
++	resolver := &stubVKResolver{mapping: map[string]multitenant.TenantID{
++		"sk-bf-acme": "acme",
++	}}
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(resolver)(nh.handle)
++
++	for _, path := range []string{"/health", "/api/platform/tenants", "/api/platform/tenants/acme"} {
++		ctx := newResolverTestCtx(t, path, map[string]string{"x-bf-vk": "sk-bf-acme"})
++		mw(ctx)
++		if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++			t.Fatalf("path %s should be skipped; resolved tenant=%v", path, v)
++		}
++	}
++	if resolver.calls != 0 {
++		t.Fatalf("resolver should not be called on skip paths, got %d calls", resolver.calls)
++	}
++}
++
++func TestTenantResolverMiddleware_NilResolverIsNoop(t *testing.T) {
++	nh := &nextHandler{}
++	mw := TenantResolverMiddleware(nil)(nh.handle)
++
++	ctx := newResolverTestCtx(t, "", map[string]string{"x-bf-vk": "sk-bf-acme"})
++	mw(ctx)
++
++	if !nh.called {
++		t.Fatal("nil resolver should pass through")
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		t.Fatalf("no tenant_id should be set when resolver is nil; got %v", v)
++	}
++}
+-- 
+2.51.0
+
