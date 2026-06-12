@@ -2108,7 +2108,7 @@ cmd-setup-workspace-ci: ## Set up Go workspace for CI builds (resolves local mod
 	@go work sync
 	@$(ECHO) "$(GREEN)Go workspace ready$(NC)"
 
-cmd-unittest: cmd-setup-workspace-ci apply-patches install-gotestsum ## Run deterministic (no-network) Go unit tests against the F5XC-patched tree (go.work); writes per-module coverage_out/coverage-<mod>-bl profiles + JUnit. Pair with `coverage-all-bl`.
+cmd-unittest: apply-patches cmd-setup-workspace-ci install-gotestsum ## Run deterministic (no-network) Go unit tests against the F5XC-patched tree (go.work); writes per-module coverage_out/coverage-<mod>-bl profiles + JUnit. Pair with `coverage-all-bl`. Order matters: patches must apply BEFORE workspace init, since some patches add new local modules (e.g. multitenant) that go.work needs to use.
 	@mkdir -p $(TEST_REPORTS_DIR) $(COVERAGE_DIR)
 	@# Patches are applied (apply-patches) and the workspace is set up
 	@# (cmd-setup-workspace-ci) so each module resolves the local, patched
@@ -2147,7 +2147,7 @@ coverage-all-bl: ## Merge cmd-unittest per-module profiles -> coverage_out/cover
 	go tool cover -func $(COVERAGE_DIR)/cover-all-bl | tail -1
 
 
-cmd-build-bifrost-aigw: cmd-setup-workspace-ci apply-patches ## Build bifrost-aigw binary for CI (applies F5XC patches in-place)
+cmd-build-bifrost-aigw: apply-patches cmd-setup-workspace-ci ## Build bifrost-aigw binary for CI (applies F5XC patches in-place). Order matters: patches must apply BEFORE workspace init so newly-added local modules (e.g. multitenant) are picked up by go.work.
 	@$(ECHO) "$(GREEN)Building bifrost-aigw binary...$(NC)"
 	@mkdir -p transports/bifrost-http/ui && echo '<!-- placeholder -->' > transports/bifrost-http/ui/.keep
 	@mkdir -p "$(GOBIN_OUT)"
