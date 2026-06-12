@@ -1,0 +1,206 @@
+From 80e4b4cab16e74aaf904a6cbbf11dc74ebcbc2a7 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 09:36:35 -0600
+Subject: [PATCH] configstore: add GetProvidersConfigByTenant for per-tenant
+ runtime loading
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the per-tenant provider lookup the upcoming MultiTenantRouter
+needs to build a TenantScopedAccount for each tenant runtime.
+
+  GetProvidersConfigByTenant(ctx, tenantID) (map[ModelProvider]ProviderConfig, error)
+
+Empty tenant id is normalized to tables.DefaultTenantID so single-
+tenant call sites that haven't been routed through the tenant
+resolver yet still see the seeded default tenant's providers.
+
+Implementation details:
+  - Internal getProvidersConfigInternal(tenantID) backs both
+    GetProvidersConfig (legacy global) and the per-tenant variant.
+  - Preload("Keys") gets a callback that scopes by tenant_id too,
+    so a tenant never sees another tenant's keys via the relationship.
+  - WHERE tenant_id = ? is applied only when tenantID != ""; empty
+    keeps the legacy global semantics for the unchanged accessor.
+
+Tests:
+  - TestGetProvidersConfigByTenant_IsolatesProvidersBetweenTenants:
+    two tenants register "openai" — each sees only its own
+  - TestGetProvidersConfigByTenant_EmptyTenantNormalizesToDefault:
+    empty tenant id resolves to DefaultTenantID
+
+MockConfigStore in transports/bifrost-http/lib/config_test.go gains
+the new method (no-op delegate to the existing global accessor —
+multi-tenant scoping is tested against the real RDBConfigStore).
+
+NOT in this patch (deferred to 0016 — the load-bearing one):
+  - TenantScopedAccount that uses this query
+  - MultiTenantRouter dispatch
+  - Inference handler call-site refactor through the router
+  - server.go wiring (middleware + Manager + Loader)
+  - lib/ctx.go tenant_id lift onto BifrostContext
+
+Splitting keeps the storage layer change reviewable in isolation.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go               | 35 +++++++++++++-
+ framework/configstore/rdb_test.go          | 56 ++++++++++++++++++++++
+ framework/configstore/store.go             |  7 +++
+ transports/bifrost-http/lib/config_test.go |  7 +++
+ 4 files changed, 103 insertions(+), 2 deletions(-)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 4379cea2f..087f07f4d 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1161,12 +1161,43 @@ func (s *RDBConfigStore) DeleteProvider(ctx context.Context, provider schemas.Mo
+ 
+ // GetProvidersConfig retrieves the provider configuration from the database.
+ func (s *RDBConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error) {
++	return s.getProvidersConfigInternal(ctx, "")
++}
++
++// GetProvidersConfigByTenant retrieves provider configs scoped to a single
++// tenant. Empty tenant id is normalized to tables.DefaultTenantID so the
++// single-tenant call sites that haven't been routed through the resolver
++// yet still see the seeded default tenant's providers.
++func (s *RDBConfigStore) GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.getProvidersConfigInternal(ctx, tenantID)
++}
++
++// getProvidersConfigInternal is the shared implementation. An empty
++// tenantID returns all rows (the legacy global-Get semantics); a
++// non-empty value adds WHERE tenant_id = ? to both the provider query
++// and the preloaded keys query so a tenant never sees another tenant's
++// keys via the relationship.
++func (s *RDBConfigStore) getProvidersConfigInternal(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error) {
++	q := s.DB().WithContext(ctx).Preload("Keys", func(db *gorm.DB) *gorm.DB {
++		if tenantID == "" {
++			return db
++		}
++		return db.Where("tenant_id = ?", tenantID)
++	})
++	if tenantID != "" {
++		q = q.Where("tenant_id = ?", tenantID)
++	}
++
+ 	var dbProviders []tables.TableProvider
+-	if err := s.DB().WithContext(ctx).Preload("Keys").Find(&dbProviders).Error; err != nil {
++	if err := q.Find(&dbProviders).Error; err != nil {
+ 		return nil, err
+ 	}
+ 	if len(dbProviders) == 0 {
+-		// No providers in database, auto-detect from environment
++		// No providers for this scope; let callers fall back to env-var
++		// auto-detection (matches legacy GetProvidersConfig behaviour).
+ 		return nil, nil
+ 	}
+ 	processedProviders := make(map[schemas.ModelProvider]ProviderConfig)
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index 2cedc6484..c06dbd15a 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -1795,3 +1795,59 @@ func TestDeletePromptSession(t *testing.T) {
+ 		assert.Len(t, versions, 2)
+ 	})
+ }
++
++// =============================================================================
++// GetProvidersConfigByTenant
++// =============================================================================
++
++// TestGetProvidersConfigByTenant_IsolatesProvidersBetweenTenants verifies
++// that two tenants with overlapping provider Names see disjoint provider
++// configs when queried by tenant_id. Patches 0007–0010 made (tenant_id,
++// name) the composite-unique key on config_providers; this test confirms
++// the by-tenant query honours that.
++func TestGetProvidersConfigByTenant_IsolatesProvidersBetweenTenants(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	// Two tenants both register an "openai" provider.
++	for _, p := range []*tables.TableProvider{
++		{Name: "openai", TenantID: "tenant-a"},
++		{Name: "openai", TenantID: "tenant-b"},
++	} {
++		require.NoError(t, store.DB().WithContext(ctx).Create(p).Error)
++	}
++
++	a, err := store.GetProvidersConfigByTenant(ctx, "tenant-a")
++	require.NoError(t, err)
++	require.NotNil(t, a)
++	assert.Len(t, a, 1, "tenant-a should only see its own openai")
++
++	b, err := store.GetProvidersConfigByTenant(ctx, "tenant-b")
++	require.NoError(t, err)
++	require.NotNil(t, b)
++	assert.Len(t, b, 1, "tenant-b should only see its own openai")
++
++	// GetProvidersConfig (no tenant filter) still returns both — it's the
++	// global accessor used by legacy single-tenant boot paths.
++	all, err := store.GetProvidersConfig(ctx)
++	require.NoError(t, err)
++	assert.Len(t, all, 1, "global Get returns 1 entry because the map key is provider name; both rows collapse to one entry")
++}
++
++func TestGetProvidersConfigByTenant_EmptyTenantNormalizesToDefault(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	// Insert a provider explicitly assigned to the default tenant.
++	require.NoError(t, store.DB().WithContext(ctx).Create(&tables.TableProvider{
++		Name:     "openai",
++		TenantID: tables.DefaultTenantID,
++	}).Error)
++
++	// Querying with an empty tenant id should resolve to the default tenant
++	// and return its row, so single-tenant callers that haven't been
++	// migrated to pass an explicit tenant id keep working.
++	got, err := store.GetProvidersConfigByTenant(ctx, "")
++	require.NoError(t, err)
++	require.Len(t, got, 1)
++}
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index 080372ff4..dcff56cd6 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -124,6 +124,13 @@ type ConfigStore interface {
+ 	UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error
+ 	GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error)
++	// GetProvidersConfigByTenant returns the provider config map scoped to
++	// a single tenant — only rows whose tenant_id matches are returned.
++	// The MultiTenantRouter calls this to build the per-tenant
++	// schemas.Account each runtime is initialized from. Empty tenant id
++	// is treated as the DefaultTenantID for single-tenant call sites
++	// that haven't been migrated yet.
++	GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error)
+ 	GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*ProviderConfig, error)
+ 	GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error)
+ 	GetProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string) (*schemas.Key, error)
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index d7475ce9e..5104fc200 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -479,6 +479,13 @@ func (m *MockConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.M
+ 	return m.providers, nil
+ }
+ 
++// GetProvidersConfigByTenant — the mock is single-tenant; ignore tenantID and
++// return the same map as GetProvidersConfig. Multi-tenant scoping is tested
++// against the real RDBConfigStore in framework/configstore.
++func (m *MockConfigStore) GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]configstore.ProviderConfig, error) {
++	return m.GetProvidersConfig(ctx)
++}
++
+ func (m *MockConfigStore) AddProvider(ctx context.Context, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
+ 	m.providers[provider] = config
+ 	return nil
+-- 
+2.51.0
+
