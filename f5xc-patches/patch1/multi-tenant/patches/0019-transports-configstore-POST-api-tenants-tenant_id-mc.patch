@@ -1,0 +1,707 @@
+From ad2e16360014efe77f46b135d3cbbd329b3a56ce Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Fri, 12 Jun 2026 21:39:45 -0600
+Subject: [PATCH] transports+configstore: POST
+ /api/tenants/{tenant_id}/mcp/clients (admin create per-tenant MCP)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completes the per-tenant inference plane: providers (patch 0016) +
+VKs (patch 0017) + MCP (this patch) is the minimum set the user
+needs to drive /v1/chat/completions and /v1/mcp/tool/execute on a
+per-tenant basis.
+
+configstore additions:
+- ConfigStore.GetMCPConfigByTenant(ctx, tenantID) returns only MCP
+  clients whose tenant_id matches. Empty tenantID normalizes to
+  DefaultTenantID, matching the existing providers-by-tenant policy.
+  Shared with GetMCPConfig via a private getMCPConfigInternal helper.
+- ConfigStore.CreateMCPClientConfigForTenant(ctx, tenantID, config)
+  pins tenantID on the new TableMCPClient row so it is only visible
+  to GetMCPConfigByTenant(tenantID). Shared with CreateMCPClientConfig
+  via createMCPClientConfigInternal. Uniqueness check is now
+  (tenant_id, name) — two tenants can both register an MCP client
+  called "tools".
+- MockConfigStore updated.
+- Tests covering: tenant_id write isolation, two tenants same MCP name
+  via composite uniqueness.
+
+Transport additions:
+- handlers.TenantMCPHandler with POST /api/tenants/{tenant_id}/mcp/clients.
+  Minimum-viable payload (id optional, name + connection_type required,
+  optional connection_string), mints a UUID if no id is supplied,
+  calls CreateMCPClientConfigForTenant, evicts the per-tenant runtime.
+  Tests covering: happy path, explicit id pass-through, missing-name,
+  missing-connection-type, missing-tenant-ctx, nil-store rejection.
+- Wires into server.go alongside the other tenant-scoped handlers.
+- The per-tenant Bifrost runtime loader in buildInferenceRouter now
+  also loads MCPConfig via GetMCPConfigByTenant so a fresh Acquire
+  picks up the tenant's MCP clients without a process restart.
+
+Layer 1 integration test extended to provision an MCP client per
+tenant with the same name "tools" but distinct connection strings,
+then assert GetMCPConfigByTenant returns the right one for each tenant
+(would catch any cross-tenant leakage at the storage layer).
+
+Out of scope: GET / PUT / DELETE on /api/tenants/{tid}/mcp/clients,
+OAuth flow + admin-login + tool-discovery shape from the legacy
+/api/mcp/client endpoint, allowed-extra-headers, tool pricing. Those
+follow once Phase 4's AuthzPlugin resolves a real tenant-admin caller.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  56 +++++-
+ framework/configstore/rdb_test.go             |  57 ++++++
+ framework/configstore/store.go                |  10 ++
+ .../handlers/mt_integration_test.go           |  48 +++++
+ .../bifrost-http/handlers/tenant_mcp.go       | 129 ++++++++++++++
+ .../bifrost-http/handlers/tenant_mcp_test.go  | 168 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |   8 +
+ transports/bifrost-http/server/server.go      |  27 ++-
+ 8 files changed, 493 insertions(+), 10 deletions(-)
+ create mode 100644 transports/bifrost-http/handlers/tenant_mcp.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_mcp_test.go
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 170373310..854aea4c5 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1532,9 +1532,32 @@ func (s *RDBConfigStore) UpdateStatus(ctx context.Context, provider schemas.Mode
+ 
+ // GetMCPConfig retrieves the MCP configuration from the database.
+ func (s *RDBConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig, error) {
++	return s.getMCPConfigInternal(ctx, "")
++}
++
++// GetMCPConfigByTenant returns the MCP client list scoped to a single
++// tenant. The per-tenant Bifrost runtime loader calls this to populate
++// its MCPConfig so each tenant only sees the MCP servers admin-provisioned
++// for them. Empty tenantID is normalized to DefaultTenantID, matching the
++// providers-by-tenant policy.
++func (s *RDBConfigStore) GetMCPConfigByTenant(ctx context.Context, tenantID string) (*schemas.MCPConfig, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.getMCPConfigInternal(ctx, tenantID)
++}
++
++// getMCPConfigInternal is the shared implementation. An empty tenantID
++// returns all rows (legacy global behavior); a non-empty value adds
++// WHERE tenant_id = ? to the MCP client query so cross-tenant leakage
++// is impossible.
++func (s *RDBConfigStore) getMCPConfigInternal(ctx context.Context, tenantID string) (*schemas.MCPConfig, error) {
+ 	var dbMCPClients []tables.TableMCPClient
+-	// Get all MCP clients
+-	if err := s.DB().WithContext(ctx).Find(&dbMCPClients).Error; err != nil {
++	q := s.DB().WithContext(ctx)
++	if tenantID != "" {
++		q = q.Where("tenant_id = ?", tenantID)
++	}
++	if err := q.Find(&dbMCPClients).Error; err != nil {
+ 		return nil, err
+ 	}
+ 	var clientConfig tables.TableClientConfig
+@@ -1706,10 +1729,32 @@ func (s *RDBConfigStore) GetMCPClientByName(ctx context.Context, name string) (*
+ 
+ // CreateMCPClientConfig creates a new MCP client configuration in the database.
+ func (s *RDBConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfig *schemas.MCPClientConfig) error {
++	return s.createMCPClientConfigInternal(ctx, tables.DefaultTenantID, clientConfig)
++}
++
++// CreateMCPClientConfigForTenant is the tenant-scoped form: pins
++// tenantID onto the created row so it is only visible to
++// GetMCPConfigByTenant(tenantID). Empty tenantID normalizes to the
++// seeded default tenant.
++func (s *RDBConfigStore) CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.createMCPClientConfigInternal(ctx, tenantID, clientConfig)
++}
++
++func (s *RDBConfigStore) createMCPClientConfigInternal(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error {
+ 	return s.DB().Transaction(func(tx *gorm.DB) error {
+-		// Check if a client with the same name already exists
+-		if _, err := s.GetMCPClientByName(ctx, clientConfig.Name); err == nil {
+-			return fmt.Errorf("MCP client with name '%s' already exists", clientConfig.Name)
++		// Check if a client with the same name already exists in this
++		// tenant's scope. Composite unique (tenant_id, name) makes
++		// per-tenant name reuse legal.
++		var collision tables.TableMCPClient
++		err := tx.WithContext(ctx).Where("tenant_id = ? AND name = ?", tenantID, clientConfig.Name).First(&collision).Error
++		if err == nil {
++			return fmt.Errorf("MCP client with name '%s' already exists for tenant '%s'", clientConfig.Name, tenantID)
++		}
++		if !errors.Is(err, gorm.ErrRecordNotFound) {
++			return err
+ 		}
+ 		// Create a deep copy to avoid modifying the original
+ 		clientConfigCopy, err := deepCopy(*clientConfig)
+@@ -1724,6 +1769,7 @@ func (s *RDBConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfig
+ 		dbClient := tables.TableMCPClient{
+ 			ClientID:              clientConfigCopy.ID,
+ 			Name:                  clientConfigCopy.Name,
++			TenantID:              tenantID,
+ 			IsCodeModeClient:      clientConfigCopy.IsCodeModeClient,
+ 			ConnectionType:        string(clientConfigCopy.ConnectionType),
+ 			ConnectionString:      clientConfigCopy.ConnectionString,
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index b540aa807..3f50c9290 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -1925,3 +1925,60 @@ func TestAddProviderForTenant_EmptyTenantNormalizesToDefault(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Len(t, def, 1, "empty tenant id should land in the default tenant scope")
+ }
++
++// TestCreateMCPClientConfigForTenant_WritesTenantID confirms the new
++// mutator pins tenant_id on the new TableMCPClient row and that
++// GetMCPConfigByTenant honors the filter.
++func TestCreateMCPClientConfigForTenant_WritesTenantID(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	mcp := &schemas.MCPClientConfig{
++		ID:               "mcp-acme-1",
++		Name:             "tools",
++		ConnectionType:   schemas.MCPConnectionTypeHTTP,
++		ConnectionString: schemas.NewEnvVar("https://acme.example.com/mcp"),
++	}
++	require.NoError(t, store.CreateMCPClientConfigForTenant(ctx, "acme", mcp))
++
++	acme, err := store.GetMCPConfigByTenant(ctx, "acme")
++	require.NoError(t, err)
++	require.NotNil(t, acme)
++	require.Len(t, acme.ClientConfigs, 1, "acme should see its own MCP client")
++	assert.Equal(t, "tools", acme.ClientConfigs[0].Name)
++
++	def, err := store.GetMCPConfigByTenant(ctx, tables.DefaultTenantID)
++	require.NoError(t, err)
++	if def != nil {
++		assert.Empty(t, def.ClientConfigs, "default tenant must not see acme's MCP client")
++	}
++}
++
++// TestCreateMCPClientConfigForTenant_TwoTenantsSameName confirms (tenant_id,
++// name) composite uniqueness lets two tenants both register an MCP client
++// called "tools" without colliding.
++func TestCreateMCPClientConfigForTenant_TwoTenantsSameName(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	makeMCP := func(id string, url string) *schemas.MCPClientConfig {
++		return &schemas.MCPClientConfig{
++			ID:               id,
++			Name:             "tools",
++			ConnectionType:   schemas.MCPConnectionTypeHTTP,
++			ConnectionString: schemas.NewEnvVar(url),
++		}
++	}
++	require.NoError(t, store.CreateMCPClientConfigForTenant(ctx, "acme", makeMCP("acme-mcp", "https://acme/mcp")))
++	require.NoError(t, store.CreateMCPClientConfigForTenant(ctx, "globex", makeMCP("globex-mcp", "https://globex/mcp")))
++
++	acme, err := store.GetMCPConfigByTenant(ctx, "acme")
++	require.NoError(t, err)
++	require.Len(t, acme.ClientConfigs, 1)
++	assert.Equal(t, "acme-mcp", acme.ClientConfigs[0].ID)
++
++	globex, err := store.GetMCPConfigByTenant(ctx, "globex")
++	require.NoError(t, err)
++	require.Len(t, globex.ClientConfigs, 1)
++	assert.Equal(t, "globex-mcp", globex.ClientConfigs[0].ID)
++}
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index a36dfe7d9..8c7adefb0 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -151,11 +151,21 @@ type ConfigStore interface {
+ 
+ 	// MCP config CRUD
+ 	GetMCPConfig(ctx context.Context) (*schemas.MCPConfig, error)
++	// GetMCPConfigByTenant is the tenant-scoped form of GetMCPConfig.
++	// Only MCP clients with TenantID == tenantID are returned (empty
++	// tenantID normalizes to DefaultTenantID). The MultiTenantRouter
++	// calls this to assemble each tenant's BifrostConfig.MCP.
++	GetMCPConfigByTenant(ctx context.Context, tenantID string) (*schemas.MCPConfig, error)
+ 	GetMCPClientByID(ctx context.Context, id string) (*tables.TableMCPClient, error)
+ 	GetMCPClientConfigByID(ctx context.Context, id string) (*schemas.MCPClientConfig, error)
+ 	GetMCPClientByName(ctx context.Context, name string) (*tables.TableMCPClient, error)
+ 	GetMCPClientsPaginated(ctx context.Context, params MCPClientsQueryParams) ([]tables.TableMCPClient, int64, error)
+ 	CreateMCPClientConfig(ctx context.Context, clientConfig *schemas.MCPClientConfig) error
++	// CreateMCPClientConfigForTenant is the tenant-scoped form of
++	// CreateMCPClientConfig: pins tenantID onto the new TableMCPClient
++	// row so it is only visible to GetMCPConfigByTenant(tenantID).
++	// Empty tenantID is normalized to DefaultTenantID.
++	CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error
+ 	UpdateMCPClientConfig(ctx context.Context, id string, clientConfig *tables.TableMCPClient) error
+ 	DeleteMCPClientConfig(ctx context.Context, id string) error
+ 
+diff --git a/transports/bifrost-http/handlers/mt_integration_test.go b/transports/bifrost-http/handlers/mt_integration_test.go
+index 74d208b9e..18cb23fe3 100644
+--- a/transports/bifrost-http/handlers/mt_integration_test.go
++++ b/transports/bifrost-http/handlers/mt_integration_test.go
+@@ -131,11 +131,16 @@ func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("vk handler: %v", err)
+ 	}
++	mcpHandler, err := NewTenantMCPHandler(store, nil)
++	if err != nil {
++		t.Fatalf("mcp handler: %v", err)
++	}
+ 
+ 	r := router.New()
+ 	tenantsHandler.RegisterRoutes(r)
+ 	providerHandler.RegisterRoutes(r, tenantPathMW)
+ 	vkHandler.RegisterRoutes(r, tenantPathMW)
++	mcpHandler.RegisterRoutes(r, tenantPathMW)
+ 
+ 	// Phase 1 — create both tenants via the platform admin endpoint.
+ 	for _, id := range []string{"acme", "globex"} {
+@@ -171,6 +176,23 @@ func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
+ 		}
+ 	}
+ 
++	// Phase 2b — register an MCP client for each tenant with the same
++	// name 'tools', different connection strings; (tenant_id, name)
++	// composite uniqueness should make this legal and each tenant
++	// should only see its own.
++	for _, tenant := range []string{"acme", "globex"} {
++		body, _ := sonic.Marshal(map[string]any{
++			"name":              "tools",
++			"connection_type":   "http",
++			"connection_string": "https://" + tenant + ".example.com/mcp",
++		})
++		c := invokeRoute(t, r, fasthttp.MethodPost,
++			"/api/tenants/"+tenant+"/mcp/clients", body)
++		if got := c.Response.StatusCode(); got != fasthttp.StatusCreated {
++			t.Fatalf("create mcp for %s: status %d body=%s", tenant, got, string(c.Response.Body()))
++		}
++	}
++
+ 	// Phase 3 — mint a VK for each tenant.
+ 	vkValues := map[string]string{}
+ 	for _, tenant := range []string{"acme", "globex"} {
+@@ -206,6 +228,32 @@ func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
+ 		t.Fatalf("globex should have its own openai with concurrency=8; got %+v", globex)
+ 	}
+ 
++	// Assertion 1b: per-tenant MCP client list is isolated.
++	acmeMCP, err := store.GetMCPConfigByTenant(ctx, "acme")
++	if err != nil {
++		t.Fatalf("get mcp for acme: %v", err)
++	}
++	if acmeMCP == nil || len(acmeMCP.ClientConfigs) != 1 || acmeMCP.ClientConfigs[0].Name != "tools" {
++		t.Fatalf("acme should have its own 'tools' MCP client; got %+v", acmeMCP)
++	}
++	if v := acmeMCP.ClientConfigs[0].ConnectionString; v == nil || v.GetValue() != "https://acme.example.com/mcp" {
++		var got string
++		if v != nil {
++			got = v.GetValue()
++		}
++		t.Fatalf("acme's MCP connection string should not be globex's; raw=%+v GetValue()=%q", v, got)
++	}
++	globexMCP, err := store.GetMCPConfigByTenant(ctx, "globex")
++	if err != nil {
++		t.Fatalf("get mcp for globex: %v", err)
++	}
++	if globexMCP == nil || len(globexMCP.ClientConfigs) != 1 || globexMCP.ClientConfigs[0].Name != "tools" {
++		t.Fatalf("globex should have its own 'tools' MCP client; got %+v", globexMCP)
++	}
++	if v := globexMCP.ClientConfigs[0].ConnectionString; v == nil || v.GetValue() != "https://globex.example.com/mcp" {
++		t.Fatalf("globex's MCP connection string should not be acme's; got %+v", v)
++	}
++
+ 	// Assertion 2: VK resolver maps each VK to the right tenant.
+ 	resolver := multitenant.NewConfigStoreVKResolver(store)
+ 	for tenant, value := range vkValues {
+diff --git a/transports/bifrost-http/handlers/tenant_mcp.go b/transports/bifrost-http/handlers/tenant_mcp.go
+new file mode 100644
+index 000000000..bc8505760
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_mcp.go
+@@ -0,0 +1,129 @@
++// Package handlers — tenant-scoped MCP admin.
++//
++// Mounts POST /api/tenants/{tenant_id}/mcp/clients so platform-admins can
++// provision per-tenant MCP servers. The per-tenant Bifrost runtime
++// loader assembles BifrostConfig.MCP from GetMCPConfigByTenant, so an
++// MCP client created here is only visible to that tenant's
++// /v1/mcp/tool/execute calls.
++//
++// v1 minimum surface: POST only, no OAuth flow, no server-sync. The
++// legacy /api/mcp/client at /api/mcp/client supports the full OAuth +
++// admin-login + tool-discovery flow; that comes under the tenant-scoped
++// route family once Phase 4's AuthzPlugin lands.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	"github.com/google/uuid"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantMCPHandler implements POST /api/tenants/{tenant_id}/mcp/clients.
++type TenantMCPHandler struct {
++	configStore configstore.ConfigStore
++	evictor     TenantRuntimeEvictor
++}
++
++// NewTenantMCPHandler constructs a TenantMCPHandler.
++func NewTenantMCPHandler(configStore configstore.ConfigStore, evictor TenantRuntimeEvictor) (*TenantMCPHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantMCPHandler{configStore: configStore, evictor: evictor}, nil
++}
++
++// RegisterRoutes mounts the tenant-scoped MCP admin routes. middlewares
++// MUST include RequireTenantPathMiddleware (or equivalent).
++func (h *TenantMCPHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.POST("/api/tenants/{tenant_id}/mcp/clients", lib.ChainMiddlewares(h.createMCPClient, middlewares...))
++}
++
++// CreateTenantMCPClientRequest is the minimum-viable payload — enough to
++// register an HTTP or STDIO MCP server with no auth. The legacy
++// MCPClientRequest under /api/mcp/client supports OAuth, headers,
++// allowed-extra-headers, tool-pricing, server-sync, etc.; those can be
++// added under the tenant-scoped route family once tenant-admin auth lands.
++type CreateTenantMCPClientRequest struct {
++	// ClientID is optional; if blank, the server mints a UUID.
++	ClientID string `json:"id,omitempty"`
++	// Name is required (composite-unique with tenant_id).
++	Name string `json:"name"`
++	// ConnectionType is one of the schemas.MCPConnectionType values
++	// (typically "http" or "stdio"). Required.
++	ConnectionType schemas.MCPConnectionType `json:"connection_type"`
++	// ConnectionString is the URL (for HTTP) or command (for STDIO).
++	// Stored as an EnvVar so the value can come from an env reference.
++	ConnectionString *schemas.EnvVar `json:"connection_string,omitempty"`
++}
++
++// CreateTenantMCPClientResponse is what we return on success.
++type CreateTenantMCPClientResponse struct {
++	ID       string `json:"id"`
++	TenantID string `json:"tenant_id"`
++	Name     string `json:"name"`
++}
++
++func (h *TenantMCPHandler) createMCPClient(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++
++	var req CreateTenantMCPClientRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
++		return
++	}
++	if req.ConnectionType == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "connection_type is required")
++		return
++	}
++	if req.ClientID == "" {
++		req.ClientID = uuid.NewString()
++	}
++
++	mcp := &schemas.MCPClientConfig{
++		ID:               req.ClientID,
++		Name:             req.Name,
++		ConnectionType:   req.ConnectionType,
++		ConnectionString: req.ConnectionString,
++	}
++
++	if err := h.configStore.CreateMCPClientConfigForTenant(ctx, string(tid), mcp); err != nil {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("MCP client %s already exists for tenant %s", req.Name, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create MCP client: %v", err))
++		return
++	}
++
++	// Evict the per-tenant runtime so the next inference request that
++	// hits /v1/mcp/tool/execute for this tenant lazy-loads with the
++	// freshly registered MCP client in scope. Without this, the loader's
++	// MCP snapshot stays cached for the runtime's lifetime.
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++
++	SendJSONWithStatus(ctx, CreateTenantMCPClientResponse{
++		ID:       req.ClientID,
++		TenantID: string(tid),
++		Name:     req.Name,
++	}, fasthttp.StatusCreated)
++}
+diff --git a/transports/bifrost-http/handlers/tenant_mcp_test.go b/transports/bifrost-http/handlers/tenant_mcp_test.go
+new file mode 100644
+index 000000000..fe6cd3885
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_mcp_test.go
+@@ -0,0 +1,168 @@
++package handlers
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++type stubMCPStore struct {
++	configstore.ConfigStore // nil embedded; unimplemented methods panic if hit
++	mu                      sync.Mutex
++	created                 []mcpCreateForTenantCall
++	createErr               error
++}
++
++type mcpCreateForTenantCall struct {
++	tenantID string
++	config   *schemas.MCPClientConfig
++}
++
++func (s *stubMCPStore) CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, cfg *schemas.MCPClientConfig) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.createErr != nil {
++		return s.createErr
++	}
++	cp := *cfg
++	s.created = append(s.created, mcpCreateForTenantCall{tenantID: tenantID, config: &cp})
++	return nil
++}
++
++func newTenantMCPCtx(t *testing.T, body string, tid string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/" + tid + "/mcp/clients")
++	req.Header.SetMethod(fasthttp.MethodPost)
++	req.SetBodyString(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	return ctx
++}
++
++func TestTenantMCPHandler_Create_HappyPath_MintsClientID(t *testing.T) {
++	store := &stubMCPStore{}
++	evictor := &stubEvictor{}
++	h, err := NewTenantMCPHandler(store, evictor)
++	if err != nil {
++		t.Fatalf("NewTenantMCPHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{
++		"name":              "tools",
++		"connection_type":   "http",
++		"connection_string": "https://acme.example.com/mcp",
++	})
++	ctx := newTenantMCPCtx(t, string(body), "acme")
++
++	h.createMCPClient(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.created) != 1 {
++		t.Fatalf("CreateMCPClientConfigForTenant calls got %d want 1", len(store.created))
++	}
++	call := store.created[0]
++	if call.tenantID != "acme" {
++		t.Fatalf("tenant id got %q want acme", call.tenantID)
++	}
++	if call.config.Name != "tools" {
++		t.Fatalf("name got %q want tools", call.config.Name)
++	}
++	if call.config.ID == "" {
++		t.Fatal("server should have minted a client id when omitted")
++	}
++
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 || evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("Evict should fire for acme; got %v", evictor.called)
++	}
++}
++
++func TestTenantMCPHandler_Create_RespectsExplicitID(t *testing.T) {
++	store := &stubMCPStore{}
++	h, _ := NewTenantMCPHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{
++		"id":              "mcp-fixed-id",
++		"name":            "tools",
++		"connection_type": "http",
++	})
++	ctx := newTenantMCPCtx(t, string(body), "acme")
++
++	h.createMCPClient(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.created[0].config.ID != "mcp-fixed-id" {
++		t.Fatalf("explicit id should pass through; got %q", store.created[0].config.ID)
++	}
++}
++
++func TestTenantMCPHandler_Create_MissingName(t *testing.T) {
++	store := &stubMCPStore{}
++	h, _ := NewTenantMCPHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"connection_type": "http"})
++	ctx := newTenantMCPCtx(t, string(body), "acme")
++
++	h.createMCPClient(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("missing name should be 400; got %d", got)
++	}
++	if len(store.created) != 0 {
++		t.Fatal("store must not be called when payload invalid")
++	}
++}
++
++func TestTenantMCPHandler_Create_MissingConnectionType(t *testing.T) {
++	store := &stubMCPStore{}
++	h, _ := NewTenantMCPHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "tools"})
++	ctx := newTenantMCPCtx(t, string(body), "acme")
++
++	h.createMCPClient(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("missing connection_type should be 400; got %d", got)
++	}
++}
++
++func TestTenantMCPHandler_Create_MissingTenantCtx(t *testing.T) {
++	store := &stubMCPStore{}
++	h, _ := NewTenantMCPHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "tools", "connection_type": "http"})
++	ctx := newTenantMCPCtx(t, string(body), "")
++
++	h.createMCPClient(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusInternalServerError {
++		t.Fatalf("missing tenant ctx should be 500; got %d", got)
++	}
++}
++
++func TestTenantMCPHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantMCPHandler(nil, nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index e1ff0b18a..a0dba258d 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -573,6 +573,10 @@ func (m *MockConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig,
+ 	return m.mcpConfig, nil
+ }
+ 
++func (m *MockConfigStore) GetMCPConfigByTenant(ctx context.Context, tenantID string) (*schemas.MCPConfig, error) {
++	return m.mcpConfig, nil
++}
++
+ func (m *MockConfigStore) GetMCPClientByID(ctx context.Context, id string) (*tables.TableMCPClient, error) {
+ 	return nil, nil
+ }
+@@ -591,6 +595,10 @@ func (m *MockConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfi
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error {
++	return m.CreateMCPClientConfig(ctx, clientConfig)
++}
++
+ func (m *MockConfigStore) UpdateMCPClientConfig(ctx context.Context, id string, clientConfig *tables.TableMCPClient) error {
+ 	m.mcpClientConfigUpdates = append(m.mcpClientConfigUpdates, struct {
+ 		ID     string
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 49ec23fb4..01e427009 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1154,18 +1154,29 @@ func (s *BifrostHTTPServer) buildInferenceRouter(ctx context.Context, middleware
+ 		return nil, nil, fmt.Errorf("multi-tenant routing requires a ConfigStore")
+ 	}
+ 
+-	// Tenant loader: queries the per-tenant provider snapshot, builds
+-	// a TenantScopedAccount, and returns the BifrostConfig the Manager
+-	// hands to bifrost.Init. Provider configs are loaded eagerly at
++	// Tenant loader: queries the per-tenant provider + MCP snapshots,
++	// builds a TenantScopedAccount, and returns the BifrostConfig the
++	// Manager hands to bifrost.Init. Configs are loaded eagerly at
+ 	// acquire time — the Manager caches the runtime so subsequent
+-	// requests for the same tenant skip the query.
++	// requests for the same tenant skip the queries. A mutation via
++	// the per-tenant admin handlers evicts the runtime so the next
++	// Acquire picks up the change.
+ 	tenantLoader := func(ctx context.Context, tid multitenant.TenantID) (schemas.BifrostConfig, error) {
+ 		providers, err := store.GetProvidersConfigByTenant(ctx, string(tid))
+ 		if err != nil {
+ 			return schemas.BifrostConfig{}, fmt.Errorf("load providers for tenant %q: %w", tid, err)
+ 		}
++		// MCP is best-effort: a tenant with no MCP clients gets an
++		// empty MCPConfig pointer (vs. nil) so the runtime is still
++		// MCP-capable should subsequent admin writes add a client and
++		// trigger an evict-and-reload.
++		mcpConfig, err := store.GetMCPConfigByTenant(ctx, string(tid))
++		if err != nil {
++			return schemas.BifrostConfig{}, fmt.Errorf("load MCP config for tenant %q: %w", tid, err)
++		}
+ 		return schemas.BifrostConfig{
+-			Account: lib.NewTenantScopedAccount(providers),
++			Account:   lib.NewTenantScopedAccount(providers),
++			MCPConfig: mcpConfig,
+ 			// InitialPoolSize / DropExcessRequests / etc. intentionally
+ 			// left at their bifrost.Init defaults. A future patch will
+ 			// extract those from per-tenant settings.
+@@ -1340,6 +1351,12 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 			return fmt.Errorf("failed to initialize tenant virtual key handler: %v", err)
+ 		}
+ 		tenantVKHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++
++		tenantMCPHandler, err := handlers.NewTenantMCPHandler(s.Config.ConfigStore, s.multitenantManager)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant mcp handler: %v", err)
++		}
++		tenantMCPHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
+ 	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+-- 
+2.51.0
+
