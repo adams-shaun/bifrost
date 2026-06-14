@@ -1,0 +1,621 @@
+From 96dc060a8a70d86d3ecc984c64aff4ae0cccdd00 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Sun, 14 Jun 2026 17:46:51 -0600
+Subject: [PATCH] transports+configstore: GET list, GET single, DELETE on
+ /api/tenants/{tid}/providers/...
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completes the read+delete half of the tenant-scoped provider admin so
+the API is ergonomic for E2E provisioning + iteration (no DB-direct
+mutation needed to retry an experiment). PUT/update is deferred — the
+legacy UpdateProvider's key-cascade + VKPC-resync logic is large
+enough to warrant its own patch.
+
+configstore additions:
+- ConfigStore.GetProviderConfigByTenant(ctx, tenantID, provider) matches
+  on (tenant_id, name). Composite uniqueness from patch 0006 makes the
+  lookup deterministic; the existing GetProviderConfig is refactored to
+  delegate through a shared getProviderConfigInternal.
+- ConfigStore.DeleteProviderForTenant(ctx, tenantID, provider) only
+  removes the row whose (tenant_id, name) matches; returns ErrNotFound
+  when the provider exists in another tenant. Existing DeleteProvider
+  now scopes through DefaultTenantID for safety so multi-tenant data
+  can't be wrong-deleted via the legacy single-tenant call shape.
+- MockConfigStore updated.
+- Tests cover: cross-tenant isolation of GET single + ErrNotFound when
+  the provider lives in a different tenant's scope, DELETE removing
+  only the calling tenant's row, DELETE returning ErrNotFound for
+  cross-tenant attempts.
+
+Transport additions:
+- handlers.TenantProviderHandler gains listProviders (GET list),
+  getProvider (GET single), deleteProvider (DELETE). DELETE evicts the
+  per-tenant runtime so the next inference request lazy-loads with
+  the provider removed; redacted reads use ProviderConfig.Redacted()
+  so key values don't leak to admin UIs.
+- Handler tests cover: list filter by tenant, GET single 404 when the
+  provider exists only in another tenant, DELETE happy path + evict,
+  DELETE 404 when nothing matches.
+
+Layer 1 integration test extended with a Phase 4 — delete acme's
+openai via the route, confirm acme's list drops, globex's openai
+survives, and the deleted-provider GET returns 404 (not globex's row,
+the critical cross-tenant safety check).
+
+Out of scope (separate patch): PUT /api/tenants/{tid}/providers/{provider}
+update. Needs a tenant-scoped variant of UpdateProvider that wraps the
+existing key-cascade + VKPC-resync logic with a tenant_id filter on
+the row lookup; non-trivial enough to deserve its own review pass.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  58 ++++++-
+ framework/configstore/rdb_test.go             |  78 +++++++++
+ framework/configstore/store.go                |  12 ++
+ .../handlers/mt_integration_test.go           |  33 +++-
+ .../bifrost-http/handlers/tenant_providers.go |  90 ++++++++++
+ .../handlers/tenant_providers_test.go         | 157 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |   8 +
+ 7 files changed, 430 insertions(+), 6 deletions(-)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 854aea4c5..57569d45b 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1134,19 +1134,43 @@ func (s *RDBConfigStore) addProviderInternal(ctx context.Context, tenantID strin
+ 	return nil
+ }
+ 
+-// DeleteProvider deletes a single provider and all its associated keys from the database.
++// DeleteProvider deletes a single provider and all its associated keys
++// from the database. Single-tenant call sites land on
++// tables.DefaultTenantID so they don't accidentally delete another
++// tenant's provider with the same name.
+ func (s *RDBConfigStore) DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error {
++	return s.deleteProviderInternal(ctx, tables.DefaultTenantID, provider, tx...)
++}
++
++// DeleteProviderForTenant is the tenant-scoped form: only removes the
++// provider whose (tenant_id, name) matches. Empty tenantID normalizes
++// to DefaultTenantID. Returns ErrNotFound when the provider exists in
++// another tenant's scope but not in this one.
++func (s *RDBConfigStore) DeleteProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.deleteProviderInternal(ctx, tenantID, provider, tx...)
++}
++
++func (s *RDBConfigStore) deleteProviderInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
+ 	if len(tx) == 0 {
+ 		return s.DB().WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+-			return s.DeleteProvider(ctx, provider, transaction)
++			return s.deleteProviderInternal(ctx, tenantID, provider, transaction)
+ 		})
+ 	}
+ 
+ 	var txDB *gorm.DB
+ 	txDB = tx[0]
+-	// Find the existing provider
++	// Find the existing provider scoped to the tenant. dbForUpdate
++	// locks the row for the rest of the transaction so cascading
++	// deletes can't race with a concurrent UpdateProvider.
++	q := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider))
++	if tenantID != "" {
++		q = q.Where("tenant_id = ?", tenantID)
++	}
+ 	var dbProvider tables.TableProvider
+-	if err := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
++	if err := q.First(&dbProvider).Error; err != nil {
+ 		if errors.Is(err, gorm.ErrRecordNotFound) {
+ 			return ErrNotFound
+ 		}
+@@ -1255,8 +1279,32 @@ func (s *RDBConfigStore) getProvidersConfigInternal(ctx context.Context, tenantI
+ 
+ // GetProviderConfig retrieves the provider configuration from the database.
+ func (s *RDBConfigStore) GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*ProviderConfig, error) {
++	return s.getProviderConfigInternal(ctx, "", provider)
++}
++
++// GetProviderConfigByTenant is the tenant-scoped form: matches on
++// (tenant_id, name). The composite uniqueness from patch 0006 makes
++// the lookup deterministic across tenants. Empty tenantID normalizes
++// to DefaultTenantID.
++func (s *RDBConfigStore) GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.getProviderConfigInternal(ctx, tenantID, provider)
++}
++
++func (s *RDBConfigStore) getProviderConfigInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error) {
++	q := s.DB().WithContext(ctx).Preload("Keys", func(db *gorm.DB) *gorm.DB {
++		if tenantID == "" {
++			return db
++		}
++		return db.Where("tenant_id = ?", tenantID)
++	}).Where("name = ?", string(provider))
++	if tenantID != "" {
++		q = q.Where("tenant_id = ?", tenantID)
++	}
+ 	var dbProvider tables.TableProvider
+-	if err := s.DB().WithContext(ctx).Preload("Keys").Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
++	if err := q.First(&dbProvider).Error; err != nil {
+ 		if errors.Is(err, gorm.ErrRecordNotFound) {
+ 			return nil, ErrNotFound
+ 		}
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index 3f50c9290..fed8f9b6c 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -1954,6 +1954,84 @@ func TestCreateMCPClientConfigForTenant_WritesTenantID(t *testing.T) {
+ 	}
+ }
+ 
++// TestGetProviderConfigByTenant_IsolatesByTenant confirms two tenants
++// with overlapping provider names get back their own row.
++func TestGetProviderConfigByTenant_IsolatesByTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	makeCfg := func(keyID string) ProviderConfig {
++		return ProviderConfig{
++			Keys: []schemas.Key{{ID: keyID, Value: *schemas.NewEnvVar(keyID)}},
++		}
++	}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", makeCfg("acme-key")))
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", makeCfg("globex-key")))
++
++	got, err := store.GetProviderConfigByTenant(ctx, "acme", "openai")
++	require.NoError(t, err)
++	require.Len(t, got.Keys, 1)
++	assert.Equal(t, "acme-key", got.Keys[0].ID)
++
++	got, err = store.GetProviderConfigByTenant(ctx, "globex", "openai")
++	require.NoError(t, err)
++	require.Len(t, got.Keys, 1)
++	assert.Equal(t, "globex-key", got.Keys[0].ID)
++}
++
++// TestGetProviderConfigByTenant_OtherTenantNotFound asserts that a
++// tenant's get for a provider name that exists in another tenant's
++// scope returns ErrNotFound, not the other tenant's row.
++func TestGetProviderConfigByTenant_OtherTenantNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	cfg := ProviderConfig{Keys: []schemas.Key{{ID: "k", Value: *schemas.NewEnvVar("sk-x")}}}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", cfg))
++
++	_, err := store.GetProviderConfigByTenant(ctx, "globex", "openai")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestDeleteProviderForTenant_OnlyRemovesOwnTenant confirms deleting
++// "openai" for tenant acme leaves globex's "openai" intact. Uses
++// distinct key IDs because TableKey.KeyID is globally unique (it is
++// referenced by OauthUserToken FKs).
++func TestDeleteProviderForTenant_OnlyRemovesOwnTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	makeCfg := func(keyID string) ProviderConfig {
++		return ProviderConfig{
++			Keys: []schemas.Key{{ID: keyID, Value: *schemas.NewEnvVar(keyID)}},
++		}
++	}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", makeCfg("acme-k")))
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", makeCfg("globex-k")))
++
++	require.NoError(t, store.DeleteProviderForTenant(ctx, "acme", "openai"))
++
++	_, err := store.GetProviderConfigByTenant(ctx, "acme", "openai")
++	assert.ErrorIs(t, err, ErrNotFound, "acme should no longer have openai")
++
++	_, err = store.GetProviderConfigByTenant(ctx, "globex", "openai")
++	assert.NoError(t, err, "globex's openai must survive acme's delete")
++}
++
++// TestDeleteProviderForTenant_NotFoundInThisTenant confirms that
++// deleting a provider that exists in another tenant's scope returns
++// ErrNotFound rather than silently deleting cross-tenant.
++func TestDeleteProviderForTenant_NotFoundInThisTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	cfg := ProviderConfig{Keys: []schemas.Key{{ID: "k", Value: *schemas.NewEnvVar("sk-x")}}}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", cfg))
++
++	err := store.DeleteProviderForTenant(ctx, "globex", "openai")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
+ // TestCreateMCPClientConfigForTenant_TwoTenantsSameName confirms (tenant_id,
+ // name) composite uniqueness lets two tenants both register an MCP client
+ // called "tools" without colliding.
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index 8c7adefb0..1a1f6eb73 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -131,6 +131,12 @@ type ConfigStore interface {
+ 	AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error
++	// DeleteProviderForTenant is the tenant-scoped form of DeleteProvider:
++	// only removes the row whose (tenant_id, name) matches. Empty
++	// tenantID normalizes to DefaultTenantID. Returns ErrNotFound when
++	// the provider exists in another tenant but not in this one — this
++	// is the contract callers rely on to surface a 404.
++	DeleteProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error
+ 	GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error)
+ 	// GetProvidersConfigByTenant returns the provider config map scoped to
+ 	// a single tenant — only rows whose tenant_id matches are returned.
+@@ -140,6 +146,12 @@ type ConfigStore interface {
+ 	// that haven't been migrated yet.
+ 	GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error)
+ 	GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*ProviderConfig, error)
++	// GetProviderConfigByTenant is the tenant-scoped form of
++	// GetProviderConfig: matches on (tenant_id, name) so two tenants can
++	// both have a provider called "openai" without colliding. Returns
++	// ErrNotFound when the tenant has no provider by that name. Empty
++	// tenantID normalizes to DefaultTenantID.
++	GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error)
+ 	GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error)
+ 	GetProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string) (*schemas.Key, error)
+ 	CreateProviderKey(ctx context.Context, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error
+diff --git a/transports/bifrost-http/handlers/mt_integration_test.go b/transports/bifrost-http/handlers/mt_integration_test.go
+index 18cb23fe3..875bbdf1a 100644
+--- a/transports/bifrost-http/handlers/mt_integration_test.go
++++ b/transports/bifrost-http/handlers/mt_integration_test.go
+@@ -285,7 +285,6 @@ func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
+ 		handle.Release()
+ 	}
+ 	loader.mu.Lock()
+-	defer loader.mu.Unlock()
+ 	if len(loader.loaded) != 2 {
+ 		t.Fatalf("loader should have been invoked for both tenants; got %v", loader.loaded)
+ 	}
+@@ -296,6 +295,38 @@ func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
+ 	if !seen["acme"] || !seen["globex"] {
+ 		t.Fatalf("both tenants should have lazy-loaded; got %v", loader.loaded)
+ 	}
++	loader.mu.Unlock()
++
++	// Phase 4 — DELETE acme's provider via the tenant-scoped admin
++	// endpoint, then assert the store no longer returns it for acme
++	// while globex stays untouched. Exercises GET single (404), GET
++	// list (count drop), and DELETE in one pass.
++	delResp := invokeRoute(t, r, fasthttp.MethodDelete, "/api/tenants/acme/providers/openai", nil)
++	if got, want := delResp.Response.StatusCode(), fasthttp.StatusNoContent; got != want {
++		t.Fatalf("delete acme openai: status %d want %d body=%s", got, want, string(delResp.Response.Body()))
++	}
++
++	acmeAfter, err := store.GetProvidersConfigByTenant(ctx, "acme")
++	if err != nil {
++		t.Fatalf("post-delete list for acme: %v", err)
++	}
++	if _, exists := acmeAfter["openai"]; exists {
++		t.Fatal("acme's openai should be gone after delete")
++	}
++	globexAfter, err := store.GetProvidersConfigByTenant(ctx, "globex")
++	if err != nil {
++		t.Fatalf("post-delete list for globex: %v", err)
++	}
++	if _, exists := globexAfter["openai"]; !exists {
++		t.Fatal("globex's openai must survive a sibling-tenant delete")
++	}
++
++	// GET single for the deleted provider returns 404, not globex's
++	// row (the most important cross-tenant safety check).
++	getResp := invokeRoute(t, r, fasthttp.MethodGet, "/api/tenants/acme/providers/openai", nil)
++	if got, want := getResp.Response.StatusCode(), fasthttp.StatusNotFound; got != want {
++		t.Fatalf("get deleted provider: status %d want %d body=%s", got, want, string(getResp.Response.Body()))
++	}
+ }
+ 
+ // TestMultiTenantAdmin_RequireTenantPath_RejectsCrossTenant proves the
+diff --git a/transports/bifrost-http/handlers/tenant_providers.go b/transports/bifrost-http/handlers/tenant_providers.go
+index c72159781..40a621d98 100644
+--- a/transports/bifrost-http/handlers/tenant_providers.go
++++ b/transports/bifrost-http/handlers/tenant_providers.go
+@@ -63,7 +63,10 @@ func (h *TenantProviderHandler) RegisterRoutes(r *router.Router, middlewares ...
+ 	if h.configStore == nil {
+ 		return
+ 	}
++	r.GET("/api/tenants/{tenant_id}/providers", lib.ChainMiddlewares(h.listProviders, middlewares...))
+ 	r.POST("/api/tenants/{tenant_id}/providers", lib.ChainMiddlewares(h.createProvider, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.getProvider, middlewares...))
++	r.DELETE("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.deleteProvider, middlewares...))
+ }
+ 
+ // createProvider — POST /api/tenants/{tenant_id}/providers
+@@ -164,6 +167,93 @@ func (h *TenantProviderHandler) createProvider(ctx *fasthttp.RequestCtx) {
+ 	}, fasthttp.StatusCreated)
+ }
+ 
++// listProviders — GET /api/tenants/{tenant_id}/providers
++//
++// Returns the tenant's full provider map (config redacted via the
++// store's Redacted() helper so key values don't leak). The response
++// shape matches the legacy /api/providers list endpoint enough to
++// support the same UI; callers that care should treat the v1 shape
++// as a JSON object keyed by provider name.
++func (h *TenantProviderHandler) listProviders(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providers, err := h.configStore.GetProvidersConfigByTenant(ctx, string(tid))
++	if err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list providers: %v", err))
++		return
++	}
++	redacted := make(map[string]any, len(providers))
++	for name, cfg := range providers {
++		redacted[string(name)] = cfg.Redacted()
++	}
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"providers": redacted,
++		"total":     len(redacted),
++	})
++}
++
++// getProvider — GET /api/tenants/{tenant_id}/providers/{provider}
++func (h *TenantProviderHandler) getProvider(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	if providerStr == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider is required")
++		return
++	}
++	cfg, err := h.configStore.GetProviderConfigByTenant(ctx, string(tid), schemas.ModelProvider(providerStr))
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"provider":  providerStr,
++		"config":    cfg.Redacted(),
++	})
++}
++
++// deleteProvider — DELETE /api/tenants/{tenant_id}/providers/{provider}
++//
++// 404 when the provider doesn't exist in this tenant's scope, 204 on
++// success. Evicts the per-tenant runtime so the next inference request
++// lazy-loads with the provider removed.
++func (h *TenantProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	if providerStr == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider is required")
++		return
++	}
++	if err := h.configStore.DeleteProviderForTenant(ctx, string(tid), schemas.ModelProvider(providerStr)); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete provider: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	ctx.SetStatusCode(fasthttp.StatusNoContent)
++}
++
+ // tenantIDFromCtx pulls the tenant_id off the fasthttp ctx, returning
+ // (tid, false) when missing. Centralised here so callers don't repeat the
+ // user-value lookup + type assertion.
+diff --git a/transports/bifrost-http/handlers/tenant_providers_test.go b/transports/bifrost-http/handlers/tenant_providers_test.go
+index 79c044357..0ab9fce45 100644
+--- a/transports/bifrost-http/handlers/tenant_providers_test.go
++++ b/transports/bifrost-http/handlers/tenant_providers_test.go
+@@ -176,3 +176,160 @@ func TestTenantProviderHandler_CreateProvider_StoreError(t *testing.T) {
+ 		t.Fatalf("ErrAlreadyExists should map to 409, got %d", got)
+ 	}
+ }
++
++// Extend stubProviderStore with GET + DELETE surfaces so the read/write
++// CRUD handlers can be exercised without dragging in a real DB.
++
++func (s *stubProviderStore) GetProvidersConfigByTenant(_ context.Context, tenantID string) (map[schemas.ModelProvider]configstore.ProviderConfig, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := map[schemas.ModelProvider]configstore.ProviderConfig{}
++	for _, call := range s.calls {
++		if call.tenantID == tenantID {
++			out[call.provider] = call.config
++		}
++	}
++	return out, nil
++}
++
++func (s *stubProviderStore) GetProviderConfigByTenant(_ context.Context, tenantID string, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, call := range s.calls {
++		if call.tenantID == tenantID && call.provider == provider {
++			cfg := call.config
++			return &cfg, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubProviderStore) DeleteProviderForTenant(_ context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, call := range s.calls {
++		if call.tenantID == tenantID && call.provider == provider {
++			s.calls = append(s.calls[:i], s.calls[i+1:]...)
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func TestTenantProviderHandler_ListProviders_FiltersByTenant(t *testing.T) {
++	store := &stubProviderStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	// Seed: two providers for acme, one for globex.
++	for _, c := range []addProviderForTenantCall{
++		{tenantID: "acme", provider: "openai", config: configstore.ProviderConfig{}},
++		{tenantID: "acme", provider: "anthropic", config: configstore.ProviderConfig{}},
++		{tenantID: "globex", provider: "openai", config: configstore.ProviderConfig{}},
++	} {
++		store.calls = append(store.calls, c)
++	}
++
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers")
++	req.Header.SetMethod(fasthttp.MethodGet)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++
++	h.listProviders(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusOK; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	var resp struct {
++		TenantID  string                 `json:"tenant_id"`
++		Providers map[string]interface{} `json:"providers"`
++		Total     int                    `json:"total"`
++	}
++	if err := sonic.Unmarshal(ctx.Response.Body(), &resp); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if resp.TenantID != "acme" {
++		t.Fatalf("tenant_id echo got %q want acme", resp.TenantID)
++	}
++	if resp.Total != 2 {
++		t.Fatalf("acme should see 2 providers; got %d (providers=%v)", resp.Total, resp.Providers)
++	}
++	if _, ok := resp.Providers["openai"]; !ok {
++		t.Fatal("acme should see openai")
++	}
++	if _, ok := resp.Providers["anthropic"]; !ok {
++		t.Fatal("acme should see anthropic")
++	}
++}
++
++func TestTenantProviderHandler_GetProvider_NotFound(t *testing.T) {
++	store := &stubProviderStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	// Provision for globex; acme should not find openai.
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "globex", provider: "openai"})
++
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers/openai")
++	req.Header.SetMethod(fasthttp.MethodGet)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("provider", "openai")
++
++	h.getProvider(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusNotFound; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++}
++
++func TestTenantProviderHandler_DeleteProvider_HappyPath_Evicts(t *testing.T) {
++	store := &stubProviderStore{}
++	evictor := &stubEvictor{}
++	h, _ := NewTenantProviderHandler(store, evictor)
++
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "acme", provider: "openai"})
++
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers/openai")
++	req.Header.SetMethod(fasthttp.MethodDelete)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("provider", "openai")
++
++	h.deleteProvider(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusNoContent; got != want {
++		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
++	}
++	if len(store.calls) != 0 {
++		t.Fatalf("store should no longer have the provider; calls=%v", store.calls)
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 || evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("Evict should fire for acme; got %v", evictor.called)
++	}
++}
++
++func TestTenantProviderHandler_DeleteProvider_NotFound(t *testing.T) {
++	store := &stubProviderStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers/openai")
++	req.Header.SetMethod(fasthttp.MethodDelete)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("provider", "openai")
++
++	h.deleteProvider(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusNotFound; got != want {
++		t.Fatalf("status got %d want %d", got, want)
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index a0dba258d..3def7ee4b 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -506,6 +506,10 @@ func (m *MockConfigStore) DeleteProvider(ctx context.Context, provider schemas.M
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) DeleteProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
++	return m.DeleteProvider(ctx, provider, tx...)
++}
++
+ func (m *MockConfigStore) GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error) {
+ 	config, ok := m.providers[provider]
+ 	if !ok {
+@@ -1106,6 +1110,10 @@ func (m *MockConfigStore) GetProviders(ctx context.Context) ([]tables.TableProvi
+ 	return nil, nil
+ }
+ 
++func (m *MockConfigStore) GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
++	return m.GetProviderConfig(ctx, provider)
++}
++
+ func (m *MockConfigStore) GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
+ 	return nil, nil
+ }
+-- 
+2.51.0
+
