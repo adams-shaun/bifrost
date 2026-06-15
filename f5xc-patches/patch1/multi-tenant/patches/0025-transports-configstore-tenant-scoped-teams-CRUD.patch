@@ -1,0 +1,789 @@
+From 350816dabb6a50fefe6e4a32c5606a9d1435ef4b Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Sun, 14 Jun 2026 22:07:13 -0600
+Subject: [PATCH] transports+configstore: tenant-scoped teams CRUD under
+ /api/tenants/{tid}/governance/teams
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Starts extending the per-tenant admin surface beyond the inference
+plane entities into governance metadata. Teams are tagging metadata
+attached to VKs (and indirectly to customers) so the runtime registry
+doesn't lazy-load them — the evictor pattern from providers / VKs /
+MCP is intentionally not wired here. A team mutation shows up in
+subsequent admin reads + on any VK whose team_id pointer the
+operator updates.
+
+configstore additions (delegate-then-verify, tenant_id re-pinned on
+the row before delegating):
+- ConfigStore.CreateTeamForTenant — pins tenant_id on the new row.
+- ConfigStore.GetTeamsByTenant — list scoped to a tenant, with
+  optional customer_id filter (same shape as GetTeams).
+- ConfigStore.GetTeamByIDForTenant — single, cross-tenant ErrNotFound.
+- ConfigStore.UpdateTeamForTenant — verify ownership, re-pin
+  tenant_id, delegate to UpdateTeam.
+- ConfigStore.DeleteTeamForTenant — verify ownership, delegate to
+  DeleteTeam (which still handles the VK.team_id null-out + budget
+  cascade).
+- MockConfigStore stubs (single-implementation delegation).
+- Tests cover: full create/list/get/update/delete happy path across
+  two tenants showing isolation; cross-tenant GET/DELETE return
+  ErrNotFound; malicious payload trying to migrate the team via
+  tenant_id in body is re-pinned.
+
+Transport additions:
+- handlers.TenantTeamsHandler with POST/GET-list/GET-single/PUT/DELETE
+  under /api/tenants/{tid}/governance/teams[/{team_id}]. POST mints
+  a UUID when id is omitted. PUT accepts optional name + customer_id;
+  empty patch → 400. DELETE returns 204 on success and 404 for
+  cross-tenant probes.
+- Wires into server.go under the same multi-tenant gate that mounts
+  the provider/VK/MCP handlers.
+- 8 handler tests covering: happy-path POST + minting; LIST tenant
+  filter; GET cross-tenant 404; PUT happy path + empty body; DELETE
+  happy path + cross-tenant 404 with target row preserved; nil-store
+  rejection at construction.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  81 ++++++
+ framework/configstore/rdb_test.go             |  65 +++++
+ framework/configstore/store.go                |  16 ++
+ .../bifrost-http/handlers/tenant_teams.go     | 205 ++++++++++++++
+ .../handlers/tenant_teams_test.go             | 257 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |  20 ++
+ transports/bifrost-http/server/server.go      |   6 +
+ 7 files changed, 650 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/tenant_teams.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_teams_test.go
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index a2a28da44..0680d87df 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -3614,6 +3614,75 @@ func (s *RDBConfigStore) CreateTeam(ctx context.Context, team *tables.TableTeam,
+ 	return nil
+ }
+ 
++// CreateTeamForTenant pins tenant_id on the new row before delegating
++// to CreateTeam.
++func (s *RDBConfigStore) CreateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if team == nil {
++		return ErrNotFound
++	}
++	team.TenantID = tenantID
++	return s.CreateTeam(ctx, team, tx...)
++}
++
++// GetTeamsByTenant lists teams scoped to a tenant. Empty tenantID
++// normalizes to DefaultTenantID. Optional customerID further filters
++// the result the same way GetTeams does.
++func (s *RDBConfigStore) GetTeamsByTenant(ctx context.Context, tenantID, customerID string) ([]tables.TableTeam, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	q := s.ScopedDB(ctx).
++		Select(teamSelectWithVKCount).
++		Preload("Customer").Preload("Budgets").Preload("RateLimit").
++		Where("governance_teams.tenant_id = ?", tenantID)
++	if customerID != "" {
++		q = q.Where("governance_teams.customer_id = ?", customerID)
++	}
++	var teams []tables.TableTeam
++	if err := q.Order("governance_teams.created_at ASC").Find(&teams).Error; err != nil {
++		return nil, err
++	}
++	return teams, nil
++}
++
++// GetTeamByIDForTenant returns the team only when its tenant_id
++// matches the supplied tenantID; otherwise ErrNotFound.
++func (s *RDBConfigStore) GetTeamByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableTeam, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	t, err := s.GetTeam(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if t.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	return t, nil
++}
++
++// UpdateTeamForTenant verifies tenant ownership before delegating
++// to UpdateTeam. tenant_id is re-pinned on the row so a malicious
++// payload can't migrate the team into another tenant's scope.
++func (s *RDBConfigStore) UpdateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if team == nil || team.ID == "" {
++		return ErrNotFound
++	}
++	existing, err := s.GetTeamByIDForTenant(ctx, tenantID, team.ID)
++	if err != nil {
++		return err
++	}
++	team.ID = existing.ID
++	team.TenantID = tenantID
++	return s.UpdateTeam(ctx, team, tx...)
++}
++
+ // UpdateTeam updates an existing team in the database.
+ func (s *RDBConfigStore) UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error {
+ 	var txDB *gorm.DB
+@@ -3628,6 +3697,18 @@ func (s *RDBConfigStore) UpdateTeam(ctx context.Context, team *tables.TableTeam,
+ 	return nil
+ }
+ 
++// DeleteTeamForTenant verifies tenant ownership before delegating
++// to DeleteTeam.
++func (s *RDBConfigStore) DeleteTeamForTenant(ctx context.Context, tenantID, id string) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if _, err := s.GetTeamByIDForTenant(ctx, tenantID, id); err != nil {
++		return err
++	}
++	return s.DeleteTeam(ctx, id)
++}
++
+ // DeleteTeam deletes a team from the database.
+ // Owned budgets cascade via the governance_budgets.team_id FK.
+ // Rate limit is a sibling row (team holds a FK to it) — deleted explicitly.
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index 57d88390a..7331490ad 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -2191,6 +2191,71 @@ func TestDeleteVirtualKeyForTenant_OnlyOwnTenant(t *testing.T) {
+ 	assert.ErrorIs(t, err, ErrNotFound)
+ }
+ 
++// TestTeamsCRUDForTenant covers the full happy path on the
++// tenant-scoped team CRUD: create + list-by-tenant returns own rows,
++// update flips a field, delete removes from the tenant's view but
++// cross-tenant delete probes are refused with ErrNotFound.
++func TestTeamsCRUDForTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	// Create a team in each tenant.
++	require.NoError(t, store.CreateTeamForTenant(ctx, "acme", &tables.TableTeam{ID: "t-acme", Name: "acme-eng"}))
++	require.NoError(t, store.CreateTeamForTenant(ctx, "globex", &tables.TableTeam{ID: "t-globex", Name: "globex-eng"}))
++
++	// List per tenant is isolated.
++	acme, err := store.GetTeamsByTenant(ctx, "acme", "")
++	require.NoError(t, err)
++	assert.Len(t, acme, 1)
++	assert.Equal(t, "acme-eng", acme[0].Name)
++
++	globex, err := store.GetTeamsByTenant(ctx, "globex", "")
++	require.NoError(t, err)
++	assert.Len(t, globex, 1)
++
++	// Cross-tenant GET-single returns ErrNotFound (not the foreign row).
++	_, err = store.GetTeamByIDForTenant(ctx, "acme", "t-globex")
++	assert.ErrorIs(t, err, ErrNotFound)
++
++	// Update flips a field.
++	updated := &tables.TableTeam{ID: "t-acme", Name: "acme-platform"}
++	require.NoError(t, store.UpdateTeamForTenant(ctx, "acme", updated))
++	after, err := store.GetTeamByIDForTenant(ctx, "acme", "t-acme")
++	require.NoError(t, err)
++	assert.Equal(t, "acme-platform", after.Name)
++
++	// Cross-tenant DELETE returns ErrNotFound and globex's team survives.
++	err = store.DeleteTeamForTenant(ctx, "acme", "t-globex")
++	assert.ErrorIs(t, err, ErrNotFound)
++	_, err = store.GetTeamByIDForTenant(ctx, "globex", "t-globex")
++	require.NoError(t, err)
++
++	// Own-tenant DELETE removes the row from its tenant's view.
++	require.NoError(t, store.DeleteTeamForTenant(ctx, "acme", "t-acme"))
++	_, err = store.GetTeamByIDForTenant(ctx, "acme", "t-acme")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestUpdateTeamForTenant_RepinsTenantOnPayload defends against a
++// malicious payload that tries to migrate a team into a different
++// tenant via PUT.
++func TestUpdateTeamForTenant_RepinsTenantOnPayload(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	require.NoError(t, store.CreateTeamForTenant(ctx, "acme", &tables.TableTeam{ID: "t-1", Name: "engineering"}))
++
++	bad := &tables.TableTeam{ID: "t-1", Name: "engineering-renamed", TenantID: "globex"}
++	require.NoError(t, store.UpdateTeamForTenant(ctx, "acme", bad))
++
++	// The row stays with acme. globex still cannot see it.
++	_, err := store.GetTeamByIDForTenant(ctx, "globex", "t-1")
++	assert.ErrorIs(t, err, ErrNotFound)
++	stillAcme, err := store.GetTeamByIDForTenant(ctx, "acme", "t-1")
++	require.NoError(t, err)
++	assert.Equal(t, "acme", stillAcme.TenantID)
++}
++
+ // TestUpdateProviderForTenant_OwnTenantSucceeds covers the happy path —
+ // updating a tenant's provider config flips the requested field and
+ // is observable through the tenant-scoped read API.
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index 970e93f56..ae06a2101 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -284,8 +284,24 @@ type ConfigStore interface {
+ 	GetTeamByName(ctx context.Context, name string, customerID string) (*tables.TableTeam, error)
+ 	GetTeamBySourceID(ctx context.Context, sourceID string) (*tables.TableTeam, error)
+ 	CreateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error
++	// CreateTeamForTenant pins tenant_id on the new TableTeam row.
++	// Empty tenantID normalizes to DefaultTenantID.
++	CreateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error
+ 	UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error
++	// UpdateTeamForTenant verifies tenant ownership before delegating
++	// to UpdateTeam. tenant_id is re-pinned on the row.
++	UpdateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error
+ 	DeleteTeam(ctx context.Context, id string) error
++	// DeleteTeamForTenant verifies tenant ownership before delegating
++	// to DeleteTeam. Cross-tenant probes return ErrNotFound.
++	DeleteTeamForTenant(ctx context.Context, tenantID, id string) error
++	// GetTeamsByTenant lists teams scoped to a tenant, optionally
++	// filtered by customer_id. Empty tenantID normalizes to
++	// DefaultTenantID.
++	GetTeamsByTenant(ctx context.Context, tenantID, customerID string) ([]tables.TableTeam, error)
++	// GetTeamByIDForTenant returns the team only when its tenant_id
++	// matches; otherwise ErrNotFound.
++	GetTeamByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableTeam, error)
+ 
+ 	// Customer CRUD
+ 	GetCustomers(ctx context.Context) ([]tables.TableCustomer, error)
+diff --git a/transports/bifrost-http/handlers/tenant_teams.go b/transports/bifrost-http/handlers/tenant_teams.go
+new file mode 100644
+index 000000000..3cc460e09
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_teams.go
+@@ -0,0 +1,205 @@
++// Package handlers — tenant-scoped governance team admin.
++//
++// Mounts CRUD under /api/tenants/{tenant_id}/governance/teams. The
++// runtime registry does not lazy-load teams (they're tagging metadata,
++// not request-path state), so the evictor pattern from the inference-
++// path entities is not wired here. A team change shows up in subsequent
++// admin reads + on any VK whose team_id pointer the operator updates.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	"github.com/google/uuid"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantTeamsHandler exposes tenant-scoped team CRUD.
++type TenantTeamsHandler struct {
++	configStore configstore.ConfigStore
++}
++
++// NewTenantTeamsHandler constructs a handler. configStore is required.
++func NewTenantTeamsHandler(configStore configstore.ConfigStore) (*TenantTeamsHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantTeamsHandler{configStore: configStore}, nil
++}
++
++// RegisterRoutes mounts the tenant-scoped team admin routes. middlewares
++// MUST include RequireTenantPathMiddleware (or equivalent).
++func (h *TenantTeamsHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.GET("/api/tenants/{tenant_id}/governance/teams", lib.ChainMiddlewares(h.listTeams, middlewares...))
++	r.POST("/api/tenants/{tenant_id}/governance/teams", lib.ChainMiddlewares(h.createTeam, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/governance/teams/{team_id}", lib.ChainMiddlewares(h.getTeam, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/governance/teams/{team_id}", lib.ChainMiddlewares(h.updateTeam, middlewares...))
++	r.DELETE("/api/tenants/{tenant_id}/governance/teams/{team_id}", lib.ChainMiddlewares(h.deleteTeam, middlewares...))
++}
++
++// CreateTenantTeamRequest is the POST body. id is optional (UUID minted).
++type CreateTenantTeamRequest struct {
++	ID         string  `json:"id,omitempty"`
++	Name       string  `json:"name"`
++	CustomerID *string `json:"customer_id,omitempty"`
++}
++
++// UpdateTenantTeamRequest is the PUT body. Pointer fields are optional.
++type UpdateTenantTeamRequest struct {
++	Name       *string `json:"name,omitempty"`
++	CustomerID *string `json:"customer_id,omitempty"`
++}
++
++func (h *TenantTeamsHandler) listTeams(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	customerID := string(ctx.QueryArgs().Peek("customer_id"))
++	teams, err := h.configStore.GetTeamsByTenant(ctx, string(tid), customerID)
++	if err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list teams: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"teams":     teams,
++		"total":     len(teams),
++	})
++}
++
++func (h *TenantTeamsHandler) createTeam(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	var req CreateTenantTeamRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
++		return
++	}
++	if req.ID == "" {
++		req.ID = uuid.NewString()
++	}
++	team := &configstoreTables.TableTeam{
++		ID:         req.ID,
++		Name:       req.Name,
++		CustomerID: req.CustomerID,
++	}
++	if err := h.configStore.CreateTeamForTenant(ctx, string(tid), team); err != nil {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Team %s already exists for tenant %s", req.Name, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create team: %v", err))
++		return
++	}
++	SendJSONWithStatus(ctx, team, fasthttp.StatusCreated)
++}
++
++func (h *TenantTeamsHandler) getTeam(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	teamID, _ := ctx.UserValue("team_id").(string)
++	if teamID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "team_id is required")
++		return
++	}
++	team, err := h.configStore.GetTeamByIDForTenant(ctx, string(tid), teamID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Team %s not found for tenant %s", teamID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get team: %v", err))
++		return
++	}
++	SendJSON(ctx, team)
++}
++
++func (h *TenantTeamsHandler) updateTeam(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	teamID, _ := ctx.UserValue("team_id").(string)
++	if teamID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "team_id is required")
++		return
++	}
++	var req UpdateTenantTeamRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == nil && req.CustomerID == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "at least one of name, customer_id is required")
++		return
++	}
++	existing, err := h.configStore.GetTeamByIDForTenant(ctx, string(tid), teamID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Team %s not found for tenant %s", teamID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load team: %v", err))
++		return
++	}
++	if req.Name != nil {
++		existing.Name = *req.Name
++	}
++	if req.CustomerID != nil {
++		existing.CustomerID = req.CustomerID
++	}
++	if err := h.configStore.UpdateTeamForTenant(ctx, string(tid), existing); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Team %s not found for tenant %s", teamID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update team: %v", err))
++		return
++	}
++	SendJSON(ctx, existing)
++}
++
++func (h *TenantTeamsHandler) deleteTeam(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	teamID, _ := ctx.UserValue("team_id").(string)
++	if teamID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "team_id is required")
++		return
++	}
++	if err := h.configStore.DeleteTeamForTenant(ctx, string(tid), teamID); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Team %s not found for tenant %s", teamID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete team: %v", err))
++		return
++	}
++	ctx.SetStatusCode(fasthttp.StatusNoContent)
++}
+diff --git a/transports/bifrost-http/handlers/tenant_teams_test.go b/transports/bifrost-http/handlers/tenant_teams_test.go
+new file mode 100644
+index 000000000..6cc98c2d8
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_teams_test.go
+@@ -0,0 +1,257 @@
++package handlers
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
++)
++
++// stubTeamsStore is the minimum ConfigStore surface this handler needs.
++type stubTeamsStore struct {
++	configstore.ConfigStore // unimplemented methods panic
++	mu                      sync.Mutex
++	teams                   []*configstoreTables.TableTeam
++	createErr               error
++}
++
++func (s *stubTeamsStore) CreateTeamForTenant(_ context.Context, tenantID string, team *configstoreTables.TableTeam, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.createErr != nil {
++		return s.createErr
++	}
++	cp := *team
++	cp.TenantID = tenantID
++	s.teams = append(s.teams, &cp)
++	return nil
++}
++
++func (s *stubTeamsStore) GetTeamsByTenant(_ context.Context, tenantID, customerID string) ([]configstoreTables.TableTeam, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	var out []configstoreTables.TableTeam
++	for _, t := range s.teams {
++		if t.TenantID != tenantID {
++			continue
++		}
++		if customerID != "" && (t.CustomerID == nil || *t.CustomerID != customerID) {
++			continue
++		}
++		out = append(out, *t)
++	}
++	return out, nil
++}
++
++func (s *stubTeamsStore) GetTeamByIDForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableTeam, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, t := range s.teams {
++		if t.ID == id && t.TenantID == tenantID {
++			cp := *t
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubTeamsStore) UpdateTeamForTenant(_ context.Context, tenantID string, team *configstoreTables.TableTeam, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, t := range s.teams {
++		if t.ID == team.ID && t.TenantID == tenantID {
++			cp := *team
++			cp.TenantID = tenantID
++			s.teams[i] = &cp
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func (s *stubTeamsStore) DeleteTeamForTenant(_ context.Context, tenantID, id string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, t := range s.teams {
++		if t.ID == id && t.TenantID == tenantID {
++			s.teams = append(s.teams[:i], s.teams[i+1:]...)
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func newTeamCtx(t *testing.T, method, path, body, tid, teamID string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if body != "" {
++		req.SetBodyString(body)
++		req.Header.SetContentType("application/json")
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	if teamID != "" {
++		ctx.SetUserValue("team_id", teamID)
++	}
++	return ctx
++}
++
++func TestTenantTeamsHandler_Create_HappyPath_MintsID(t *testing.T) {
++	store := &stubTeamsStore{}
++	h, err := NewTenantTeamsHandler(store)
++	if err != nil {
++		t.Fatalf("NewTenantTeamsHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{"name": "engineering"})
++	ctx := newTeamCtx(t, fasthttp.MethodPost, "/api/tenants/acme/governance/teams", string(body), "acme", "")
++
++	h.createTeam(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.teams) != 1 || store.teams[0].Name != "engineering" {
++		t.Fatalf("team should have been created with name engineering; got %+v", store.teams)
++	}
++	if store.teams[0].ID == "" {
++		t.Fatal("server should mint id when omitted")
++	}
++	if store.teams[0].TenantID != "acme" {
++		t.Fatalf("tenant_id got %q want acme", store.teams[0].TenantID)
++	}
++}
++
++func TestTenantTeamsHandler_List_FiltersByTenant(t *testing.T) {
++	store := &stubTeamsStore{}
++	store.teams = append(store.teams,
++		&configstoreTables.TableTeam{ID: "t-a", Name: "acme-eng", TenantID: "acme"},
++		&configstoreTables.TableTeam{ID: "t-a2", Name: "acme-platform", TenantID: "acme"},
++		&configstoreTables.TableTeam{ID: "t-g", Name: "globex-eng", TenantID: "globex"},
++	)
++	h, _ := NewTenantTeamsHandler(store)
++
++	ctx := newTeamCtx(t, fasthttp.MethodGet, "/api/tenants/acme/governance/teams", "", "acme", "")
++
++	h.listTeams(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	var resp struct {
++		Teams []configstoreTables.TableTeam `json:"teams"`
++		Total int                           `json:"total"`
++	}
++	if err := sonic.Unmarshal(ctx.Response.Body(), &resp); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if resp.Total != 2 {
++		t.Fatalf("acme should see 2 teams; got %d", resp.Total)
++	}
++}
++
++func TestTenantTeamsHandler_Get_CrossTenant_NotFound(t *testing.T) {
++	store := &stubTeamsStore{}
++	store.teams = append(store.teams, &configstoreTables.TableTeam{ID: "t-globex", TenantID: "globex"})
++	h, _ := NewTenantTeamsHandler(store)
++
++	ctx := newTeamCtx(t, fasthttp.MethodGet, "/api/tenants/acme/governance/teams/t-globex", "", "acme", "t-globex")
++
++	h.getTeam(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant GET should be 404; got %d", got)
++	}
++}
++
++func TestTenantTeamsHandler_Update_HappyPath(t *testing.T) {
++	store := &stubTeamsStore{}
++	store.teams = append(store.teams, &configstoreTables.TableTeam{ID: "t-1", Name: "before", TenantID: "acme"})
++	h, _ := NewTenantTeamsHandler(store)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "after"})
++	ctx := newTeamCtx(t, fasthttp.MethodPut, "/api/tenants/acme/governance/teams/t-1", string(body), "acme", "t-1")
++
++	h.updateTeam(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.teams[0].Name != "after" {
++		t.Fatalf("name should have flipped; got %q", store.teams[0].Name)
++	}
++}
++
++func TestTenantTeamsHandler_Update_RejectsEmpty(t *testing.T) {
++	store := &stubTeamsStore{}
++	store.teams = append(store.teams, &configstoreTables.TableTeam{ID: "t-1", TenantID: "acme"})
++	h, _ := NewTenantTeamsHandler(store)
++
++	ctx := newTeamCtx(t, fasthttp.MethodPut, "/api/tenants/acme/governance/teams/t-1", `{}`, "acme", "t-1")
++
++	h.updateTeam(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("empty patch should be 400; got %d", got)
++	}
++}
++
++func TestTenantTeamsHandler_Delete_HappyPath(t *testing.T) {
++	store := &stubTeamsStore{}
++	store.teams = append(store.teams, &configstoreTables.TableTeam{ID: "t-1", TenantID: "acme"})
++	h, _ := NewTenantTeamsHandler(store)
++
++	ctx := newTeamCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/governance/teams/t-1", "", "acme", "t-1")
++
++	h.deleteTeam(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNoContent {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.teams) != 0 {
++		t.Fatal("team should be gone")
++	}
++}
++
++func TestTenantTeamsHandler_Delete_CrossTenant_NotFound(t *testing.T) {
++	store := &stubTeamsStore{}
++	store.teams = append(store.teams, &configstoreTables.TableTeam{ID: "t-globex", TenantID: "globex"})
++	h, _ := NewTenantTeamsHandler(store)
++
++	ctx := newTeamCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/governance/teams/t-globex", "", "acme", "t-globex")
++
++	h.deleteTeam(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant DELETE should be 404; got %d", got)
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.teams) != 1 {
++		t.Fatal("globex's team should survive a cross-tenant delete attempt")
++	}
++}
++
++func TestTenantTeamsHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantTeamsHandler(nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index 161a25dee..db255a695 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -839,6 +839,26 @@ func (m *MockConfigStore) CreateTeam(ctx context.Context, team *tables.TableTeam
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) CreateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
++	return m.CreateTeam(ctx, team, tx...)
++}
++
++func (m *MockConfigStore) UpdateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
++	return m.UpdateTeam(ctx, team, tx...)
++}
++
++func (m *MockConfigStore) DeleteTeamForTenant(ctx context.Context, tenantID, id string) error {
++	return m.DeleteTeam(ctx, id)
++}
++
++func (m *MockConfigStore) GetTeamsByTenant(ctx context.Context, tenantID, customerID string) ([]tables.TableTeam, error) {
++	return m.GetTeams(ctx, customerID)
++}
++
++func (m *MockConfigStore) GetTeamByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableTeam, error) {
++	return m.GetTeam(ctx, id)
++}
++
+ func (m *MockConfigStore) UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error {
+ 	return nil
+ }
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 01e427009..64543044e 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1357,6 +1357,12 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 			return fmt.Errorf("failed to initialize tenant mcp handler: %v", err)
+ 		}
+ 		tenantMCPHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++
++		tenantTeamsHandler, err := handlers.NewTenantTeamsHandler(s.Config.ConfigStore)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant teams handler: %v", err)
++		}
++		tenantTeamsHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
+ 	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+-- 
+2.51.0
+
