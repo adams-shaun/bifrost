@@ -1,0 +1,796 @@
+From f679c808cb122d0c4a7f852ce5f3ab4f6364e8f2 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Sun, 14 Jun 2026 19:57:24 -0600
+Subject: [PATCH] transports+configstore: per-tenant provider keys CRUD under
+ /api/tenants/{tid}/providers/{provider}/keys
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the most-requested ergonomic gap on the per-tenant admin
+surface: operators can now rotate per-tenant credentials (add new
+key, switch the rotation flag, delete the old key) without recreating
+the whole provider.
+
+configstore additions (delegate-then-verify; CreateProviderKeyForTenant
+also pins tenant_id on the new TableKey row so it stays visible only to
+the calling tenant):
+- ConfigStore.GetProviderKeysForTenant — filters both the provider join
+  AND the config_keys rows by tenant_id, so a tenant with a same-named
+  provider as another tenant cannot see the other tenant's keys.
+- ConfigStore.GetProviderKeyForTenant — single-row variant that collapses
+  to ErrNotFound on cross-tenant probes.
+- ConfigStore.CreateProviderKeyForTenant — refactored CreateProviderKey
+  through createProviderKeyInternal so both the legacy (DefaultTenantID
+  pinned) and the tenant-scoped form share the create logic. The new
+  TableKey row gets tenant_id explicitly so it's only visible to the
+  calling tenant.
+- ConfigStore.DeleteProviderKeyForTenant — verify-then-delegate around
+  the existing DeleteProviderKey transaction.
+- MockConfigStore stubs added (single-implementation delegation).
+- Tests cover: per-tenant rotation flow with two tenants holding
+  same-named providers; cross-tenant create rejection (ErrNotFound);
+  cross-tenant get/delete probes returning ErrNotFound.
+
+Transport additions:
+- handlers.TenantProviderHandler gains listProviderKeys, createProviderKey,
+  getProviderKey, deleteProviderKey under
+  /api/tenants/{tid}/providers/{provider}/keys[/{key_id}]. POST mints a
+  UUID for id when omitted; list + get redact key values on the wire so
+  an operator UI cannot read back stored secrets via the admin API.
+  POST + DELETE evict the per-tenant runtime so the next inference
+  acquires with the new key set.
+- Handler tests cover: happy-path create with evict, parent-not-found
+  404, missing fields 400, list redaction, get cross-tenant 404,
+  delete happy-path with evict.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  95 ++++++-
+ framework/configstore/rdb_test.go             |  92 +++++++
+ framework/configstore/store.go                |  16 ++
+ .../bifrost-http/handlers/tenant_providers.go | 171 +++++++++++++
+ .../handlers/tenant_providers_test.go         | 236 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |  16 ++
+ 6 files changed, 623 insertions(+), 3 deletions(-)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index cd5887191..c9f25b300 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1365,6 +1365,44 @@ func (s *RDBConfigStore) GetProviderKeys(ctx context.Context, provider schemas.M
+ 	return keys, nil
+ }
+ 
++// GetProviderKeysForTenant lists keys for a tenant-scoped provider.
++// Filters both the provider join AND the key rows by tenant_id so a
++// tenant cannot see another tenant's keys even when both have a
++// provider with the same name.
++func (s *RDBConfigStore) GetProviderKeysForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	var dbKeys []tables.TableKey
++	result := s.DB().WithContext(ctx).
++		Table("config_providers").
++		Select("config_keys.*").
++		Joins("LEFT JOIN config_keys ON config_keys.provider_id = config_providers.id AND config_keys.tenant_id = ?", tenantID).
++		Where("config_providers.name = ? AND config_providers.tenant_id = ?", string(provider), tenantID).
++		Order("config_keys.created_at ASC").
++		Scan(&dbKeys)
++	if result.Error != nil {
++		return nil, result.Error
++	}
++	if result.RowsAffected == 0 {
++		return nil, ErrNotFound
++	}
++	if len(dbKeys) == 1 && dbKeys[0].ID == 0 && dbKeys[0].KeyID == "" {
++		return []schemas.Key{}, nil
++	}
++	keys := make([]schemas.Key, 0, len(dbKeys))
++	for _, dbKey := range dbKeys {
++		if dbKey.ID == 0 && dbKey.KeyID == "" {
++			continue
++		}
++		if err := dbKey.AfterFind(nil); err != nil {
++			return nil, err
++		}
++		keys = append(keys, schemaKeyFromTableKey(dbKey))
++	}
++	return keys, nil
++}
++
+ func (s *RDBConfigStore) getProviderKeyByName(ctx context.Context, txDB *gorm.DB, provider schemas.ModelProvider, keyID string) (*tables.TableKey, error) {
+ 	var dbKey tables.TableKey
+ 	if err := dbForUpdate(txDB.WithContext(ctx)).
+@@ -1392,18 +1430,56 @@ func (s *RDBConfigStore) GetProviderKey(ctx context.Context, provider schemas.Mo
+ 	return &key, nil
+ }
+ 
+-// CreateProviderKey creates a new key for an existing provider.
++// GetProviderKeyForTenant is the tenant-scoped form. Returns ErrNotFound
++// when the key exists under a different tenant.
++func (s *RDBConfigStore) GetProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	dbKey, err := s.getProviderKeyByName(ctx, s.DB(), provider, keyID)
++	if err != nil {
++		return nil, err
++	}
++	if dbKey.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	key := schemaKeyFromTableKey(*dbKey)
++	return &key, nil
++}
++
++// CreateProviderKey creates a new key for an existing provider. Single-
++// tenant call shape — DefaultTenantID is pinned on both the provider
++// lookup and the new key row to avoid cross-tenant footguns from the
++// legacy code path.
+ func (s *RDBConfigStore) CreateProviderKey(ctx context.Context, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
++	return s.createProviderKeyInternal(ctx, tables.DefaultTenantID, provider, key, tx...)
++}
++
++// CreateProviderKeyForTenant is the tenant-scoped form: verifies the
++// parent provider exists in tenantID's scope, then pins tenantID on
++// the new TableKey row so it stays visible only to that tenant.
++func (s *RDBConfigStore) CreateProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.createProviderKeyInternal(ctx, tenantID, provider, key, tx...)
++}
++
++func (s *RDBConfigStore) createProviderKeyInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
+ 	if len(tx) == 0 {
+ 		return s.DB().WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+-			return s.CreateProviderKey(ctx, provider, key, transaction)
++			return s.createProviderKeyInternal(ctx, tenantID, provider, key, transaction)
+ 		})
+ 	}
+ 
+ 	var txDB *gorm.DB
+ 	txDB = tx[0]
++	q := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider))
++	if tenantID != "" {
++		q = q.Where("tenant_id = ?", tenantID)
++	}
+ 	var dbProvider tables.TableProvider
+-	if err := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
++	if err := q.First(&dbProvider).Error; err != nil {
+ 		if errors.Is(err, gorm.ErrRecordNotFound) {
+ 			return ErrNotFound
+ 		}
+@@ -1413,6 +1489,7 @@ func (s *RDBConfigStore) CreateProviderKey(ctx context.Context, provider schemas
+ 	if err != nil {
+ 		return err
+ 	}
++	dbKey.TenantID = tenantID
+ 	if err := txDB.WithContext(ctx).Create(&dbKey).Error; err != nil {
+ 		return s.parseGormError(err)
+ 	}
+@@ -1457,6 +1534,18 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
+ 	return nil
+ }
+ 
++// DeleteProviderKeyForTenant verifies tenant ownership before
++// delegating to DeleteProviderKey. Cross-tenant probes ErrNotFound.
++func (s *RDBConfigStore) DeleteProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if _, err := s.GetProviderKeyForTenant(ctx, tenantID, provider, keyID); err != nil {
++		return err
++	}
++	return s.DeleteProviderKey(ctx, provider, keyID, tx...)
++}
++
+ // DeleteProviderKey deletes a single key for an existing provider.
+ func (s *RDBConfigStore) DeleteProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error {
+ 	if len(tx) == 0 {
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index e4cdcd644..c471f9762 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -2032,6 +2032,98 @@ func TestDeleteProviderForTenant_NotFoundInThisTenant(t *testing.T) {
+ 	assert.ErrorIs(t, err, ErrNotFound)
+ }
+ 
++// TestCreateProviderKeyForTenant_PinsTenantID confirms a key added via
++// the tenant-scoped mutator stays visible only within that tenant's
++// scope. Uses distinct KeyIDs because TableKey.KeyID is globally
++// unique.
++func TestCreateProviderKeyForTenant_PinsTenantID(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	makeCfg := func(keyID string) ProviderConfig {
++		return ProviderConfig{
++			Keys: []schemas.Key{{ID: keyID, Name: keyID, Value: *schemas.NewEnvVar(keyID)}},
++		}
++	}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", makeCfg("acme-initial")))
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", makeCfg("globex-initial")))
++
++	require.NoError(t, store.CreateProviderKeyForTenant(ctx, "acme", "openai", schemas.Key{
++		ID: "acme-rotated", Name: "acme-rotated", Value: *schemas.NewEnvVar("sk-acme-rotated"),
++	}))
++
++	// acme should see two keys; globex still only its original one.
++	acmeKeys, err := store.GetProviderKeysForTenant(ctx, "acme", "openai")
++	require.NoError(t, err)
++	assert.Len(t, acmeKeys, 2, "acme should see initial + rotated")
++
++	globexKeys, err := store.GetProviderKeysForTenant(ctx, "globex", "openai")
++	require.NoError(t, err)
++	assert.Len(t, globexKeys, 1, "globex must not see acme's rotated key")
++}
++
++// TestCreateProviderKeyForTenant_CrossTenantProviderNotFound confirms
++// adding a key to a provider that lives under a different tenant
++// returns ErrNotFound instead of silently writing to the wrong scope.
++func TestCreateProviderKeyForTenant_CrossTenantProviderNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	cfg := ProviderConfig{Keys: []schemas.Key{{ID: "k", Name: "k", Value: *schemas.NewEnvVar("sk-x")}}}
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", cfg))
++
++	err := store.CreateProviderKeyForTenant(ctx, "acme", "openai", schemas.Key{
++		ID: "wrong-tenant", Name: "wrong-tenant", Value: *schemas.NewEnvVar("sk-x"),
++	})
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestGetProviderKeyForTenant_CrossTenantReturnsNotFound asserts looking
++// up a key whose tenant_id is different from the caller's returns
++// ErrNotFound rather than the foreign key's contents.
++func TestGetProviderKeyForTenant_CrossTenantReturnsNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	cfg := ProviderConfig{Keys: []schemas.Key{{ID: "acme-secret", Name: "acme-secret", Value: *schemas.NewEnvVar("sk-acme")}}}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", cfg))
++
++	got, err := store.GetProviderKeyForTenant(ctx, "acme", "openai", "acme-secret")
++	require.NoError(t, err)
++	require.NotNil(t, got)
++
++	_, err = store.GetProviderKeyForTenant(ctx, "globex", "openai", "acme-secret")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestDeleteProviderKeyForTenant_OnlyOwnTenant confirms cross-tenant
++// delete attempts are refused with ErrNotFound and the target row
++// survives.
++func TestDeleteProviderKeyForTenant_OnlyOwnTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	for _, p := range []struct{ tid, keyID string }{
++		{"acme", "acme-key"},
++		{"globex", "globex-key"},
++	} {
++		require.NoError(t, store.AddProviderForTenant(ctx, p.tid, "openai", ProviderConfig{
++			Keys: []schemas.Key{{ID: p.keyID, Name: p.keyID, Value: *schemas.NewEnvVar(p.keyID)}},
++		}))
++	}
++
++	// acme trying to delete globex's key → ErrNotFound; target survives.
++	err := store.DeleteProviderKeyForTenant(ctx, "acme", "openai", "globex-key")
++	assert.ErrorIs(t, err, ErrNotFound)
++	_, err = store.GetProviderKeyForTenant(ctx, "globex", "openai", "globex-key")
++	require.NoError(t, err)
++
++	// Same-tenant delete succeeds.
++	require.NoError(t, store.DeleteProviderKeyForTenant(ctx, "acme", "openai", "acme-key"))
++	_, err = store.GetProviderKeyForTenant(ctx, "acme", "openai", "acme-key")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
+ // TestGetVirtualKeysByTenant_IsolatesByTenant confirms list-by-tenant
+ // returns only the calling tenant's VKs.
+ func TestGetVirtualKeysByTenant_IsolatesByTenant(t *testing.T) {
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index de032ef0f..305b8fcc2 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -153,10 +153,26 @@ type ConfigStore interface {
+ 	// tenantID normalizes to DefaultTenantID.
+ 	GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error)
+ 	GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error)
++	// GetProviderKeysForTenant is the tenant-scoped form of GetProviderKeys.
++	// Filters both the providers and the keys by tenant_id so a tenant
++	// never sees another tenant's keys even when the two have a provider
++	// with the same name. Empty tenantID normalizes to DefaultTenantID.
++	GetProviderKeysForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error)
+ 	GetProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string) (*schemas.Key, error)
++	// GetProviderKeyForTenant is the tenant-scoped form. Cross-tenant
++	// probes return ErrNotFound.
++	GetProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error)
+ 	CreateProviderKey(ctx context.Context, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error
++	// CreateProviderKeyForTenant adds a key to a tenant-scoped provider.
++	// Verifies the parent provider exists in tenantID's scope (returning
++	// ErrNotFound if not), then pins tenantID on the new TableKey row
++	// so it stays visible only to that tenant.
++	CreateProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error
+ 	UpdateProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key, tx ...*gorm.DB) error
+ 	DeleteProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error
++	// DeleteProviderKeyForTenant only removes the key whose tenant_id
++	// matches. Returns ErrNotFound on cross-tenant probes.
++	DeleteProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error
+ 	GetProviders(ctx context.Context) ([]tables.TableProvider, error)
+ 	GetProvider(ctx context.Context, provider schemas.ModelProvider) (*tables.TableProvider, error)
+ 	UpdateStatus(ctx context.Context, provider schemas.ModelProvider, keyID string, status, errorMsg string) error
+diff --git a/transports/bifrost-http/handlers/tenant_providers.go b/transports/bifrost-http/handlers/tenant_providers.go
+index 40a621d98..968950151 100644
+--- a/transports/bifrost-http/handlers/tenant_providers.go
++++ b/transports/bifrost-http/handlers/tenant_providers.go
+@@ -18,6 +18,7 @@ import (
+ 
+ 	"github.com/bytedance/sonic"
+ 	"github.com/fasthttp/router"
++	"github.com/google/uuid"
+ 	bifrost "github.com/maximhq/bifrost/core"
+ 	"github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/framework/configstore"
+@@ -67,6 +68,10 @@ func (h *TenantProviderHandler) RegisterRoutes(r *router.Router, middlewares ...
+ 	r.POST("/api/tenants/{tenant_id}/providers", lib.ChainMiddlewares(h.createProvider, middlewares...))
+ 	r.GET("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.getProvider, middlewares...))
+ 	r.DELETE("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.deleteProvider, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/providers/{provider}/keys", lib.ChainMiddlewares(h.listProviderKeys, middlewares...))
++	r.POST("/api/tenants/{tenant_id}/providers/{provider}/keys", lib.ChainMiddlewares(h.createProviderKey, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.getProviderKey, middlewares...))
++	r.DELETE("/api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.deleteProviderKey, middlewares...))
+ }
+ 
+ // createProvider — POST /api/tenants/{tenant_id}/providers
+@@ -254,6 +259,172 @@ func (h *TenantProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
+ 	ctx.SetStatusCode(fasthttp.StatusNoContent)
+ }
+ 
++// providerKeyCreatePayload accepts a single key. We require name + value
++// at the API boundary; id is optional (server mints a UUID if absent).
++type providerKeyCreatePayload struct {
++	ID    string `json:"id,omitempty"`
++	Name  string `json:"name"`
++	Value string `json:"value"`
++}
++
++// listProviderKeys — GET /api/tenants/{tenant_id}/providers/{provider}/keys
++func (h *TenantProviderHandler) listProviderKeys(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	if providerStr == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider is required")
++		return
++	}
++	keys, err := h.configStore.GetProviderKeysForTenant(ctx, string(tid), schemas.ModelProvider(providerStr))
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list keys: %v", err))
++		return
++	}
++	redactedKeys := make([]schemas.Key, len(keys))
++	for i, k := range keys {
++		redactedKeys[i] = k
++		redactedKeys[i].Value = *schemas.NewEnvVar("REDACTED")
++	}
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"provider":  providerStr,
++		"keys":      redactedKeys,
++		"total":     len(redactedKeys),
++	})
++}
++
++// createProviderKey — POST /api/tenants/{tenant_id}/providers/{provider}/keys
++//
++// Adds a new key to a per-tenant provider. The new TableKey row's
++// tenant_id is pinned to the calling tenant so cross-tenant reads
++// don't pick it up. The per-tenant runtime is evicted so the next
++// inference acquires the new key set.
++func (h *TenantProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	if providerStr == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider is required")
++		return
++	}
++
++	var payload providerKeyCreatePayload
++	if err := sonic.Unmarshal(ctx.PostBody(), &payload); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if payload.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
++		return
++	}
++	if payload.Value == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "value is required")
++		return
++	}
++	if payload.ID == "" {
++		payload.ID = uuid.NewString()
++	}
++
++	key := schemas.Key{
++		ID:    payload.ID,
++		Name:  payload.Name,
++		Value: *schemas.NewEnvVar(payload.Value),
++	}
++	if err := h.configStore.CreateProviderKeyForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), key); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
++			return
++		}
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Key already exists for tenant %s / provider %s", tid, providerStr))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create key: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	SendJSONWithStatus(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"provider":  providerStr,
++		"id":        payload.ID,
++		"name":      payload.Name,
++	}, fasthttp.StatusCreated)
++}
++
++// getProviderKey — GET /api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}
++//
++// Value is redacted on the wire; rotation flows should call create+delete
++// rather than reading back the existing secret.
++func (h *TenantProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	keyID, _ := ctx.UserValue("key_id").(string)
++	if providerStr == "" || keyID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider and key_id are required")
++		return
++	}
++	key, err := h.configStore.GetProviderKeyForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), keyID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Key %s not found for tenant %s / provider %s", keyID, tid, providerStr))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get key: %v", err))
++		return
++	}
++	redacted := *key
++	redacted.Value = *schemas.NewEnvVar("REDACTED")
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"provider":  providerStr,
++		"key":       redacted,
++	})
++}
++
++// deleteProviderKey — DELETE /api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}
++func (h *TenantProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	keyID, _ := ctx.UserValue("key_id").(string)
++	if providerStr == "" || keyID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider and key_id are required")
++		return
++	}
++	if err := h.configStore.DeleteProviderKeyForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), keyID); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Key %s not found for tenant %s / provider %s", keyID, tid, providerStr))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete key: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	ctx.SetStatusCode(fasthttp.StatusNoContent)
++}
++
+ // tenantIDFromCtx pulls the tenant_id off the fasthttp ctx, returning
+ // (tid, false) when missing. Centralised here so callers don't repeat the
+ // user-value lookup + type assertion.
+diff --git a/transports/bifrost-http/handlers/tenant_providers_test.go b/transports/bifrost-http/handlers/tenant_providers_test.go
+index 0ab9fce45..fca2d9bd7 100644
+--- a/transports/bifrost-http/handlers/tenant_providers_test.go
++++ b/transports/bifrost-http/handlers/tenant_providers_test.go
+@@ -333,3 +333,239 @@ func TestTenantProviderHandler_DeleteProvider_NotFound(t *testing.T) {
+ 		t.Fatalf("status got %d want %d", got, want)
+ 	}
+ }
++
++// ---- Provider keys: stub extensions + tests ----
++
++type providerKeyCall struct {
++	tenantID string
++	provider schemas.ModelProvider
++	key      schemas.Key
++}
++
++// stubKeyStore embeds stubProviderStore so it inherits provider stubs
++// and adds tenant-scoped key bookkeeping. Kept separate from
++// stubProviderStore to avoid bloating the simpler provider tests.
++type stubKeyStore struct {
++	stubProviderStore
++	keyCalls []providerKeyCall
++	createErr error
++}
++
++func (s *stubKeyStore) CreateProviderKeyForTenant(_ context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.createErr != nil {
++		return s.createErr
++	}
++	// Require the parent provider to exist for the calling tenant.
++	parentExists := false
++	for _, c := range s.calls {
++		if c.tenantID == tenantID && c.provider == provider {
++			parentExists = true
++			break
++		}
++	}
++	if !parentExists {
++		return configstore.ErrNotFound
++	}
++	s.keyCalls = append(s.keyCalls, providerKeyCall{tenantID: tenantID, provider: provider, key: key})
++	return nil
++}
++
++func (s *stubKeyStore) GetProviderKeysForTenant(_ context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	parentExists := false
++	for _, c := range s.calls {
++		if c.tenantID == tenantID && c.provider == provider {
++			parentExists = true
++			break
++		}
++	}
++	if !parentExists {
++		return nil, configstore.ErrNotFound
++	}
++	out := []schemas.Key{}
++	for _, k := range s.keyCalls {
++		if k.tenantID == tenantID && k.provider == provider {
++			out = append(out, k.key)
++		}
++	}
++	return out, nil
++}
++
++func (s *stubKeyStore) GetProviderKeyForTenant(_ context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, k := range s.keyCalls {
++		if k.tenantID == tenantID && k.provider == provider && k.key.ID == keyID {
++			cp := k.key
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubKeyStore) DeleteProviderKeyForTenant(_ context.Context, tenantID string, provider schemas.ModelProvider, keyID string, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, k := range s.keyCalls {
++		if k.tenantID == tenantID && k.provider == provider && k.key.ID == keyID {
++			s.keyCalls = append(s.keyCalls[:i], s.keyCalls[i+1:]...)
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func newKeyCtx(t *testing.T, method, path, body, tid, provider, keyID string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if body != "" {
++		req.SetBodyString(body)
++		req.Header.SetContentType("application/json")
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	if provider != "" {
++		ctx.SetUserValue("provider", provider)
++	}
++	if keyID != "" {
++		ctx.SetUserValue("key_id", keyID)
++	}
++	return ctx
++}
++
++func TestTenantProviderHandler_CreateProviderKey_HappyPath_Evicts(t *testing.T) {
++	store := &stubKeyStore{}
++	evictor := &stubEvictor{}
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "acme", provider: "openai"})
++
++	h, _ := NewTenantProviderHandler(store, evictor)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "primary", "value": "sk-acme-1"})
++	ctx := newKeyCtx(t, fasthttp.MethodPost, "/api/tenants/acme/providers/openai/keys", string(body), "acme", "openai", "")
++
++	h.createProviderKey(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	if len(store.keyCalls) != 1 {
++		t.Fatalf("expected 1 key created; got %d", len(store.keyCalls))
++	}
++	if store.keyCalls[0].key.ID == "" {
++		t.Fatal("server should mint a key id when omitted")
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 || evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("Evict should fire for acme; got %v", evictor.called)
++	}
++}
++
++func TestTenantProviderHandler_CreateProviderKey_ParentNotFound(t *testing.T) {
++	store := &stubKeyStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "primary", "value": "sk-x"})
++	ctx := newKeyCtx(t, fasthttp.MethodPost, "/api/tenants/acme/providers/openai/keys", string(body), "acme", "openai", "")
++
++	h.createProviderKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("missing parent should be 404; got %d body=%s", got, string(ctx.Response.Body()))
++	}
++}
++
++func TestTenantProviderHandler_CreateProviderKey_MissingFields(t *testing.T) {
++	store := &stubKeyStore{}
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{}) // both name + value missing
++	ctx := newKeyCtx(t, fasthttp.MethodPost, "/api/tenants/acme/providers/openai/keys", string(body), "acme", "openai", "")
++
++	h.createProviderKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("missing name+value should be 400; got %d", got)
++	}
++}
++
++func TestTenantProviderHandler_ListProviderKeys_RedactsValues(t *testing.T) {
++	store := &stubKeyStore{}
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "acme", provider: "openai"})
++	store.keyCalls = append(store.keyCalls,
++		providerKeyCall{tenantID: "acme", provider: "openai", key: schemas.Key{ID: "k1", Name: "primary", Value: *schemas.NewEnvVar("sk-secret")}},
++	)
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	ctx := newKeyCtx(t, fasthttp.MethodGet, "/api/tenants/acme/providers/openai/keys", "", "acme", "openai", "")
++
++	h.listProviderKeys(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusOK; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	var resp struct {
++		Keys []schemas.Key `json:"keys"`
++	}
++	if err := sonic.Unmarshal(ctx.Response.Body(), &resp); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if len(resp.Keys) != 1 {
++		t.Fatalf("expected 1 key; got %d", len(resp.Keys))
++	}
++	if resp.Keys[0].Value.GetValue() != "REDACTED" {
++		t.Fatalf("list response should redact key values; got %q", resp.Keys[0].Value.GetValue())
++	}
++}
++
++func TestTenantProviderHandler_GetProviderKey_CrossTenantNotFound(t *testing.T) {
++	store := &stubKeyStore{}
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "globex", provider: "openai"})
++	store.keyCalls = append(store.keyCalls,
++		providerKeyCall{tenantID: "globex", provider: "openai", key: schemas.Key{ID: "globex-secret", Name: "primary", Value: *schemas.NewEnvVar("sk-globex")}},
++	)
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	// acme should not see globex's key by id.
++	ctx := newKeyCtx(t, fasthttp.MethodGet, "/api/tenants/acme/providers/openai/keys/globex-secret", "", "acme", "openai", "globex-secret")
++
++	h.getProviderKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant get should be 404; got %d body=%s", got, string(ctx.Response.Body()))
++	}
++}
++
++func TestTenantProviderHandler_DeleteProviderKey_HappyPath_Evicts(t *testing.T) {
++	store := &stubKeyStore{}
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "acme", provider: "openai"})
++	store.keyCalls = append(store.keyCalls,
++		providerKeyCall{tenantID: "acme", provider: "openai", key: schemas.Key{ID: "k1"}},
++	)
++	evictor := &stubEvictor{}
++	h, _ := NewTenantProviderHandler(store, evictor)
++
++	ctx := newKeyCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/providers/openai/keys/k1", "", "acme", "openai", "k1")
++
++	h.deleteProviderKey(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusNoContent; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	if len(store.keyCalls) != 0 {
++		t.Fatal("key should be gone after delete")
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 {
++		t.Fatalf("Evict should fire; got %d calls", len(evictor.called))
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index 4a131a719..3265e45ae 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -518,6 +518,22 @@ func (m *MockConfigStore) GetProviderKeys(ctx context.Context, provider schemas.
+ 	return append([]schemas.Key(nil), config.Keys...), nil
+ }
+ 
++func (m *MockConfigStore) GetProviderKeysForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error) {
++	return m.GetProviderKeys(ctx, provider)
++}
++
++func (m *MockConfigStore) GetProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
++	return m.GetProviderKey(ctx, provider, keyID)
++}
++
++func (m *MockConfigStore) CreateProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
++	return m.CreateProviderKey(ctx, provider, key, tx...)
++}
++
++func (m *MockConfigStore) DeleteProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error {
++	return m.DeleteProviderKey(ctx, provider, keyID, tx...)
++}
++
+ func (m *MockConfigStore) GetProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
+ 	config, ok := m.providers[provider]
+ 	if !ok {
+-- 
+2.51.0
+
