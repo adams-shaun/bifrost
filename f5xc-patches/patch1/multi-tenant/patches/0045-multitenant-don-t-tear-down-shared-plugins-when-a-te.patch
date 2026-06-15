@@ -1,0 +1,167 @@
+From 4815f118a8891c235039ae1445e52f684b02b80f Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 16:00:14 -0600
+Subject: [PATCH] multitenant: don't tear down shared plugins when a tenant
+ runtime evicts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+bifrost.Bifrost.Shutdown() iterates over its plugins and calls
+plugin.Cleanup() on each.  Patch 0042 (pass LLMPlugins / MCPPlugins
+to the tenant Bifrost) routed the SAME plugin instances the root
+runtime owns into every per-tenant runtime, on the assumption they
+were stateless wrappers.  They're not.  The logging plugin owns the
+logstore writer; the governance plugin owns its in-memory tracker;
+the telemetry plugin owns the metrics pipeline.  The first time a
+tenant runtime got evicted (any admin write that touches the tenant
+configstore — e.g. add-key — calls evictor.Evict(tid)), its
+Shutdown() ran Cleanup() on those shared plugins.  After that point
+NOTHING logged anywhere in the process — root or tenant, success or
+error — because the writer was closed.
+
+Repro on the bm cluster: pre-eviction tenant /v1 success logs to
+/api/logs cleanly; create a key (triggers Evict); every subsequent
+/v1 call returns 200 but no log row is ever written.
+
+Fix: wrap each plugin in a forwarding shim (sharedLLMPlugin /
+sharedMCPPlugin) before handing them to the tenant bifrost.Init.
+The shim forwards every Pre/Post hook to the underlying instance but
+turns Cleanup into a no-op, so per-tenant Shutdown can't tear down
+the resources the root runtime still depends on.  The root runtime
+still owns the original plugins and runs the real Cleanup at process
+shutdown.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ multitenant/plugin_share.go              | 82 ++++++++++++++++++++++++
+ transports/bifrost-http/server/server.go | 21 +++---
+ 2 files changed, 95 insertions(+), 8 deletions(-)
+ create mode 100644 multitenant/plugin_share.go
+
+diff --git a/multitenant/plugin_share.go b/multitenant/plugin_share.go
+new file mode 100644
+index 000000000..559db596a
+--- /dev/null
++++ b/multitenant/plugin_share.go
+@@ -0,0 +1,82 @@
++// Package multitenant — plugin_share.go.
++//
++// Why this exists: the tenant loader (see transports/bifrost-http/server/
++// server.go) hands the SAME LLMPlugin / MCPPlugin instances the root
++// bifrost.Bifrost was built with to every per-tenant bifrost.Bifrost
++// instance.  That's what makes a /v1 request routed through a tenant
++// runtime still run the logging, governance, telemetry plugins.
++//
++// But bifrost.Bifrost.Shutdown() calls plugin.Cleanup() on every plugin
++// it owns.  When the Manager evicts a tenant runtime (a key/VK admin
++// write triggers Evict; LRU pressure triggers Evict; Shutdown evicts
++// all), the evicted tenant Bifrost.Shutdown() runs Cleanup() on the
++// shared plugins — which puts them in a torn-down state for everyone,
++// including the still-live root runtime.  Symptom: after a single
++// tenant eviction nothing logs anymore (root or tenant), because the
++// logging plugin's writer is closed.
++//
++// The fix here keeps the upside (one plugin chain, shared across all
++// runtimes) without the downside: wrap each plugin in a forwarder that
++// passes every hook through to the underlying instance but turns
++// Cleanup() into a no-op.  The root runtime still owns the original
++// plugins and runs the real Cleanup at process shutdown.
++
++package multitenant
++
++import "github.com/maximhq/bifrost/core/schemas"
++
++// sharedLLMPlugin forwards every LLMPlugin call to the wrapped plugin
++// but skips Cleanup so per-tenant Shutdown can't break shared state.
++type sharedLLMPlugin struct {
++	inner schemas.LLMPlugin
++}
++
++func (s *sharedLLMPlugin) GetName() string { return s.inner.GetName() }
++func (s *sharedLLMPlugin) Cleanup() error  { return nil }
++func (s *sharedLLMPlugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
++	return s.inner.PreLLMHook(ctx, req)
++}
++func (s *sharedLLMPlugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
++	return s.inner.PostLLMHook(ctx, resp, bifrostErr)
++}
++
++// sharedMCPPlugin is the MCPPlugin counterpart of sharedLLMPlugin.
++type sharedMCPPlugin struct {
++	inner schemas.MCPPlugin
++}
++
++func (s *sharedMCPPlugin) GetName() string { return s.inner.GetName() }
++func (s *sharedMCPPlugin) Cleanup() error  { return nil }
++func (s *sharedMCPPlugin) PreMCPHook(ctx *schemas.BifrostContext, req *schemas.BifrostMCPRequest) (*schemas.BifrostMCPRequest, *schemas.MCPPluginShortCircuit, error) {
++	return s.inner.PreMCPHook(ctx, req)
++}
++func (s *sharedMCPPlugin) PostMCPHook(ctx *schemas.BifrostContext, resp *schemas.BifrostMCPResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostMCPResponse, *schemas.BifrostError, error) {
++	return s.inner.PostMCPHook(ctx, resp, bifrostErr)
++}
++
++// ShareLLMPlugins returns a slice of LLMPlugin wrappers safe to pass to
++// a per-tenant bifrost.Bifrost.  Each wrapper forwards all hooks to the
++// original instance but ignores Cleanup, so the tenant runtime's
++// Shutdown can't tear down state the root runtime still depends on.
++func ShareLLMPlugins(plugins []schemas.LLMPlugin) []schemas.LLMPlugin {
++	if len(plugins) == 0 {
++		return nil
++	}
++	out := make([]schemas.LLMPlugin, len(plugins))
++	for i, p := range plugins {
++		out[i] = &sharedLLMPlugin{inner: p}
++	}
++	return out
++}
++
++// ShareMCPPlugins is the MCPPlugin counterpart of ShareLLMPlugins.
++func ShareMCPPlugins(plugins []schemas.MCPPlugin) []schemas.MCPPlugin {
++	if len(plugins) == 0 {
++		return nil
++	}
++	out := make([]schemas.MCPPlugin, len(plugins))
++	for i, p := range plugins {
++		out[i] = &sharedMCPPlugin{inner: p}
++	}
++	return out
++}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 74931839b..fd2da2bac 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1217,17 +1217,22 @@ func (s *BifrostHTTPServer) ensureMultiTenantInitialized(ctx context.Context) er
+ 			return schemas.BifrostConfig{}, fmt.Errorf("load MCP config for tenant %q: %w", tid, err)
+ 		}
+ 		// Plugins (logging, governance, telemetry, etc.) are shared with
+-		// the root Bifrost instance — they're stateless wrappers around
+-		// the shared logstore / config and need to run on every request
+-		// regardless of which Bifrost.Client handles it.  Without this,
+-		// tenant-routed /v1 calls bypass logging entirely (dashboard
+-		// shows zero rows even with tenant_id stamping wired up) and
+-		// budget / rate-limit enforcement is silently skipped.
++		// the root Bifrost instance — they own the logstore writer, the
++		// in-memory governance state, the telemetry pipeline, all of which
++		// need to run on every request regardless of which Bifrost.Client
++		// handles it.  Pass the plugins through multitenant.Share*Plugins
++		// so the per-tenant Bifrost's Shutdown() (called whenever the
++		// runtime is evicted — admin write, LRU pressure, server stop)
++		// does NOT call Cleanup() on the shared plugin instances.  The
++		// root runtime still owns the originals and runs the real
++		// Cleanup at process shutdown.  Skipping the share-wrapper means
++		// the first tenant eviction tears down the logging writer for
++		// the WHOLE process and nothing logs anymore.
+ 		return schemas.BifrostConfig{
+ 			Account:    lib.NewTenantScopedAccount(providers),
+ 			MCPConfig:  mcpConfig,
+-			LLMPlugins: s.Config.GetLoadedLLMPlugins(),
+-			MCPPlugins: s.Config.GetLoadedMCPPlugins(),
++			LLMPlugins: multitenant.ShareLLMPlugins(s.Config.GetLoadedLLMPlugins()),
++			MCPPlugins: multitenant.ShareMCPPlugins(s.Config.GetLoadedMCPPlugins()),
+ 			Logger:     logger,
+ 		}, nil
+ 	}
+-- 
+2.51.0
+
