@@ -83,15 +83,67 @@ and carries a `Ref: https://jira.f5net.com/browse/XC-25496` trailer.
 | 0013 | transports: wire MultiTenantRouter + resolver middleware into …  | `buildInferenceRouter` in server.go picks SingleTenantRouter or MultiTenantRouter based on `BIFROST_MULTI_TENANT_ENABLED`.                    |
 | 0014 | transports/handlers: route inference through BifrostRouter       | All HTTP inference entry points (`inference.go`, `asyncinference.go`, `mcpinference.go`) now `router.Acquire(ctx) + defer release` instead of `h.client.X`. Streaming threads release through `handleStreamingResponse` for SSE goroutine lifetime; async closures acquire at execution time. |
 
-### Verification gates (all green at 0014)
+### Phase 4 — Per-tenant admin surface
 
-- `make verify-patches` — strict `git am` replay of all 18 patches.
+The first thirteen patches (0001–0014) lit up multi-tenant inference;
+patches 0015–0027 build the admin surface operators need to actually
+provision tenants and their inference-plane state via API.
+
+| #    | Subject                                                          | What it adds                                                                                                                                  |
+| ---- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0015 | transports/lib+handlers: AdminAuthz stub + tenant-scoped admin middleware | `lib.AdminAuthz` interface + `StubPlatformAdminAuthz` (v1: always-platform-admin, `BIFROST_ADMIN_DEFAULT_TENANT` env-configurable fallback). Three middlewares: `RequireTenantPathMiddleware`, `LegacyAdminTenantScopeMiddleware`, `RequirePlatformAdminMiddleware`. Adds `multitenant.DefaultTenantID = "default"`. |
+| 0016 | transports+configstore: POST `/api/tenants/{tenant_id}/providers` | `ConfigStore.AddProviderForTenant` pins tenant_id on the new TableProvider + TableKey rows. `handlers.TenantProviderHandler` POST with Manager.Evict on mutate. Stashes `multitenant.Manager` on `BifrostHTTPServer` for the admin layer. |
+| 0017 | transports: POST `/api/tenants/{tenant_id}/governance/virtual-keys` | `handlers.TenantVirtualKeyHandler` POST. Mints a governance-prefixed VK value if the caller omits one. Response carries the value for immediate inference use. |
+| 0018 | transports/handlers integration test + e2e Layer-2 scaffold      | `handlers/mt_integration_test.go` boots a real SQLite ConfigStore via `NewConfigStore`, wires every multi-tenant handler, and drives the full happy path for two tenants with assertions at store + VK resolver + Manager.Acquire layers. `test/e2e/README.md` documents the kind/Helm Layer 2. |
+| 0019 | transports+configstore: POST `/api/tenants/{tenant_id}/mcp/clients` | `ConfigStore.GetMCPConfigByTenant` + `CreateMCPClientConfigForTenant` (composite uniqueness on `(tenant_id, name)`). Tenant loader in `buildInferenceRouter` now loads MCPConfig per-tenant so a fresh runtime sees its MCP clients. |
+| 0020 | transports+configstore: GET list/single + DELETE on `/api/tenants/{tid}/providers/...` | Completes read+delete on providers. Legacy `DeleteProvider` now scopes to `DefaultTenantID` so multi-tenant data can't be wrong-deleted via the single-tenant call shape. |
+| 0021 | transports+configstore: GET list/single + DELETE on `/api/tenants/{tid}/{governance/virtual-keys, mcp/clients}` | Mirror of 0020 for VKs and MCP clients. Delegate-then-verify on cross-tenant probes returns ErrNotFound. |
+| 0022 | transports+configstore: per-tenant provider keys CRUD            | Nested under `/api/tenants/{tid}/providers/{provider}/keys`. `ConfigStore.GetProviderKeysForTenant` filters both the provider join AND the key rows by tenant_id (fixes a latent cross-tenant leak when two tenants have same-named providers). |
+| 0023 | transports+configstore: PUT on tenant VK and MCP                 | `UpdateVirtualKeyForTenant`, `UpdateMCPClientConfigForTenant` with malicious-tenant-id-in-body defense. Handlers patch safe fields only (VK name/description/active; MCP disabled/connection_string/connection_type). |
+| 0024 | transports+configstore: PUT on `/api/tenants/{tid}/providers/{provider}` | Refactored `UpdateProvider` through `updateProviderInternal(ctx, tenantID, ...)` — legacy single-tenant entry pins DefaultTenantID; tenant-scoped form filters the provider lookup + VKPC join + new TableKey rows by tenant_id. |
+| 0025 | transports+configstore: tenant-scoped teams CRUD                 | Full CRUD under `/api/tenants/{tid}/governance/teams`. First governance-metadata entity (no runtime evictor — teams are tagging, not request-path state). |
+| 0026 | transports+configstore: tenant-scoped customers CRUD             | Mirror of 0025 for customers under `/api/tenants/{tid}/governance/customers`. |
+| 0027 | transports+configstore: tenant-scoped budgets + rate limits CRUD | Batched in one patch since both share the same shape. Routes under `/api/tenants/{tid}/governance/{budgets, rate-limits}`. Budget create validates `max_limit >= 0` and `reset_duration` via `ParseDuration`; rate limit create requires at least one of token / request limits. |
+
+### Verification gates (all green at 0027)
+
+- `make verify-patches` — strict `git am` replay of all 27 patches.
 - `make clean-patches && make apply-patches` — round-trip rebuilds the
   workspace cleanly.
 - `go vet` clean on handlers, lib, server, multitenant.
 - Test suites green: `transports/bifrost-http/handlers`,
   `transports/bifrost-http/lib`, `transports/bifrost-http/server`,
   `multitenant`, `framework/configstore` (+tables), `plugins/governance`.
+
+### Per-tenant admin surface matrix (post-0027)
+
+The admin API is feature-complete for all nine entity groups. Every
+entity ships under `/api/tenants/{tenant_id}/...` (platform-admin only
+via the v1 AdminAuthz stub). Inference-plane entities additionally
+evict the per-tenant runtime on mutate so the next request reloads.
+
+| Entity                      | POST | GET list | GET single | PUT | DELETE | Runtime evict on mutate |
+| --------------------------- | :--: | :------: | :--------: | :-: | :----: | :---------------------: |
+| Tenants (`/api/platform/tenants`) |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           —             |
+| **Inference plane** |       |          |            |     |        |                         |
+| Providers                   |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           ✓             |
+| Provider keys (nested)      |  ✓   |    ✓     |     ✓      |  —¹  |   ✓    |           ✓             |
+| Virtual keys                |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           ✓             |
+| MCP clients                 |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           ✓             |
+| **Governance metadata** |       |          |            |     |        |                         |
+| Teams                       |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           —²            |
+| Customers                   |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           —²            |
+| Budgets                     |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           —²            |
+| Rate limits                 |  ✓   |    ✓     |     ✓      |  ✓  |   ✓    |           —²            |
+
+¹ Provider keys rotate via POST + DELETE (avoids the cascade machinery in
+the legacy `UpdateProviderKey`). Operator workflow: POST a new key with
+a new `id`, smoke-test, DELETE the old one.
+
+² Governance metadata is configuration data attached to other entities
+(VKs reference budget/rate-limit/team/customer IDs), not request-path
+state. A mutation shows up on subsequent admin reads + on any
+inference-plane row whose pointer is updated.
 
 ## History: spike-patch cleanup (done)
 
@@ -135,68 +187,17 @@ Dropped patches (no longer in the series): old 0002, 0004, 0005, 0006.
 
 ### Next up
 
-The two priority items for the next sprint:
+The two priority items remaining now that patches 0001–0027 have landed:
 
-1. **Per-tenant admin interface across the board** — every entity that has
-   admin endpoints today needs a tenant-scoped form. Scope and design notes
-   below.
-2. **K8s-style E2E test harness** — boot Bifrost + Postgres + Redis,
-   provision multiple tenants via the admin API, drive inference + MCP on
-   each, assert cross-tenant isolation. Design notes below.
-
-### Next-1: Per-tenant admin interface
-
-The existing OSS admin handlers operate on a single global ConfigStore —
-they don't filter by `tenant_id`. Patch 0012 added platform-scope CRUD at
-`/api/platform/tenants`; the parallel work is to tenant-scope the rest of
-the admin surface.
-
-Entities that need tenant-scoped admin endpoints (each entity already has a
-`tenant_id` column from patches 0007–0009; the work is at the handler
-layer):
-
-| Entity         | Current single-tenant route                        | Tenant-scoped form                                  |
-| -------------- | -------------------------------------------------- | --------------------------------------------------- |
-| Providers      | `/api/providers`                                   | `/api/tenants/{tenant_id}/providers`                |
-| Provider keys  | `/api/providers/{provider}/keys`                   | `/api/tenants/{tenant_id}/providers/{provider}/keys`|
-| MCP clients    | `/api/mcp/clients`                                 | `/api/tenants/{tenant_id}/mcp/clients`              |
-| Customers      | `/api/customers`                                   | `/api/tenants/{tenant_id}/customers`                |
-| Teams          | `/api/teams`                                       | `/api/tenants/{tenant_id}/teams`                    |
-| Virtual keys   | `/api/virtual-keys`                                | `/api/tenants/{tenant_id}/virtual-keys`             |
-| Budgets        | `/api/budgets`                                     | `/api/tenants/{tenant_id}/budgets`                  |
-| Rate limits    | `/api/rate-limits`                                 | `/api/tenants/{tenant_id}/rate-limits`              |
-
-Design constraints:
-
-- **Authorization layers.** Two callers: platform-admin (can target any
-  `tenant_id`) and tenant-admin (locked to their own tenant_id resolved
-  from the calling VK). The middleware that resolves the calling identity
-  must reject tenant-admin requests that target a different tenant_id
-  than they belong to. Phase 4's AuthzPlugin is the right home for this
-  policy — we can ship the routes with a stub authz check first and swap
-  it in later.
-- **Repo-layer changes.** Most repos already accept `tenant_id`; audit
-  needed to confirm every Read/List filters by it and every Create
-  enforces it. Patch 0010 already gave us composite `(tenant_id, name)`
-  uniqueness so name collisions across tenants are fine.
-- **UI surface.** The bundled UI assumes a single tenant. v1 can punt on
-  UI changes — operators use the API directly. Phase 4 (RBAC + UI) will
-  add a tenant picker.
-- **Runtime invalidation.** When a tenant's provider/MCP/VK config changes
-  via the admin API, the per-tenant Bifrost runtime in the registry must
-  be evicted (or reloaded) so the next request picks up the new config.
-  Today `Manager` has no hook for this; we'll need to add an `Evict(tenantID)`
-  call and wire it into every mutating admin handler. Possibly: pub/sub
-  via the existing dlock primitives so multi-replica deployments evict in
-  sync.
-
-Patch breakdown (rough):
-
-- One patch per entity-group (providers, governance entities, MCP) keeps
-  diffs reviewable.
-- One patch wiring `Manager.Evict` into the mutation paths.
-- One patch adding the AuthzPlugin stub + tenant-admin-vs-platform-admin
-  middleware split.
+1. **Layer 2 E2E** — kind cluster, Helm, Postgres, multi-replica HA,
+   streaming/async/hot-reconfig. Design notes below; Layer 1 (in-process
+   integration test exercising every multi-tenant handler) is already
+   shipped at `transports/bifrost-http/handlers/mt_integration_test.go`.
+2. **Phase 4 AuthzPlugin / OIDC** — replace the v1 `StubPlatformAdminAuthz`
+   with a real, identity-aware authorization plugin so tenant-admins can
+   call the admin API on their own tenant via `/api/tenants/{tid}/...`
+   without first becoming platform-admins. Until this lands the
+   per-tenant routes are platform-admin-only.
 
 ### Next-2: K8s-style E2E test harness
 
@@ -281,36 +282,32 @@ Open questions before we start the harness:
   separate stage, or a nightly job? Testcontainers is cheap enough to
   gate every MR; kind is probably nightly.
 
-### In scope for the HTTP REST inference plane (close-out for phase 3)
+### Inference plane close-out items still pending
 
-- **End-to-end integration test.** Unit tests cover each layer in isolation;
-  no test yet exercises the full
-  middleware → `MultiTenantRouter.Acquire` → handler → release flow with a
-  real tenant_id and a multi-tenant ConfigStore. Need a fixture that boots
-  two tenants and asserts cross-tenant request isolation.
-- **Verify `*HandlerWithRouter` wiring is actually used.** Patch 0018 added
-  the constructors and the handlers consume the router, but server.go should
-  be re-read end-to-end to confirm `BIFROST_MULTI_TENANT_ENABLED=1` causes
-  `NewAsyncHandlerWithRouter` / `NewMCPInferenceHandlerWithRouter` /
-  `NewCompletionHandlerWithRouter` to be invoked (not just constructed).
+- **Layer 2 E2E coverage of the close-out scenarios.** Layer 1
+  integration test exercises admin-side isolation; what's still missing
+  is a real-server-binding test that drives `/v1/chat/completions`
+  streaming (SSE goroutine holds the per-tenant runtime open through
+  the full stream), `/v1/async/chat/completions` (closure-time
+  Acquire), and a hot-reconfig flow (PUT a new provider mid-traffic,
+  verify next inference picks up the change via the evictor).
 - **Resolver cache invalidation.** Today the VK→tenant cache uses a 60 s
   TTL. For VK revocation latency we'll want Postgres `LISTEN`/`NOTIFY` or
-  a versioned invalidation header from the admin API.
-
-### Out of scope of patch 0018 — separate patches needed
-
+  a versioned invalidation header from the admin API. The PUT/DELETE
+  handlers already evict the per-tenant runtime, but the **resolver
+  cache** on each replica is still independently TTL'd.
 - **Realtime / WebSocket inference.** `wsrealtime.go`, `wsresponses.go`,
   `webrtc_realtime.go`, `realtime_client_secrets.go` still call
   `h.client.X` directly. They run real inference, so multi-tenant support
   here needs the same Acquire/release pattern plus a WebSocket-lifetime
   model for the handle (longer-lived than HTTP, can survive eviction
   pressure).
-- **Admin handlers.** `providers.go` and `mcp.go` operate on the fallback
-  single-tenant runtime. For SaaS, admin operations must be tenant-scoped
-  so a tenant-admin can only see/edit their own providers and MCP clients.
-- **Platform-admin vs tenant-admin authorization.** Patch 0012 added the
-  CRUD endpoints; no AuthzPlugin yet enforces that only platform-admins
-  can call `/api/platform/tenants`. Phase 4 work.
+- **Tenant-scoping the legacy `/api/<entity>` route family.** Patch 0015
+  shipped `LegacyAdminTenantScopeMiddleware` which lifts the caller's
+  own tenant onto ctx, but the legacy handlers don't read it yet — they
+  still operate on the global ConfigStore. Wiring them through requires
+  modifying every legacy handler to filter by ctx tenant_id and is gated
+  on Phase 4's AuthzPlugin resolving a real tenant-admin caller.
 
 ### Later phases (per the memory plan)
 
