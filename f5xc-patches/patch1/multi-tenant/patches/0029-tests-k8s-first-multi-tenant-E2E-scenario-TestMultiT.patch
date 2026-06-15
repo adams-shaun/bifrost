@@ -1,0 +1,752 @@
+From b61950fac59684490fa2290662a7218408ba9888 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 02:54:12 -0600
+Subject: [PATCH] tests/k8s: first multi-tenant E2E scenario
+ (TestMultiTenantSanity)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends the existing kind+Helm harness with the smallest E2E that
+proves multi-tenant routing is end-to-end correct on a real patched
+binary in a real cluster: two tenants share one mock LLM, each gets
+its own tenant-scoped provider+VK via /api/platform/tenants +
+/api/tenants/{tid}/{providers,governance/virtual-keys}, both drive a
+chat completion through their own runtime, then tenant A's VK gets
+deleted and we assert (a) A can no longer drive inference and (b) B
+still can — closing the loop on patch 0028's same-replica resolver
+cache invalidation.
+
+Harness extensions:
+
+- fixtures/bifrost.go gains a functional-options API:
+  - WithMultiTenant(adminDefaultTenant) splices
+    BIFROST_MULTI_TENANT_ENABLED=true (+ optional
+    BIFROST_ADMIN_DEFAULT_TENANT) into the rendered Deployment
+    BEFORE kubectl apply, so the very first pod that comes up
+    already carries the right config. Doing this pre-apply (rather
+    than `kubectl set env` after) avoids the race where WaitReady
+    picks up an old-spec pod that briefly became Ready.
+  - WithExtraEnv(name, value) is a generic escape hatch for
+    future scenarios that need other env knobs.
+  - Splicing uses yaml.v3 (already an indirect dep, now promoted
+    to direct) on the rendered YAML rather than sed/regex so
+    reformatting / comments don't trip a brittle string match.
+
+- fixtures/multitenant.go (new) — MTAdmin raw-HTTP client driving
+  the per-tenant admin surface the F5XC patches add. The
+  go-bifrost-ai SDK doesn't yet know about /api/tenants/{tid}/...,
+  so scenarios drive these endpoints over plain http.Client.
+  Surface: CreateTenant, CreateProvider, CreateProviderKey,
+  CreateVirtualKey, ListVirtualKeys, DeleteVirtualKey, Chat,
+  WaitForVKResolver (bounded retry to absorb cold-start lazy
+  load).
+
+- scenarios/multitenant_sanity_test.go (new) — TestMultiTenantSanity:
+  the integration test described above. //go:build k8s, runs under
+  the existing `make test-k8s-image` + GOWORK=off path.
+
+- README.md updated with the new test entry and a short
+  "Multi-tenant scenarios" section pointing at the harness
+  extensions, so follow-on scenarios (streaming, async, MCP,
+  multi-replica, Anthropic-shape) can layer onto the same MTAdmin.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ tests/k8s/README.md                           |  17 ++
+ tests/k8s/fixtures/bifrost.go                 | 187 +++++++++++-
+ tests/k8s/fixtures/multitenant.go             | 271 ++++++++++++++++++
+ tests/k8s/go.mod                              |   2 +-
+ .../k8s/scenarios/multitenant_sanity_test.go  | 119 ++++++++
+ 5 files changed, 593 insertions(+), 3 deletions(-)
+ create mode 100644 tests/k8s/fixtures/multitenant.go
+ create mode 100644 tests/k8s/scenarios/multitenant_sanity_test.go
+
+diff --git a/tests/k8s/README.md b/tests/k8s/README.md
+index 50af3c38f..352ce6dd3 100644
+--- a/tests/k8s/README.md
++++ b/tests/k8s/README.md
+@@ -109,6 +109,23 @@ replica's in-memory state matches what was written.
+ | `TestScaleMatrix` | Propagation across a sweep of replica counts | — |
+ | `TestStressConfigSyncConservation` | 3 replicas, hundreds of objects/table, multi-VK load via per-pod fan-out, live config churn, propagation report, **convergence audit + exact token conservation** | `BIFROST_STRESS_OBJECTS` (200), `BIFROST_STRESS_CLIENTS` (50), `BIFROST_STRESS_RPS` (2500), `BIFROST_STRESS_DURATION` (2m) |
+ | `TestBenchmark` | The reusable benchmark suite: sized deploy, seed, **in-cluster k6** vs the Service ClusterIP, optional obs/profiling, churn, then conservation + audit gates | `BIFROST_BENCH_OBJECTS` (100), `BIFROST_BENCH_REPLICAS` (3), `BIFROST_BENCH_RPS` (500), `BIFROST_BENCH_DURATION` (2m), `BIFROST_BENCH_TLS` (off) |
++| `TestMultiTenantSanity` | Boots Bifrost with `BIFROST_MULTI_TENANT_ENABLED=true`, provisions two independent tenants, drives one inference per tenant, deletes tenant A's VK and verifies same-replica resolver-cache invalidation (patch 0028) | — |
++
++## Multi-tenant scenarios
++
++`TestMultiTenantSanity` is the first scenario in the F5XC multi-tenant E2E
++series (XC-25496). It opts into the new admin surface by passing
++`fixtures.WithMultiTenant("")` to `NewBifrostInstall`; the option splices
++`BIFROST_MULTI_TENANT_ENABLED=true` into the rendered Deployment before
++`kubectl apply` (so the first pod already carries the right config — no
++post-apply rollout race). The new `fixtures.MTAdmin` raw-HTTP client
++drives `/api/platform/tenants` + `/api/tenants/{tid}/{providers,
++governance/virtual-keys}` since the go-bifrost-ai SDK does not yet expose
++tenant-scoped methods.
++
++Follow-on scenarios (streaming, async, MCP, multi-replica VK
++invalidation, Anthropic-shape isolation) layer onto the same `MTAdmin`
++helper.
+ 
+ ## Cross-cutting capabilities (apply to EVERY test here)
+ 
+diff --git a/tests/k8s/fixtures/bifrost.go b/tests/k8s/fixtures/bifrost.go
+index 7057f7e8f..01ab54f7e 100644
+--- a/tests/k8s/fixtures/bifrost.go
++++ b/tests/k8s/fixtures/bifrost.go
+@@ -13,6 +13,8 @@ import (
+ 	"strings"
+ 	"testing"
+ 	"time"
++
++	"gopkg.in/yaml.v3"
+ )
+ 
+ const (
+@@ -46,9 +48,61 @@ type BifrostInstall struct {
+ 	// MockLLM points at the in-cluster mock LLM (deployed by the deps chart).
+ 	MockLLM *MockLLM
+ 
++	// MultiTenantEnabled reflects whether the install was deployed with
++	// BIFROST_MULTI_TENANT_ENABLED=true (i.e. WithMultiTenant was passed).
++	// Scenarios use this to decide whether to drive the per-tenant admin
++	// surface or the legacy single-tenant one.
++	MultiTenantEnabled bool
++
+ 	cluster      *KindCluster
+ 	t            *testing.T
+ 	stopForwards []func()
++
++	extraEnv []corev1EnvVar
++}
++
++// corev1EnvVar is a minimal mirror of corev1.EnvVar — we don't take a k8s
++// client dependency just to splice env vars into the rendered Deployment.
++type corev1EnvVar struct {
++	Name  string `yaml:"name"`
++	Value string `yaml:"value"`
++}
++
++// BifrostOption customizes the install before kubectl apply.
++type BifrostOption func(*bifrostOptions)
++
++type bifrostOptions struct {
++	multiTenant         bool
++	adminDefaultTenant  string
++	additionalEnvByName map[string]string // future-proof escape hatch
++}
++
++// WithMultiTenant turns multi-tenancy on for the deployed bifrost by
++// injecting BIFROST_MULTI_TENANT_ENABLED=true and (when adminDefaultTenant
++// is non-empty) BIFROST_ADMIN_DEFAULT_TENANT into the Deployment's env
++// before the rendered manifest is applied.
++//
++// adminDefaultTenant tells the AdminAuthz stub which tenant ID legacy
++// /api/<entity> calls (and platform-admin endpoints whose path doesn't
++// embed a tenant) bind to. Pass "" if the scenario only drives
++// /api/platform/* and /api/tenants/{tid}/* and never the legacy surface.
++func WithMultiTenant(adminDefaultTenant string) BifrostOption {
++	return func(o *bifrostOptions) {
++		o.multiTenant = true
++		o.adminDefaultTenant = adminDefaultTenant
++	}
++}
++
++// WithExtraEnv injects an arbitrary env var into the bifrost container at
++// deploy time. Repeated calls accumulate; a later call overwrites an
++// earlier one for the same name.
++func WithExtraEnv(name, value string) BifrostOption {
++	return func(o *bifrostOptions) {
++		if o.additionalEnvByName == nil {
++			o.additionalEnvByName = map[string]string{}
++		}
++		o.additionalEnvByName[name] = value
++	}
+ }
+ 
+ // KeepInfra reports whether teardown should be skipped (BIFROST_K8S_KEEP=1),
+@@ -62,7 +116,10 @@ func KeepInfra() bool { return os.Getenv("BIFROST_K8S_KEEP") == "1" }
+ //  4. wait for readiness and open a port-forward to the bifrost Service.
+ //
+ // Returns the install handle and a teardown func.
+-func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
++//
++// opts customize the deploy (e.g. WithMultiTenant). Backward-compatible:
++// existing callers passing no opts get the legacy single-tenant deploy.
++func NewBifrostInstall(t *testing.T, c *KindCluster, opts ...BifrostOption) (*BifrostInstall, func()) {
+ 	t.Helper()
+ 
+ 	if _, err := exec.LookPath("helm"); err != nil {
+@@ -72,8 +129,27 @@ func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
+ 		t.Skipf("docker not installed: %v", err)
+ 	}
+ 
++	o := &bifrostOptions{}
++	for _, opt := range opts {
++		opt(o)
++	}
++
+ 	ns, nsCallerManaged := namespace()
+-	bf := &BifrostInstall{Namespace: ns, cluster: c, t: t}
++	bf := &BifrostInstall{
++		Namespace:          ns,
++		cluster:            c,
++		t:                  t,
++		MultiTenantEnabled: o.multiTenant,
++	}
++	if o.multiTenant {
++		bf.extraEnv = append(bf.extraEnv, corev1EnvVar{Name: "BIFROST_MULTI_TENANT_ENABLED", Value: "true"})
++		if o.adminDefaultTenant != "" {
++			bf.extraEnv = append(bf.extraEnv, corev1EnvVar{Name: "BIFROST_ADMIN_DEFAULT_TENANT", Value: o.adminDefaultTenant})
++		}
++	}
++	for name, value := range o.additionalEnvByName {
++		bf.extraEnv = append(bf.extraEnv, corev1EnvVar{Name: name, Value: value})
++	}
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+ 	defer cancel()
+@@ -234,6 +310,23 @@ func (bf *BifrostInstall) renderAndApplyBifrost(ctx context.Context) {
+ 		t.Fatalf("serelib docker cp out: %v: %s", err, strings.TrimSpace(string(out)))
+ 	}
+ 
++	// Splice extra env vars (e.g. WithMultiTenant) into the rendered
++	// Deployment before kubectl apply, so the very first pod that comes
++	// up already carries the right config. Doing this BEFORE apply
++	// (rather than `kubectl set env` after) avoids the race where
++	// WaitReady picks up an old-spec pod that briefly became Ready.
++	if len(bf.extraEnv) > 0 {
++		path := filepath.Join(work, "k8s", "deployment.yml")
++		if err := spliceExtraEnvIntoDeployment(path, bf.extraEnv); err != nil {
++			t.Fatalf("splice extra env into rendered deployment: %v", err)
++		}
++		names := make([]string, 0, len(bf.extraEnv))
++		for _, e := range bf.extraEnv {
++			names = append(names, e.Name)
++		}
++		t.Logf("spliced extra env into Deployment: %s", strings.Join(names, ","))
++	}
++
+ 	apply := bf.cluster.Kubectl(ctx, "apply", "-n", bf.Namespace, "-f", filepath.Join(work, "k8s"))
+ 	if out, err := apply.CombinedOutput(); err != nil {
+ 		t.Fatalf("kubectl apply bifrost: %v: %s", err, strings.TrimSpace(string(out)))
+@@ -241,6 +334,96 @@ func (bf *BifrostInstall) renderAndApplyBifrost(ctx context.Context) {
+ 	t.Logf("applied serelib-rendered bifrost manifests to namespace %s", bf.Namespace)
+ }
+ 
++// spliceExtraEnvIntoDeployment edits the rendered Deployment YAML in place,
++// appending env entries to the FIRST container of the FIRST PodSpec it
++// finds. The rendered file has exactly one container ("bifrost"), so
++// "first" is unambiguous in practice. Uses yaml.v3 (already an indirect
++// dep) rather than sed/regex so reformatting/comments don't trip a
++// brittle string match.
++func spliceExtraEnvIntoDeployment(path string, extra []corev1EnvVar) error {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return fmt.Errorf("read %s: %w", path, err)
++	}
++	var root yaml.Node
++	if err := yaml.Unmarshal(data, &root); err != nil {
++		return fmt.Errorf("parse %s: %w", path, err)
++	}
++	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
++		return fmt.Errorf("unexpected YAML shape in %s", path)
++	}
++	// spec.template.spec.containers[0].env
++	specEnv, err := navigate(root.Content[0],
++		"spec", "template", "spec", "containers")
++	if err != nil {
++		return err
++	}
++	if specEnv.Kind != yaml.SequenceNode || len(specEnv.Content) == 0 {
++		return fmt.Errorf("containers not a non-empty sequence in %s", path)
++	}
++	container := specEnv.Content[0]
++	envNode := mappingValue(container, "env")
++	if envNode == nil {
++		// No env block at all — add one.
++		envNode = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
++		container.Content = append(container.Content,
++			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "env"},
++			envNode)
++	}
++	if envNode.Kind != yaml.SequenceNode {
++		return fmt.Errorf("container env not a sequence in %s", path)
++	}
++	for _, e := range extra {
++		entry := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
++		entry.Content = []*yaml.Node{
++			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
++			{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.Name},
++			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "value"},
++			// Quote-style "" -> yaml.v3 picks a sane default ("|" for multiline,
++			// plain otherwise). Force DoubleQuotedStyle so e.g. "true" stays a
++			// string (Kubernetes EnvVar.value is a string).
++			{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.Value, Style: yaml.DoubleQuotedStyle},
++		}
++		envNode.Content = append(envNode.Content, entry)
++	}
++	out, err := yaml.Marshal(&root)
++	if err != nil {
++		return fmt.Errorf("marshal %s: %w", path, err)
++	}
++	if err := os.WriteFile(path, out, 0o644); err != nil {
++		return fmt.Errorf("write %s: %w", path, err)
++	}
++	return nil
++}
++
++// navigate walks down a sequence of mapping keys to reach a nested node.
++// Returns an error mentioning the missing key for diagnostics.
++func navigate(n *yaml.Node, keys ...string) (*yaml.Node, error) {
++	cur := n
++	for _, k := range keys {
++		child := mappingValue(cur, k)
++		if child == nil {
++			return nil, fmt.Errorf("yaml key %q not found at path %v", k, keys)
++		}
++		cur = child
++	}
++	return cur, nil
++}
++
++// mappingValue returns the value node for the given key in a mapping, or
++// nil if not present / not a mapping.
++func mappingValue(n *yaml.Node, key string) *yaml.Node {
++	if n == nil || n.Kind != yaml.MappingNode {
++		return nil
++	}
++	for i := 0; i+1 < len(n.Content); i += 2 {
++		if n.Content[i].Value == key {
++			return n.Content[i+1]
++		}
++	}
++	return nil
++}
++
+ func (bf *BifrostInstall) ensureNamespace(ctx context.Context) error {
+ 	if err := bf.waitForNamespaceGone(ctx, 2*time.Minute); err != nil {
+ 		return fmt.Errorf("wait for prior namespace to terminate: %w", err)
+diff --git a/tests/k8s/fixtures/multitenant.go b/tests/k8s/fixtures/multitenant.go
+new file mode 100644
+index 000000000..abf64d0c5
+--- /dev/null
++++ b/tests/k8s/fixtures/multitenant.go
+@@ -0,0 +1,271 @@
++package fixtures
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++)
++
++// MTAdmin drives the per-tenant admin surface that the F5XC patches add
++// at /api/platform/tenants and /api/tenants/{tid}/... — endpoints the
++// go-bifrost-ai SDK doesn't yet know about. Constructed via
++// BifrostInstall.MTAdmin() once the install is up. All operations target
++// the bifrost service via the host-side port-forward (bf.BaseURL); cross-
++// replica concerns are out of scope here (covered by the propagation
++// tests in scenarios/, when multi-tenant gets multi-replica scenarios).
++type MTAdmin struct {
++	bf *BifrostInstall
++}
++
++// MTAdmin returns the multi-tenant admin client. Safe to call regardless
++// of MultiTenantEnabled; the endpoints just 404 if MT is off — which is
++// itself a useful negative-test signal.
++func (bf *BifrostInstall) MTAdmin() *MTAdmin { return &MTAdmin{bf: bf} }
++
++// CreateTenant POSTs /api/platform/tenants. The platform admin picks the
++// tenant ID (slug-like, stable); auto-generation would prevent IdP/SCIM
++// integrations from minting tenants with stable external IDs.
++func (m *MTAdmin) CreateTenant(t *testing.T, ctx context.Context, id, name string) {
++	t.Helper()
++	body := map[string]any{"id": id, "name": name, "status": "active"}
++	resp, raw, err := m.bf.PostJSON(ctx, "/api/platform/tenants", body, nil)
++	if err != nil {
++		t.Fatalf("create tenant %s: %v", id, err)
++	}
++	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
++		t.Fatalf("create tenant %s: status %d: %s", id, resp.StatusCode, raw)
++	}
++	t.Logf("created tenant %s (%s)", id, name)
++}
++
++// CreateProvider POSTs /api/tenants/{tid}/providers. Mirrors
++// ConfigureMockProvider's shape but scoped to a specific tenant.
++func (m *MTAdmin) CreateProvider(t *testing.T, ctx context.Context, tid, provider, baseURL string) {
++	t.Helper()
++	body := map[string]any{
++		"provider": provider,
++		"network_config": map[string]any{
++			"base_url":                           baseURL,
++			"default_request_timeout_in_seconds": 30,
++			"max_retries":                        0,
++		},
++		"concurrency_and_buffer_size": map[string]any{
++			"concurrency": 50,
++			"buffer_size": 100,
++		},
++	}
++	path := fmt.Sprintf("/api/tenants/%s/providers", tid)
++	resp, raw, err := m.bf.PostJSON(ctx, path, body, nil)
++	if err != nil {
++		t.Fatalf("create provider %s for tenant %s: %v", provider, tid, err)
++	}
++	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
++		t.Fatalf("create provider %s for tenant %s: status %d: %s", provider, tid, resp.StatusCode, raw)
++	}
++	t.Logf("tenant %s: created provider %s -> %s", tid, provider, baseURL)
++}
++
++// CreateProviderKey POSTs /api/tenants/{tid}/providers/{provider}/keys.
++// value is a bare string (the safe shape — see governance.go).
++func (m *MTAdmin) CreateProviderKey(t *testing.T, ctx context.Context, tid, provider, name, value string) {
++	t.Helper()
++	body := map[string]any{
++		"name":  name,
++		"value": value,
++	}
++	path := fmt.Sprintf("/api/tenants/%s/providers/%s/keys", tid, provider)
++	resp, raw, err := m.bf.PostJSON(ctx, path, body, nil)
++	if err != nil {
++		t.Fatalf("create key for tenant %s provider %s: %v", tid, provider, err)
++	}
++	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
++		t.Fatalf("create key for tenant %s provider %s: status %d: %s", tid, provider, resp.StatusCode, raw)
++	}
++	t.Logf("tenant %s: attached key %q to provider %s", tid, name, provider)
++}
++
++// CreateVirtualKey POSTs /api/tenants/{tid}/governance/virtual-keys.
++// Returns the server-minted (or echoed) VK value, which the caller uses
++// to drive inference via the x-bf-vk header.
++func (m *MTAdmin) CreateVirtualKey(t *testing.T, ctx context.Context, tid, name string) string {
++	t.Helper()
++	body := map[string]any{"name": name}
++	path := fmt.Sprintf("/api/tenants/%s/governance/virtual-keys", tid)
++	resp, raw, err := m.bf.PostJSON(ctx, path, body, nil)
++	if err != nil {
++		t.Fatalf("create VK for tenant %s: %v", tid, err)
++	}
++	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
++		t.Fatalf("create VK for tenant %s: status %d: %s", tid, resp.StatusCode, raw)
++	}
++	var parsed struct {
++		ID       string `json:"id"`
++		TenantID string `json:"tenant_id"`
++		Name     string `json:"name"`
++		Value    string `json:"value"`
++	}
++	if err := json.Unmarshal(raw, &parsed); err != nil {
++		t.Fatalf("parse VK response for tenant %s: %v: body=%s", tid, err, raw)
++	}
++	if parsed.Value == "" {
++		t.Fatalf("VK response missing value for tenant %s: body=%s", tid, raw)
++	}
++	t.Logf("tenant %s: created VK %s (id=%s)", tid, parsed.Name, parsed.ID)
++	return parsed.Value
++}
++
++// DeleteVirtualKey DELETEs /api/tenants/{tid}/governance/virtual-keys/{vk_id}.
++// Used to exercise the patch-0028 invalidator wiring: after delete, the
++// resolver cache should drop the entry on the calling replica, so the
++// next inference call with that VK 401s instead of routing to a
++// half-loaded tenant runtime.
++func (m *MTAdmin) DeleteVirtualKey(t *testing.T, ctx context.Context, tid, vkID string) {
++	t.Helper()
++	path := fmt.Sprintf("/api/tenants/%s/governance/virtual-keys/%s", tid, vkID)
++	resp, raw, err := m.delete(ctx, path)
++	if err != nil {
++		t.Fatalf("delete VK %s for tenant %s: %v", vkID, tid, err)
++	}
++	if resp.StatusCode != http.StatusNoContent {
++		t.Fatalf("delete VK %s for tenant %s: status %d: %s", vkID, tid, resp.StatusCode, raw)
++	}
++	t.Logf("tenant %s: deleted VK %s", tid, vkID)
++}
++
++// ListVirtualKeys GETs /api/tenants/{tid}/governance/virtual-keys and
++// returns the parsed (id, name, value) tuples. Used so a delete test can
++// find the VK ID without the caller having to thread it through from
++// create time.
++func (m *MTAdmin) ListVirtualKeys(t *testing.T, ctx context.Context, tid string) []MTVirtualKey {
++	t.Helper()
++	path := fmt.Sprintf("/api/tenants/%s/governance/virtual-keys", tid)
++	resp, raw, err := m.get(ctx, path)
++	if err != nil {
++		t.Fatalf("list VKs for tenant %s: %v", tid, err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("list VKs for tenant %s: status %d: %s", tid, resp.StatusCode, raw)
++	}
++	var parsed struct {
++		VirtualKeys []MTVirtualKey `json:"virtual_keys"`
++	}
++	if err := json.Unmarshal(raw, &parsed); err != nil {
++		t.Fatalf("parse VK list for tenant %s: %v: body=%s", tid, err, raw)
++	}
++	return parsed.VirtualKeys
++}
++
++// MTVirtualKey is the slim VK shape returned by the tenant-scoped list.
++// Only the fields scenarios reach for are surfaced; full schema lives in
++// configstore.TableVirtualKey.
++type MTVirtualKey struct {
++	ID       string `json:"id"`
++	TenantID string `json:"tenant_id"`
++	Name     string `json:"name"`
++	Value    string `json:"value"`
++}
++
++// ChatResult is what the inference helpers report back. A non-zero
++// StatusCode + non-nil Err is harness failure; StatusCode != 200 with
++// nil Err is a server-side rejection (e.g. 401 after a deleted VK).
++type ChatResult struct {
++	StatusCode int
++	Body       []byte
++	Err        error
++}
++
++// Chat drives POST /v1/chat/completions with the supplied virtual key
++// in the x-bf-vk header. Returns the raw status + body so scenarios can
++// assert 200 vs 401/403 etc.
++//
++// vk is the value (sk-bf-...) returned by CreateVirtualKey, NOT the VK
++// ID. Bifrost's resolver hashes the value to look up the tenant.
++func (m *MTAdmin) Chat(ctx context.Context, vk, provider, model, userMessage string) ChatResult {
++	body := map[string]any{
++		"model": fmt.Sprintf("%s/%s", provider, model),
++		"messages": []map[string]any{
++			{"role": "user", "content": userMessage},
++		},
++		"max_tokens": 32,
++	}
++	headers := map[string]string{
++		"x-bf-vk": vk,
++	}
++	resp, raw, err := m.bf.PostJSON(ctx, "/v1/chat/completions", body, headers)
++	if err != nil {
++		return ChatResult{Err: err}
++	}
++	return ChatResult{StatusCode: resp.StatusCode, Body: raw}
++}
++
++// WaitForVKResolver polls Chat until the VK either resolves successfully
++// (status 200) or the deadline elapses. Provider config propagation
++// across the resolver cache is asynchronous on a freshly-created VK in
++// pathological cases (cold runtime + slow DB); a short bounded wait
++// makes scenarios deterministic without a flat sleep.
++func (m *MTAdmin) WaitForVKResolver(t *testing.T, ctx context.Context, vk, provider, model string, timeout time.Duration) ChatResult {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	var last ChatResult
++	for time.Now().Before(deadline) {
++		last = m.Chat(ctx, vk, provider, model, "ping")
++		if last.StatusCode == http.StatusOK {
++			return last
++		}
++		// Anything other than 401/403/404 is a real error — bail early so
++		// the failure mode is visible in the log rather than buried at the
++		// deadline.
++		if last.StatusCode != http.StatusUnauthorized &&
++			last.StatusCode != http.StatusForbidden &&
++			last.StatusCode != http.StatusNotFound {
++			return last
++		}
++		time.Sleep(250 * time.Millisecond)
++	}
++	return last
++}
++
++// delete and get factor out the parts of PostJSON that aren't POST.
++// PostJSON itself can't be reused for non-POST methods without
++// refactoring its public signature, which other tests depend on.
++func (m *MTAdmin) delete(ctx context.Context, path string) (*http.Response, []byte, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, m.bf.BaseURL+path, nil)
++	if err != nil {
++		return nil, nil, err
++	}
++	return m.do(req)
++}
++
++func (m *MTAdmin) get(ctx context.Context, path string) (*http.Response, []byte, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.bf.BaseURL+path, nil)
++	if err != nil {
++		return nil, nil, err
++	}
++	return m.do(req)
++}
++
++func (m *MTAdmin) do(req *http.Request) (*http.Response, []byte, error) {
++	resp, err := m.bf.httpClient().Do(req)
++	if err != nil {
++		return nil, nil, err
++	}
++	defer resp.Body.Close()
++	out, err := io.ReadAll(resp.Body)
++	return resp, out, err
++}
++
++// SnippetOf trims a long response body for log readability. Sized for
++// one-line t.Logf output; full body is still in ChatResult.Body if a
++// test needs to assert on contents.
++func SnippetOf(b []byte, max int) string {
++	s := strings.TrimSpace(string(b))
++	if len(s) <= max {
++		return s
++	}
++	return s[:max] + "…"
++}
+diff --git a/tests/k8s/go.mod b/tests/k8s/go.mod
+index 757995c23..51c52363a 100644
+--- a/tests/k8s/go.mod
++++ b/tests/k8s/go.mod
+@@ -4,6 +4,7 @@ go 1.26.3
+ 
+ require (
+ 	github.com/maximhq/bifrost/core v1.5.15
++	gopkg.in/yaml.v3 v3.0.1
+ 	gopkg.volterra.us/go-bifrost-ai v0.0.0-20260604195430-93ab8ce27f10
+ )
+ 
+@@ -34,5 +35,4 @@ require (
+ 	golang.org/x/arch v0.23.0 // indirect
+ 	golang.org/x/sys v0.45.0 // indirect
+ 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+-	gopkg.in/yaml.v3 v3.0.1 // indirect
+ )
+diff --git a/tests/k8s/scenarios/multitenant_sanity_test.go b/tests/k8s/scenarios/multitenant_sanity_test.go
+new file mode 100644
+index 000000000..ff4d74fa8
+--- /dev/null
++++ b/tests/k8s/scenarios/multitenant_sanity_test.go
+@@ -0,0 +1,119 @@
++//go:build k8s
++
++package scenarios
++
++import (
++	"context"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/maximhq/bifrost/tests/k8s/fixtures"
++)
++
++// TestMultiTenantSanity boots Bifrost with multi-tenancy ON
++// (BIFROST_MULTI_TENANT_ENABLED=true), provisions two independent tenants
++// against the in-cluster mock LLM, drives one chat per tenant, then
++// deletes tenant A's virtual key and verifies:
++//
++//  1. tenant A's chat now 401s (proof the VK resolver cache was
++//     invalidated immediately, per patch 0028 — without the
++//     invalidator, the deleted VK would still resolve for up to 60s),
++//  2. tenant B's chat still succeeds (proof the invalidation was
++//     scoped to A's VK only).
++//
++// This is the smallest E2E that proves multi-tenant routing is
++// end-to-end correct on a real binary in a real cluster. Streaming,
++// async, MCP, multi-replica propagation, and Anthropic-shape scenarios
++// each get their own follow-on test.
++//
++// Run with:
++//
++//	make test-k8s-image
++//	cd tests/k8s && GOWORK=off BIFROST_K8S_SKIP_BUILD=1 \
++//	    go test -tags=k8s -count=1 -timeout 30m \
++//	    -run '^TestMultiTenantSanity$' -v ./scenarios/...
++func TestMultiTenantSanity(t *testing.T) {
++	c, stopCluster := fixtures.NewKindCluster(t, fixtures.WithKindReuse())
++	defer stopCluster()
++
++	// adminDefaultTenant = "" — this scenario only drives /api/platform/*
++	// and /api/tenants/{tid}/*, never the legacy single-tenant surface,
++	// so AdminAuthz has no fallback work to do.
++	bf, teardown := fixtures.NewBifrostInstall(t, c, fixtures.WithMultiTenant(""))
++	defer teardown()
++
++	if !bf.MultiTenantEnabled {
++		t.Fatal("BifrostInstall reports multi-tenant disabled despite WithMultiTenant — option not wired through")
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
++	defer cancel()
++
++	mt := bf.MTAdmin()
++
++	// Both tenants share the same in-cluster mock LLM URL — isolation is
++	// asserted at the routing/auth layer (each tenant resolves to its
++	// own runtime), not by giving each tenant a different backend.
++	mockURL := bf.MockLLM.InClusterURL
++
++	tenants := []struct {
++		ID, Name string
++	}{
++		{"acme", "Acme Industries"},
++		{"globex", "Globex Corporation"},
++	}
++
++	vkByTenant := map[string]string{}
++	for _, tn := range tenants {
++		mt.CreateTenant(t, ctx, tn.ID, tn.Name)
++		mt.CreateProvider(t, ctx, tn.ID, "openai", mockURL)
++		mt.CreateProviderKey(t, ctx, tn.ID, "openai", "mock", "mock-key")
++		vkByTenant[tn.ID] = mt.CreateVirtualKey(t, ctx, tn.ID, "primary")
++	}
++
++	// Drive one inference per tenant. WaitForVKResolver handles the
++	// case where the tenant runtime hasn't lazy-loaded yet — the
++	// initial 401 retries inside the 30s budget rather than failing
++	// the test on a cold start.
++	for _, tn := range tenants {
++		res := mt.WaitForVKResolver(t, ctx, vkByTenant[tn.ID], "openai", "gpt-4o-mock", 30*time.Second)
++		if res.Err != nil {
++			t.Fatalf("tenant %s: chat call errored: %v", tn.ID, res.Err)
++		}
++		if res.StatusCode != http.StatusOK {
++			t.Fatalf("tenant %s: chat call status %d: %s", tn.ID, res.StatusCode, fixtures.SnippetOf(res.Body, 240))
++		}
++		t.Logf("tenant %s: chat 200 OK (snippet=%s)", tn.ID, fixtures.SnippetOf(res.Body, 120))
++	}
++
++	// --- Patch-0028 assertion: deleting a VK invalidates the resolver
++	// cache same-replica so the next chat 401s instead of routing.
++	acmeVKs := mt.ListVirtualKeys(t, ctx, "acme")
++	if len(acmeVKs) != 1 {
++		t.Fatalf("acme: expected 1 VK after seed; got %d (%v)", len(acmeVKs), acmeVKs)
++	}
++	mt.DeleteVirtualKey(t, ctx, "acme", acmeVKs[0].ID)
++
++	deletedRes := mt.Chat(ctx, vkByTenant["acme"], "openai", "gpt-4o-mock", "after-delete")
++	if deletedRes.Err != nil {
++		t.Fatalf("acme post-delete chat errored: %v", deletedRes.Err)
++	}
++	if deletedRes.StatusCode == http.StatusOK {
++		t.Fatalf("acme post-delete chat unexpectedly 200 — resolver cache NOT invalidated (patch 0028 broken or not deployed): %s",
++			fixtures.SnippetOf(deletedRes.Body, 240))
++	}
++	t.Logf("acme post-delete chat status=%d (expected 401/403/404) — resolver cache invalidation confirmed", deletedRes.StatusCode)
++
++	// Globex's VK was never touched — it must still work. This rules
++	// out an InvalidateAll-style overcorrection.
++	stillRes := mt.Chat(ctx, vkByTenant["globex"], "openai", "gpt-4o-mock", "after-acme-delete")
++	if stillRes.Err != nil {
++		t.Fatalf("globex post-delete chat errored: %v", stillRes.Err)
++	}
++	if stillRes.StatusCode != http.StatusOK {
++		t.Fatalf("globex post-acme-delete chat status %d — invalidation leaked across tenants: %s",
++			stillRes.StatusCode, fixtures.SnippetOf(stillRes.Body, 240))
++	}
++	t.Logf("globex chat 200 OK after acme VK delete — per-VK invalidation confirmed")
++}
+-- 
+2.51.0
+
