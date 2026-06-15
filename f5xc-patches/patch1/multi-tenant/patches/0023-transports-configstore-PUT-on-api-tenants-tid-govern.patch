@@ -1,0 +1,762 @@
+From b5410121d6df2c8bac35f368675fae22cb74ce9c Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Sun, 14 Jun 2026 20:46:25 -0600
+Subject: [PATCH] transports+configstore: PUT on
+ /api/tenants/{tid}/{governance/virtual-keys,mcp/clients}/{id}
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds in-place mutation for the two simpler tenant-scoped entities so
+operators can flip safe fields (VK active state / description / name;
+MCP disabled flag / connection string / connection type) without
+recreating the row. PUT on /api/tenants/{tid}/providers/{provider}
+follows in a separate patch — UpdateProvider has heavy VKPC-resync
+logic that needs its own review pass.
+
+configstore additions (delegate-then-verify; tenant_id re-pinned on
+the row before delegating so a malicious payload cannot move the row
+into another tenant's scope):
+- ConfigStore.UpdateVirtualKeyForTenant — verifies tenant ownership
+  via GetVirtualKeyByIDForTenant, force-pins tenant_id, then delegates
+  to UpdateVirtualKey (which preserves its existing id-or-name lookup
+  shape because we set ID = existing.ID before calling).
+- ConfigStore.UpdateMCPClientConfigForTenant — same shape for MCP.
+- MockConfigStore stubs added (single-implementation delegation).
+- Tests covering: own-tenant update visible to GET, cross-tenant
+  attempt returns ErrNotFound and leaves the target row untouched,
+  malicious tenant_id-in-payload defense.
+
+Transport additions:
+- handlers.TenantVirtualKeyHandler gains updateVirtualKey under
+  PUT /api/tenants/{tid}/governance/virtual-keys/{vk_id}. Body has
+  optional name/description/is_active; at least one must be present.
+  Loads the row in the calling tenant's scope, applies the patch
+  fields, delegates to UpdateVirtualKeyForTenant, then evicts the
+  per-tenant runtime so cached VK metadata is dropped.
+- handlers.TenantMCPHandler gains updateMCPClient under
+  PUT /api/tenants/{tid}/mcp/clients/{client_id}. Body has optional
+  disabled/connection_string/connection_type; same patch-apply-evict
+  shape.
+- Handler tests cover: happy-path PUT + evict, cross-tenant PUT 404
+  with target unchanged, empty-body 400.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  38 ++++++
+ framework/configstore/rdb_test.go             | 116 +++++++++++++++++
+ framework/configstore/store.go                |   9 ++
+ .../bifrost-http/handlers/tenant_mcp.go       |  72 +++++++++++
+ .../bifrost-http/handlers/tenant_mcp_test.go  | 116 +++++++++++++++++
+ .../handlers/tenant_virtualkeys.go            |  76 +++++++++++
+ .../handlers/tenant_virtualkeys_test.go       | 122 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |   8 ++
+ 8 files changed, 557 insertions(+)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index c9f25b300..133e98f2f 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -2112,6 +2112,24 @@ func (s *RDBConfigStore) UpdateMCPClientConfig(ctx context.Context, id string, c
+ 	})
+ }
+ 
++// UpdateMCPClientConfigForTenant verifies tenant ownership before
++// delegating to UpdateMCPClientConfig. tenant_id is re-pinned on the
++// supplied row so a malicious payload cannot move the client into
++// another tenant's scope through the update path.
++func (s *RDBConfigStore) UpdateMCPClientConfigForTenant(ctx context.Context, tenantID, id string, clientConfig *tables.TableMCPClient) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if clientConfig == nil {
++		return ErrNotFound
++	}
++	if _, err := s.GetMCPClientByIDForTenant(ctx, tenantID, id); err != nil {
++		return err
++	}
++	clientConfig.TenantID = tenantID
++	return s.UpdateMCPClientConfig(ctx, id, clientConfig)
++}
++
+ // DeleteMCPClientConfigForTenant is the tenant-scoped form: verifies
+ // tenant ownership before delegating to DeleteMCPClientConfig.
+ func (s *RDBConfigStore) DeleteMCPClientConfigForTenant(ctx context.Context, tenantID, id string) error {
+@@ -2968,6 +2986,26 @@ func (s *RDBConfigStore) GetAllRedactedKeys(ctx context.Context, ids []string) (
+ 	return redactedKeys, nil
+ }
+ 
++// UpdateVirtualKeyForTenant verifies tenant ownership before delegating
++// to UpdateVirtualKey. The supplied row gets tenant_id pinned to the
++// verified tenantID so a malicious payload cannot move the VK into
++// another tenant's scope.
++func (s *RDBConfigStore) UpdateVirtualKeyForTenant(ctx context.Context, tenantID string, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if virtualKey == nil || virtualKey.ID == "" {
++		return ErrNotFound
++	}
++	existing, err := s.GetVirtualKeyByIDForTenant(ctx, tenantID, virtualKey.ID)
++	if err != nil {
++		return err
++	}
++	virtualKey.ID = existing.ID
++	virtualKey.TenantID = tenantID
++	return s.UpdateVirtualKey(ctx, virtualKey, tx...)
++}
++
+ // DeleteVirtualKeyForTenant is the tenant-scoped form: only removes
+ // the VK when its tenant_id matches. Verifies tenant ownership first,
+ // then delegates to the existing DeleteVirtualKey transaction (which
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index c471f9762..aadf6fba5 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -2191,6 +2191,122 @@ func TestDeleteVirtualKeyForTenant_OnlyOwnTenant(t *testing.T) {
+ 	assert.ErrorIs(t, err, ErrNotFound)
+ }
+ 
++// TestUpdateVirtualKeyForTenant_OwnTenantSucceeds confirms a tenant
++// can update its own VK and observe the change.
++func TestUpdateVirtualKeyForTenant_OwnTenantSucceeds(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	isActive := true
++	original := &tables.TableVirtualKey{
++		ID: "vk-1", Name: "alpha", Value: "sk-bf-alpha", TenantID: "acme", IsActive: &isActive, Description: "before",
++	}
++	require.NoError(t, store.CreateVirtualKey(ctx, original))
++
++	updated := &tables.TableVirtualKey{
++		ID: "vk-1", Name: "alpha", Value: "sk-bf-alpha", TenantID: "acme", IsActive: &isActive, Description: "after",
++	}
++	require.NoError(t, store.UpdateVirtualKeyForTenant(ctx, "acme", updated))
++
++	got, err := store.GetVirtualKeyByIDForTenant(ctx, "acme", "vk-1")
++	require.NoError(t, err)
++	assert.Equal(t, "after", got.Description, "update should be visible to acme")
++}
++
++// TestUpdateVirtualKeyForTenant_CrossTenantReturnsNotFound proves an
++// admin in tenant A cannot mutate a VK that belongs to tenant B even
++// when they correctly guess the id.
++func TestUpdateVirtualKeyForTenant_CrossTenantReturnsNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	isActive := true
++	require.NoError(t, store.CreateVirtualKey(ctx, &tables.TableVirtualKey{
++		ID: "vk-secret", Name: "secret", Value: "sk-bf-secret", TenantID: "globex", IsActive: &isActive,
++	}))
++
++	err := store.UpdateVirtualKeyForTenant(ctx, "acme", &tables.TableVirtualKey{
++		ID: "vk-secret", Name: "secret", Value: "sk-bf-secret", IsActive: &isActive, Description: "hijack attempt",
++	})
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestUpdateVirtualKeyForTenant_RepinsTenantOnPayload defends against
++// a malicious payload that tries to move the VK into a different
++// tenant by setting TenantID in the body.
++func TestUpdateVirtualKeyForTenant_RepinsTenantOnPayload(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	isActive := true
++	require.NoError(t, store.CreateVirtualKey(ctx, &tables.TableVirtualKey{
++		ID: "vk-1", Name: "alpha", Value: "sk-bf-alpha", TenantID: "acme", IsActive: &isActive,
++	}))
++
++	// Payload claims to be moving the VK into globex; should be re-
++	// pinned to acme by UpdateVirtualKeyForTenant.
++	bad := &tables.TableVirtualKey{
++		ID: "vk-1", Name: "alpha", Value: "sk-bf-alpha", TenantID: "globex", IsActive: &isActive, Description: "moved?",
++	}
++	require.NoError(t, store.UpdateVirtualKeyForTenant(ctx, "acme", bad))
++
++	// VK stays with acme. globex still cannot see it.
++	_, err := store.GetVirtualKeyByIDForTenant(ctx, "globex", "vk-1")
++	assert.ErrorIs(t, err, ErrNotFound)
++	stillAcme, err := store.GetVirtualKeyByIDForTenant(ctx, "acme", "vk-1")
++	require.NoError(t, err)
++	assert.Equal(t, "acme", stillAcme.TenantID)
++}
++
++// TestUpdateMCPClientConfigForTenant_OwnTenantSucceeds confirms a
++// tenant-scoped update flips a field and is observable in the
++// tenant's read path.
++func TestUpdateMCPClientConfigForTenant_OwnTenantSucceeds(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	require.NoError(t, store.CreateMCPClientConfigForTenant(ctx, "acme", &schemas.MCPClientConfig{
++		ID:               "mcp-1",
++		Name:             "tools",
++		ConnectionType:   schemas.MCPConnectionTypeHTTP,
++		ConnectionString: schemas.NewEnvVar("https://acme/mcp"),
++	}))
++
++	existing, err := store.GetMCPClientByIDForTenant(ctx, "acme", "mcp-1")
++	require.NoError(t, err)
++	existing.Disabled = true
++	require.NoError(t, store.UpdateMCPClientConfigForTenant(ctx, "acme", "mcp-1", existing))
++
++	after, err := store.GetMCPClientByIDForTenant(ctx, "acme", "mcp-1")
++	require.NoError(t, err)
++	assert.True(t, after.Disabled, "update should be visible to acme")
++}
++
++// TestUpdateMCPClientConfigForTenant_CrossTenantReturnsNotFound asserts
++// the MCP equivalent of the VK cross-tenant isolation check.
++func TestUpdateMCPClientConfigForTenant_CrossTenantReturnsNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	require.NoError(t, store.CreateMCPClientConfigForTenant(ctx, "globex", &schemas.MCPClientConfig{
++		ID:               "mcp-globex",
++		Name:             "tools",
++		ConnectionType:   schemas.MCPConnectionTypeHTTP,
++		ConnectionString: schemas.NewEnvVar("https://globex/mcp"),
++	}))
++	existing, err := store.GetMCPClientByIDForTenant(ctx, "globex", "mcp-globex")
++	require.NoError(t, err)
++	existing.Disabled = true
++
++	err = store.UpdateMCPClientConfigForTenant(ctx, "acme", "mcp-globex", existing)
++	assert.ErrorIs(t, err, ErrNotFound)
++
++	// globex's row stays untouched.
++	still, err := store.GetMCPClientByIDForTenant(ctx, "globex", "mcp-globex")
++	require.NoError(t, err)
++	assert.False(t, still.Disabled, "globex's row should not have flipped under a cross-tenant attempt")
++}
++
+ // TestGetMCPClientByIDForTenant_CrossTenantReturnsNotFound covers the
+ // MCP equivalent of the VK isolation check.
+ func TestGetMCPClientByIDForTenant_CrossTenantReturnsNotFound(t *testing.T) {
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index 305b8fcc2..fe2c8e25e 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -203,6 +203,10 @@ type ConfigStore interface {
+ 	// tenant_id matches the supplied tenantID. Returns ErrNotFound on
+ 	// cross-tenant probes.
+ 	DeleteMCPClientConfigForTenant(ctx context.Context, tenantID, id string) error
++	// UpdateMCPClientConfigForTenant verifies the target client belongs
++	// to the supplied tenantID before delegating to UpdateMCPClientConfig.
++	// tenant_id is re-pinned on the row.
++	UpdateMCPClientConfigForTenant(ctx context.Context, tenantID, id string, clientConfig *tables.TableMCPClient) error
+ 
+ 	// Vector store config CRUD
+ 	UpdateVectorStoreConfig(ctx context.Context, config *vectorstore.Config) error
+@@ -246,6 +250,11 @@ type ConfigStore interface {
+ 	// matches the supplied tenantID. Returns ErrNotFound if the VK
+ 	// lives in another tenant's scope.
+ 	DeleteVirtualKeyForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error
++	// UpdateVirtualKeyForTenant verifies the target VK belongs to the
++	// supplied tenantID before delegating to UpdateVirtualKey. tenant_id
++	// is re-pinned on the row so a malicious payload cannot move a VK
++	// into another tenant's scope through the update path.
++	UpdateVirtualKeyForTenant(ctx context.Context, tenantID string, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error
+ 
+ 	// Virtual key provider config CRUD
+ 	GetVirtualKeyProviderConfigs(ctx context.Context, virtualKeyID string) ([]tables.TableVirtualKeyProviderConfig, error)
+diff --git a/transports/bifrost-http/handlers/tenant_mcp.go b/transports/bifrost-http/handlers/tenant_mcp.go
+index 75ecd462a..ca41d85a4 100644
+--- a/transports/bifrost-http/handlers/tenant_mcp.go
++++ b/transports/bifrost-http/handlers/tenant_mcp.go
+@@ -48,9 +48,20 @@ func (h *TenantMCPHandler) RegisterRoutes(r *router.Router, middlewares ...schem
+ 	r.GET("/api/tenants/{tenant_id}/mcp/clients", lib.ChainMiddlewares(h.listMCPClients, middlewares...))
+ 	r.POST("/api/tenants/{tenant_id}/mcp/clients", lib.ChainMiddlewares(h.createMCPClient, middlewares...))
+ 	r.GET("/api/tenants/{tenant_id}/mcp/clients/{client_id}", lib.ChainMiddlewares(h.getMCPClient, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/mcp/clients/{client_id}", lib.ChainMiddlewares(h.updateMCPClient, middlewares...))
+ 	r.DELETE("/api/tenants/{tenant_id}/mcp/clients/{client_id}", lib.ChainMiddlewares(h.deleteMCPClient, middlewares...))
+ }
+ 
++// UpdateTenantMCPClientRequest is the v1 minimum-viable PUT body.
++// Lets operators flip the disabled flag (drain a tenant's tool flow
++// without removing config) and rotate the connection string. id is
++// taken from the URL, not the body.
++type UpdateTenantMCPClientRequest struct {
++	Disabled         *bool                      `json:"disabled,omitempty"`
++	ConnectionString *schemas.EnvVar            `json:"connection_string,omitempty"`
++	ConnectionType   *schemas.MCPConnectionType `json:"connection_type,omitempty"`
++}
++
+ // CreateTenantMCPClientRequest is the minimum-viable payload — enough to
+ // register an HTTP or STDIO MCP server with no auth. The legacy
+ // MCPClientRequest under /api/mcp/client supports OAuth, headers,
+@@ -178,6 +189,67 @@ func (h *TenantMCPHandler) getMCPClient(ctx *fasthttp.RequestCtx) {
+ 	SendJSON(ctx, dbClient)
+ }
+ 
++// updateMCPClient — PUT /api/tenants/{tenant_id}/mcp/clients/{client_id}
++//
++// v1 only flips the safe fields (disabled, connection_string,
++// connection_type). Headers/OAuth/tool-pricing/etc. follow the legacy
++// /api/mcp/client/{id} when tenant-admin auth lands.
++func (h *TenantMCPHandler) updateMCPClient(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	clientID, _ := ctx.UserValue("client_id").(string)
++	if clientID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "client_id is required")
++		return
++	}
++
++	var req UpdateTenantMCPClientRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Disabled == nil && req.ConnectionString == nil && req.ConnectionType == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "at least one of disabled, connection_string, connection_type is required")
++		return
++	}
++
++	existing, err := h.configStore.GetMCPClientByIDForTenant(ctx, string(tid), clientID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("MCP client %s not found for tenant %s", clientID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load mcp client: %v", err))
++		return
++	}
++
++	if req.Disabled != nil {
++		existing.Disabled = *req.Disabled
++	}
++	if req.ConnectionString != nil {
++		existing.ConnectionString = req.ConnectionString
++	}
++	if req.ConnectionType != nil {
++		existing.ConnectionType = string(*req.ConnectionType)
++	}
++
++	if err := h.configStore.UpdateMCPClientConfigForTenant(ctx, string(tid), clientID, existing); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("MCP client %s not found for tenant %s", clientID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update mcp client: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	SendJSON(ctx, existing)
++}
++
+ // deleteMCPClient — DELETE /api/tenants/{tenant_id}/mcp/clients/{client_id}
+ func (h *TenantMCPHandler) deleteMCPClient(ctx *fasthttp.RequestCtx) {
+ 	tid, ok := tenantIDFromCtx(ctx)
+diff --git a/transports/bifrost-http/handlers/tenant_mcp_test.go b/transports/bifrost-http/handlers/tenant_mcp_test.go
+index fe6cd3885..9f629b97b 100644
+--- a/transports/bifrost-http/handlers/tenant_mcp_test.go
++++ b/transports/bifrost-http/handlers/tenant_mcp_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/bytedance/sonic"
+ 	"github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
+ 	"github.com/maximhq/bifrost/multitenant"
+ 	"github.com/valyala/fasthttp"
+ )
+@@ -17,6 +18,7 @@ type stubMCPStore struct {
+ 	configstore.ConfigStore // nil embedded; unimplemented methods panic if hit
+ 	mu                      sync.Mutex
+ 	created                 []mcpCreateForTenantCall
++	stored                  []*configstoreTables.TableMCPClient
+ 	createErr               error
+ }
+ 
+@@ -166,3 +168,117 @@ func TestTenantMCPHandler_NewWithNilStore(t *testing.T) {
+ 		t.Fatal("nil store should error")
+ 	}
+ }
++
++// stubMCPStore extensions used by GET single + PUT tests.
++
++func (s *stubMCPStore) GetMCPClientByIDForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableMCPClient, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, c := range s.stored {
++		if c.ClientID == id && c.TenantID == tenantID {
++			cp := *c
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubMCPStore) UpdateMCPClientConfigForTenant(_ context.Context, tenantID, id string, cfg *configstoreTables.TableMCPClient) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, existing := range s.stored {
++		if existing.ClientID == id && existing.TenantID == tenantID {
++			cp := *cfg
++			cp.TenantID = tenantID
++			s.stored[i] = &cp
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func TestTenantMCPHandler_Update_HappyPath_Evicts(t *testing.T) {
++	store := &stubMCPStore{}
++	store.stored = append(store.stored, &configstoreTables.TableMCPClient{
++		ClientID: "mcp-1", TenantID: "acme", Name: "tools", ConnectionType: "http", Disabled: false,
++	})
++	evictor := &stubEvictor{}
++	h, _ := NewTenantMCPHandler(store, evictor)
++
++	body, _ := sonic.Marshal(map[string]any{"disabled": true})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/mcp/clients/mcp-1")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("client_id", "mcp-1")
++
++	h.updateMCPClient(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusOK; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if !store.stored[0].Disabled {
++		t.Fatal("disabled flag should have flipped")
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 || evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("Evict should fire; got %v", evictor.called)
++	}
++}
++
++func TestTenantMCPHandler_Update_CrossTenantReturns404(t *testing.T) {
++	store := &stubMCPStore{}
++	store.stored = append(store.stored, &configstoreTables.TableMCPClient{
++		ClientID: "mcp-secret", TenantID: "globex", Name: "tools", ConnectionType: "http",
++	})
++	h, _ := NewTenantMCPHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"disabled": true})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/mcp/clients/mcp-secret")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("client_id", "mcp-secret")
++
++	h.updateMCPClient(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant put should be 404; got %d", got)
++	}
++	// globex's row must not have flipped.
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.stored[0].Disabled {
++		t.Fatal("globex's row should not have been mutated by acme's PUT attempt")
++	}
++}
++
++func TestTenantMCPHandler_Update_RejectsEmptyBody(t *testing.T) {
++	store := &stubMCPStore{}
++	store.stored = append(store.stored, &configstoreTables.TableMCPClient{ClientID: "mcp-1", TenantID: "acme"})
++	h, _ := NewTenantMCPHandler(store, nil)
++
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/mcp/clients/mcp-1")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody([]byte(`{}`))
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("client_id", "mcp-1")
++
++	h.updateMCPClient(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("empty patch body should be 400; got %d", got)
++	}
++}
+diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys.go b/transports/bifrost-http/handlers/tenant_virtualkeys.go
+index 4c43087b7..9f394b0a8 100644
+--- a/transports/bifrost-http/handlers/tenant_virtualkeys.go
++++ b/transports/bifrost-http/handlers/tenant_virtualkeys.go
+@@ -57,9 +57,20 @@ func (h *TenantVirtualKeyHandler) RegisterRoutes(r *router.Router, middlewares .
+ 	r.GET("/api/tenants/{tenant_id}/governance/virtual-keys", lib.ChainMiddlewares(h.listVirtualKeys, middlewares...))
+ 	r.POST("/api/tenants/{tenant_id}/governance/virtual-keys", lib.ChainMiddlewares(h.createVirtualKey, middlewares...))
+ 	r.GET("/api/tenants/{tenant_id}/governance/virtual-keys/{vk_id}", lib.ChainMiddlewares(h.getVirtualKey, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/governance/virtual-keys/{vk_id}", lib.ChainMiddlewares(h.updateVirtualKey, middlewares...))
+ 	r.DELETE("/api/tenants/{tenant_id}/governance/virtual-keys/{vk_id}", lib.ChainMiddlewares(h.deleteVirtualKey, middlewares...))
+ }
+ 
++// UpdateTenantVirtualKeyRequest is the v1 minimum-viable PUT body. Only
++// the safe-to-flip fields are accepted (name + description + active
++// state); the VK value rotates via DELETE+POST rather than in-place
++// update so callers can't accidentally invalidate live VK references.
++type UpdateTenantVirtualKeyRequest struct {
++	Name        *string `json:"name,omitempty"`
++	Description *string `json:"description,omitempty"`
++	IsActive    *bool   `json:"is_active,omitempty"`
++}
++
+ // CreateTenantVirtualKeyRequest is the minimum-viable payload. The
+ // legacy CreateVirtualKeyRequest under /api/governance/virtual-keys
+ // supports many more fields; this v1 form keeps the surface tight so
+@@ -187,6 +198,71 @@ func (h *TenantVirtualKeyHandler) getVirtualKey(ctx *fasthttp.RequestCtx) {
+ 	SendJSON(ctx, vk)
+ }
+ 
++// updateVirtualKey — PUT /api/tenants/{tenant_id}/governance/virtual-keys/{vk_id}
++//
++// Accepts the safe-to-flip fields (name, description, is_active). Only
++// fields explicitly present in the body are touched; omitted fields
++// keep their current value. Evicts the per-tenant runtime so cached
++// VK metadata is dropped.
++func (h *TenantVirtualKeyHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	vkID, _ := ctx.UserValue("vk_id").(string)
++	if vkID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "vk_id is required")
++		return
++	}
++
++	var req UpdateTenantVirtualKeyRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == nil && req.Description == nil && req.IsActive == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "at least one of name, description, is_active is required")
++		return
++	}
++
++	existing, err := h.configStore.GetVirtualKeyByIDForTenant(ctx, string(tid), vkID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Virtual key %s not found for tenant %s", vkID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load virtual key: %v", err))
++		return
++	}
++
++	// Apply the patch in place. UpdateVirtualKeyForTenant re-pins
++	// tenant_id on the row before delegating, so a malicious payload
++	// can't reach this far.
++	if req.Name != nil {
++		existing.Name = *req.Name
++	}
++	if req.Description != nil {
++		existing.Description = *req.Description
++	}
++	if req.IsActive != nil {
++		existing.IsActive = req.IsActive
++	}
++
++	if err := h.configStore.UpdateVirtualKeyForTenant(ctx, string(tid), existing); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Virtual key %s not found for tenant %s", vkID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update virtual key: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	SendJSON(ctx, existing)
++}
++
+ // deleteVirtualKey — DELETE /api/tenants/{tenant_id}/governance/virtual-keys/{vk_id}
+ //
+ // 204 on success, 404 on cross-tenant / missing. Evicts the per-tenant
+diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+index 592b61bc8..de9ce4d3b 100644
+--- a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
++++ b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+@@ -2,6 +2,7 @@ package handlers
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"net"
+ 	"strings"
+ 	"sync"
+@@ -166,6 +167,127 @@ func TestTenantVirtualKeyHandler_NewWithNilStore(t *testing.T) {
+ 	}
+ }
+ 
++// stubVKStore extensions to back GET single + PUT tests.
++
++func (s *stubVKStore) GetVirtualKeyByIDForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableVirtualKey, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, vk := range s.created {
++		if vk.ID == id && vk.TenantID == tenantID {
++			cp := *vk
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubVKStore) UpdateVirtualKeyForTenant(_ context.Context, tenantID string, vk *configstoreTables.TableVirtualKey, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, existing := range s.created {
++		if existing.ID == vk.ID && existing.TenantID == tenantID {
++			cp := *vk
++			cp.TenantID = tenantID
++			s.created[i] = &cp
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func TestTenantVirtualKeyHandler_Update_HappyPath_Evicts(t *testing.T) {
++	store := &stubVKStore{}
++	isActive := true
++	store.created = append(store.created, &configstoreTables.TableVirtualKey{
++		ID: "vk-1", TenantID: "acme", Name: "alpha", Value: "sk-bf-alpha", IsActive: &isActive, Description: "before",
++	})
++	evictor := &stubEvictor{}
++	h, _ := NewTenantVirtualKeyHandler(store, evictor)
++
++	body, _ := sonic.Marshal(map[string]any{"description": "after"})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/governance/virtual-keys/vk-1")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("vk_id", "vk-1")
++
++	h.updateVirtualKey(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusOK; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if got := store.created[0].Description; got != "after" {
++		t.Fatalf("description should have been patched; got %q", got)
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 || evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("Evict should fire for acme; got %v", evictor.called)
++	}
++}
++
++func TestTenantVirtualKeyHandler_Update_CrossTenantReturns404(t *testing.T) {
++	store := &stubVKStore{}
++	isActive := true
++	store.created = append(store.created, &configstoreTables.TableVirtualKey{
++		ID: "vk-secret", TenantID: "globex", Name: "secret", Value: "sk-bf-secret", IsActive: &isActive,
++	})
++	h, _ := NewTenantVirtualKeyHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{"description": "hijack"})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/governance/virtual-keys/vk-secret")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("vk_id", "vk-secret")
++
++	h.updateVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant put should be 404; got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	// Original row untouched.
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if got := store.created[0].Description; got != "" {
++		t.Fatalf("globex's row should not have been mutated; got description=%q", got)
++	}
++}
++
++func TestTenantVirtualKeyHandler_Update_RejectsEmptyBody(t *testing.T) {
++	store := &stubVKStore{}
++	store.created = append(store.created, &configstoreTables.TableVirtualKey{ID: "vk-1", TenantID: "acme"})
++	h, _ := NewTenantVirtualKeyHandler(store, nil)
++
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/governance/virtual-keys/vk-1")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody([]byte(`{}`))
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("vk_id", "vk-1")
++
++	h.updateVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("empty patch body should be 400; got %d", got)
++	}
++}
++
++// Ensures errors package is referenced from this file (used by the
++// PUT/DELETE error-mapping logic above) — keeps the imports list
++// honest under go vet's unused-import check.
++var _ = errors.New
++
+ func TestTenantVirtualKeyHandler_Create_EvictsTenantRuntime(t *testing.T) {
+ 	store := &stubVKStore{}
+ 	evictor := &stubEvictor{}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index 3265e45ae..6658c7799 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -609,6 +609,10 @@ func (m *MockConfigStore) DeleteMCPClientConfigForTenant(ctx context.Context, te
+ 	return m.DeleteMCPClientConfig(ctx, id)
+ }
+ 
++func (m *MockConfigStore) UpdateMCPClientConfigForTenant(ctx context.Context, tenantID, id string, clientConfig *tables.TableMCPClient) error {
++	return m.UpdateMCPClientConfig(ctx, id, clientConfig)
++}
++
+ func (m *MockConfigStore) GetMCPClientConfigByID(ctx context.Context, id string) (*schemas.MCPClientConfig, error) {
+ 	return nil, nil
+ }
+@@ -880,6 +884,10 @@ func (m *MockConfigStore) DeleteVirtualKeyForTenant(ctx context.Context, tenantI
+ 	return m.DeleteVirtualKey(ctx, id, tx...)
+ }
+ 
++func (m *MockConfigStore) UpdateVirtualKeyForTenant(ctx context.Context, tenantID string, vk *tables.TableVirtualKey, tx ...*gorm.DB) error {
++	return m.UpdateVirtualKey(ctx, vk, tx...)
++}
++
+ func (m *MockConfigStore) GetVirtualKey(ctx context.Context, id string) (*tables.TableVirtualKey, error) {
+ 	return nil, nil
+ }
+-- 
+2.51.0
+
