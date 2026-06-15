@@ -1,0 +1,414 @@
+From 0cebbaf82bdc21a63fbf711230d46a043ba9a2bd Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 08:57:20 -0600
+Subject: [PATCH 2/4] transports: tenant_providers response shapes + PUT key +
+ full key payload
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cluster of follow-up fixes the first real UI exercise of the
+multi-tenant admin surface forced into the open. All landed in one
+patch because they're variations of the same underlying mistake:
+the v1 tenant-scoped handlers were returning slim {tenant_id,
+provider, ...} envelopes that didn't match the rich shapes the UI's
+RTK Query mutations + optimistic cache updates expect.
+
+Behavioral fixes (each one a real "doesn't work" report from
+browser testing):
+
+  1. POST /api/tenants/{tid}/providers used to return
+     {tenant_id, provider}. The UI's createProvider mutation does
+     draft.push(newProvider) then sortProviders which reads .name —
+     undefined .name throws inside .localeCompare and the React
+     error boundary surfaces "Something went wrong". Now returns
+     the full ProviderResponse shape (name, network_config,
+     concurrency_and_buffer_size, provider_status, …) via a new
+     buildTenantProviderResponse helper that mirrors the legacy
+     ProviderHandler.getProviderResponseFromConfig without taking
+     a *ProviderHandler receiver.
+
+  2. GET /api/tenants/{tid}/providers returned providers as a
+     MAP keyed by name; the UI expects an ARRAY of rows each with
+     .name. The map-keyed response flattened into a list of empty
+     ModelProvider objects and the providers list rendered zero
+     rows even when the tenant had providers. Now returns
+     {providers: [...], total} matching ListProvidersResponse.
+
+  3. GET /api/tenants/{tid}/providers/{p} returned
+     {tenant_id, provider, config: {...}}; the UI expects the rich
+     shape at the top level. Same fix.
+
+  4. PUT /api/tenants/{tid}/providers/{p} (update) returned the
+     same slim shape — same React error boundary on save. Same fix.
+
+  5. POST /api/tenants/{tid}/providers/{p}/keys was reading just
+     {ID, Name, Value} and silently dropping Models, Weight,
+     Enabled, Aliases, BlacklistedModels, and every key-type-
+     specific config. So the UI's add-key form let the user pick
+     models but they never persisted; inference 400'd with "no
+     keys found that support model: X". Payload now embeds the
+     full schemas.Key; Models defaults to ["*"] when omitted (the
+     legacy single-tenant flow's behaviour).
+
+  6. PUT /api/tenants/{tid}/providers/{p}/keys/{key_id} (key
+     update) was MISSING ENTIRELY — fasthttp's MethodNotAllowed
+     returned a 4xx and the UI's edit-key form silently failed.
+     New handler takes the full schemas.Key, ID pinned from URL
+     (NOT body) so a typo'd id can't redirect the update,
+     carries forward Name/Value/Models when the body left them
+     blank, redacts Value in the response, evicts the per-tenant
+     runtime.
+
+Tests:
+  - tenant_providers_test.go updated to assert the new array-shape
+    list response. Old map-shape would have masked future regressions.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../bifrost-http/handlers/tenant_providers.go | 214 ++++++++++++++----
+ .../handlers/tenant_providers_test.go         |  22 +-
+ 2 files changed, 182 insertions(+), 54 deletions(-)
+
+diff --git a/transports/bifrost-http/handlers/tenant_providers.go b/transports/bifrost-http/handlers/tenant_providers.go
+index ba35dddac..cd01d33ac 100644
+--- a/transports/bifrost-http/handlers/tenant_providers.go
++++ b/transports/bifrost-http/handlers/tenant_providers.go
+@@ -72,6 +72,7 @@ func (h *TenantProviderHandler) RegisterRoutes(r *router.Router, middlewares ...
+ 	r.GET("/api/tenants/{tenant_id}/providers/{provider}/keys", lib.ChainMiddlewares(h.listProviderKeys, middlewares...))
+ 	r.POST("/api/tenants/{tenant_id}/providers/{provider}/keys", lib.ChainMiddlewares(h.createProviderKey, middlewares...))
+ 	r.GET("/api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.getProviderKey, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.updateProviderKey, middlewares...))
+ 	r.DELETE("/api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.deleteProviderKey, middlewares...))
+ }
+ 
+@@ -167,19 +168,56 @@ func (h *TenantProviderHandler) createProvider(ctx *fasthttp.RequestCtx) {
+ 		h.evictor.Evict(tid)
+ 	}
+ 
+-	SendJSONWithStatus(ctx, map[string]any{
+-		"tenant_id": string(tid),
+-		"provider":  string(payload.Provider),
+-	}, fasthttp.StatusCreated)
++	// Return the same rich ProviderResponse shape the legacy POST
++	// /api/providers returns so the UI's optimistic cache update
++	// (which expects Name + NetworkConfig + ConcurrencyAndBufferSize
++	// + status) round-trips correctly. A slimmer {tenant_id, provider}
++	// shape would silently break the providers-list refresh under the
++	// Stage 2 baseQuery rewriter, since the optimistic push would
++	// drop a half-populated row into the cache.
++	SendJSONWithStatus(ctx, buildTenantProviderResponse(payload.Provider, config), fasthttp.StatusCreated)
++}
++
++// buildTenantProviderResponse mirrors ProviderHandler.getProviderResponseFromConfig
++// without taking a *ProviderHandler receiver, so the tenant-scoped
++// handlers can return the same wire shape without depending on the
++// legacy handler's lifecycle. tenant_id is added as an extra field —
++// surfaced for clients that filter the response by tenant, harmless to
++// the UI's typed ModelProvider (it just ignores unknown fields).
++func buildTenantProviderResponse(provider schemas.ModelProvider, config configstore.ProviderConfig) map[string]any {
++	if config.NetworkConfig == nil {
++		nc := schemas.DefaultNetworkConfig
++		config.NetworkConfig = &nc
++	}
++	if config.ConcurrencyAndBufferSize == nil {
++		cb := schemas.DefaultConcurrencyAndBufferSize
++		config.ConcurrencyAndBufferSize = &cb
++	}
++	return map[string]any{
++		"name":                        provider,
++		"network_config":              *config.NetworkConfig,
++		"concurrency_and_buffer_size": *config.ConcurrencyAndBufferSize,
++		"proxy_config":                config.ProxyConfig,
++		"send_back_raw_request":       config.SendBackRawRequest,
++		"send_back_raw_response":      config.SendBackRawResponse,
++		"store_raw_request_response":  config.StoreRawRequestResponse,
++		"custom_provider_config":      config.CustomProviderConfig,
++		"openai_config":               config.OpenAIConfig,
++		"provider_status":             ProviderStatusActive,
++		"status":                      config.Status,
++		"description":                 config.Description,
++		"config_hash":                 config.ConfigHash,
++	}
+ }
+ 
+ // listProviders — GET /api/tenants/{tenant_id}/providers
+ //
+-// Returns the tenant's full provider map (config redacted via the
+-// store's Redacted() helper so key values don't leak). The response
+-// shape matches the legacy /api/providers list endpoint enough to
+-// support the same UI; callers that care should treat the v1 shape
+-// as a JSON object keyed by provider name.
++// Returns the tenant's providers in the SAME wire shape as the legacy
++// /api/providers list endpoint (ListProvidersResponse: providers as
++// an ARRAY of ProviderResponse, plus total). The UI's getProviders
++// query keys off response.providers[].name; a map-keyed-by-name
++// response would flatten to a list of empty ModelProvider objects
++// and the providers list would render as zero rows.
+ func (h *TenantProviderHandler) listProviders(ctx *fasthttp.RequestCtx) {
+ 	tid, ok := tenantIDFromCtx(ctx)
+ 	if !ok {
+@@ -191,14 +229,13 @@ func (h *TenantProviderHandler) listProviders(ctx *fasthttp.RequestCtx) {
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list providers: %v", err))
+ 		return
+ 	}
+-	redacted := make(map[string]any, len(providers))
++	rows := make([]map[string]any, 0, len(providers))
+ 	for name, cfg := range providers {
+-		redacted[string(name)] = cfg.Redacted()
++		rows = append(rows, buildTenantProviderResponse(name, *cfg.Redacted()))
+ 	}
+ 	SendJSON(ctx, map[string]any{
+-		"tenant_id": string(tid),
+-		"providers": redacted,
+-		"total":     len(redacted),
++		"providers": rows,
++		"total":     len(rows),
+ 	})
+ }
+ 
+@@ -223,11 +260,11 @@ func (h *TenantProviderHandler) getProvider(ctx *fasthttp.RequestCtx) {
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider: %v", err))
+ 		return
+ 	}
+-	SendJSON(ctx, map[string]any{
+-		"tenant_id": string(tid),
+-		"provider":  providerStr,
+-		"config":    cfg.Redacted(),
+-	})
++	// Return the same rich ProviderResponse shape getProvider's UI
++	// caller (and the optimistic cache update on PUT) expects — Name
++	// at the top level, NetworkConfig + ConcurrencyAndBufferSize +
++	// status fields alongside, NOT nested under a "config" key.
++	SendJSON(ctx, buildTenantProviderResponse(schemas.ModelProvider(providerStr), *cfg.Redacted()))
+ }
+ 
+ // updateProvider — PUT /api/tenants/{tenant_id}/providers/{provider}
+@@ -318,11 +355,13 @@ func (h *TenantProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 	if h.evictor != nil {
+ 		h.evictor.Evict(tid)
+ 	}
+-	SendJSON(ctx, map[string]any{
+-		"tenant_id": string(tid),
+-		"provider":  providerStr,
+-		"config":    updated.Redacted(),
+-	})
++	// Return rich ProviderResponse so the UI's updateProvider
++	// mutation's onQueryStarted can update the getProviders cache
++	// without crashing — sortProviders reads `name`, which a
++	// {tenant_id, provider, config} shape wouldn't surface; the
++	// undefined .name would throw inside .localeCompare and the
++	// React error boundary would show "Something went wrong".
++	SendJSON(ctx, buildTenantProviderResponse(schemas.ModelProvider(providerStr), *updated.Redacted()))
+ }
+ 
+ // deleteProvider — DELETE /api/tenants/{tenant_id}/providers/{provider}
+@@ -355,12 +394,16 @@ func (h *TenantProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
+ 	ctx.SetStatusCode(fasthttp.StatusNoContent)
+ }
+ 
+-// providerKeyCreatePayload accepts a single key. We require name + value
+-// at the API boundary; id is optional (server mints a UUID if absent).
++// providerKeyCreatePayload mirrors the legacy POST
++// /api/providers/{provider}/keys body so the UI's add-key form (which
++// sends the full schemas.Key — name, value, models, weight, aliases,
++// blacklisted_models, etc.) round-trips through the tenant-scoped
++// route without silently dropping fields.
++//
++// Embedding schemas.Key directly means we inherit every wire-format
++// field schema in the project — no per-field shadowing.
+ type providerKeyCreatePayload struct {
+-	ID    string `json:"id,omitempty"`
+-	Name  string `json:"name"`
+-	Value string `json:"value"`
++	schemas.Key
+ }
+ 
+ // listProviderKeys — GET /api/tenants/{tenant_id}/providers/{provider}/keys
+@@ -424,24 +467,22 @@ func (h *TenantProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ 		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
+ 		return
+ 	}
+-	if payload.Value == "" {
++	if payload.Value.GetValue() == "" {
+ 		SendError(ctx, fasthttp.StatusBadRequest, "value is required")
+ 		return
+ 	}
+ 	if payload.ID == "" {
+ 		payload.ID = uuid.NewString()
+ 	}
+-
+-	key := schemas.Key{
+-		ID:    payload.ID,
+-		Name:  payload.Name,
+-		Value: *schemas.NewEnvVar(payload.Value),
+-		// Default Models to wildcard so a freshly-attached key can
+-		// drive inference without a follow-up edit. v1 payload doesn't
+-		// expose Models; a follow-on patch will add it as an optional
+-		// payload field and only fall back to "*" when omitted.
+-		Models: []string{"*"},
++	// Default Models to wildcard when the caller omitted it so a freshly
++	// attached key can drive inference without a follow-up edit. The
++	// legacy single-tenant flow had the same default; preserving it
++	// keeps form behavior identical across tenant-scoped vs legacy.
++	if len(payload.Models) == 0 {
++		payload.Models = []string{"*"}
+ 	}
++
++	key := payload.Key
+ 	if err := h.configStore.CreateProviderKeyForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), key); err != nil {
+ 		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
+@@ -457,12 +498,14 @@ func (h *TenantProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ 	if h.evictor != nil {
+ 		h.evictor.Evict(tid)
+ 	}
+-	SendJSONWithStatus(ctx, map[string]any{
+-		"tenant_id": string(tid),
+-		"provider":  providerStr,
+-		"id":        payload.ID,
+-		"name":      payload.Name,
+-	}, fasthttp.StatusCreated)
++	// Return the full schemas.Key shape so the UI's optimistic provider-
++	// keys cache update has every field its TypeScript type expects
++	// (models, weight, enabled, aliases, …). Redact the value on the
++	// way out — secrets never leave the server in plaintext after the
++	// create response, matching listProviderKeys's behavior.
++	respKey := key
++	respKey.Value = *schemas.NewEnvVar("REDACTED")
++	SendJSONWithStatus(ctx, respKey, fasthttp.StatusCreated)
+ }
+ 
+ // getProviderKey — GET /api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}
+@@ -499,6 +542,85 @@ func (h *TenantProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
+ 	})
+ }
+ 
++// updateProviderKey — PUT /api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}
++//
++// Updates an existing key in place. Body accepts the full schemas.Key
++// shape (name, value, models, weight, aliases, enabled, …) so the UI's
++// edit-key form round-trips end-to-end. ID is read from the URL, NOT
++// the body — the path is the source of truth so a typo'd id in the
++// payload can't redirect the update to a different key.
++//
++// Cross-tenant safety: we GetProviderKeyForTenant first to confirm
++// the key belongs to the calling tenant, then UpdateProviderKey
++// (which works against the global key row). Without the tenant
++// verification step a tenant could PUT another tenant's key by
++// guessing the id; the GET check makes that a 404.
++//
++// Value rotation: passing a new value in the body rotates the key in
++// place. Inference resumes against the new value on the next request
++// (after the per-tenant runtime eviction below picks up the change).
++func (h *TenantProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	keyID, _ := ctx.UserValue("key_id").(string)
++	if providerStr == "" || keyID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider and key_id are required")
++		return
++	}
++	// Verify the key belongs to this tenant before mutating.
++	existing, err := h.configStore.GetProviderKeyForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), keyID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Key %s not found for tenant %s / provider %s", keyID, tid, providerStr))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load key: %v", err))
++		return
++	}
++	var payload schemas.Key
++	if err := sonic.Unmarshal(ctx.PostBody(), &payload); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	// Pin id from the URL; the body's id is ignored. Carry forward
++	// fields the body left blank so partial-update payloads don't
++	// silently null out existing state.
++	payload.ID = keyID
++	if payload.Name == "" {
++		payload.Name = existing.Name
++	}
++	if payload.Value.GetValue() == "" {
++		// No new value supplied — keep the existing one. The persisted
++		// EnvVar carries the encrypted blob; we don't need to decrypt
++		// here because UpdateProviderKey writes the whole row.
++		payload.Value = existing.Value
++	}
++	if len(payload.Models) == 0 {
++		payload.Models = existing.Models
++	}
++
++	if err := h.configStore.UpdateProviderKey(ctx, schemas.ModelProvider(providerStr), keyID, payload); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Key %s not found for provider %s", keyID, providerStr))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update key: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	// Redact the value before responding — secrets only leave the
++	// server on the create response; subsequent reads/updates redact.
++	respKey := payload
++	respKey.Value = *schemas.NewEnvVar("REDACTED")
++	SendJSON(ctx, respKey)
++}
++
+ // deleteProviderKey — DELETE /api/tenants/{tenant_id}/providers/{provider}/keys/{key_id}
+ func (h *TenantProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
+ 	tid, ok := tenantIDFromCtx(ctx)
+diff --git a/transports/bifrost-http/handlers/tenant_providers_test.go b/transports/bifrost-http/handlers/tenant_providers_test.go
+index ac11aff62..33a116dd5 100644
+--- a/transports/bifrost-http/handlers/tenant_providers_test.go
++++ b/transports/bifrost-http/handlers/tenant_providers_test.go
+@@ -241,24 +241,30 @@ func TestTenantProviderHandler_ListProviders_FiltersByTenant(t *testing.T) {
+ 	if got, want := ctx.Response.StatusCode(), fasthttp.StatusOK; got != want {
+ 		t.Fatalf("status got %d want %d (body=%s)", got, want, string(ctx.Response.Body()))
+ 	}
++	// Response shape mirrors the legacy ListProvidersResponse: an
++	// ARRAY of provider rows (each with name/network_config/...), plus
++	// total. Map-keyed-by-name would force the UI's getProviders cache
++	// into a list of empty ModelProvider objects, breaking sort + sidebar.
+ 	var resp struct {
+-		TenantID  string                 `json:"tenant_id"`
+-		Providers map[string]interface{} `json:"providers"`
+-		Total     int                    `json:"total"`
++		Providers []struct {
++			Name string `json:"name"`
++		} `json:"providers"`
++		Total int `json:"total"`
+ 	}
+ 	if err := sonic.Unmarshal(ctx.Response.Body(), &resp); err != nil {
+ 		t.Fatalf("decode: %v", err)
+ 	}
+-	if resp.TenantID != "acme" {
+-		t.Fatalf("tenant_id echo got %q want acme", resp.TenantID)
+-	}
+ 	if resp.Total != 2 {
+ 		t.Fatalf("acme should see 2 providers; got %d (providers=%v)", resp.Total, resp.Providers)
+ 	}
+-	if _, ok := resp.Providers["openai"]; !ok {
++	names := make(map[string]bool, len(resp.Providers))
++	for _, p := range resp.Providers {
++		names[p.Name] = true
++	}
++	if !names["openai"] {
+ 		t.Fatal("acme should see openai")
+ 	}
+-	if _, ok := resp.Providers["anthropic"]; !ok {
++	if !names["anthropic"] {
+ 		t.Fatal("acme should see anthropic")
+ 	}
+ }
+-- 
+2.51.0
+

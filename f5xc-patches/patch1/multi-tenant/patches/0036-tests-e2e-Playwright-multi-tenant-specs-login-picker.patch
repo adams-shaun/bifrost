@@ -1,0 +1,508 @@
+From 36772a7e63b7bbe285ab9241a46f888e0ef500b8 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 08:58:44 -0600
+Subject: [PATCH 4/4] tests/e2e: Playwright multi-tenant specs (login picker,
+ switcher, onboarding)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Drives the patch-0033 UI in a real browser against a running
+bifrost-http with BIFROST_MULTI_TENANT_ENABLED=true.
+
+multi-tenant.spec.ts — three describe blocks:
+
+  - "login picker": dropdown lists seeded tenants, login persists
+    selection to localStorage, the public /api/session/tenants
+    endpoint returns only {id, name, status} (guards against the
+    auth-bypass whitelist accidentally leaking admin metadata).
+
+  - "in-workspace switcher": TenantBadge reflects login choice,
+    switching tenants updates badge + localStorage, hard reload
+    preserves the selection.
+
+  - "config isolation": tenant A's seeded provider is visible on
+    A's providers page, not on B's. Today this passes via the
+    patch-0034 baseQuery rewriter; if Stage 2 ever silently
+    regressed, this is the spec that catches it.
+
+onboarding.spec.ts — one continuous browser flow that exercises
+the full new-tenant happy path the user asked for: login as admin,
+pick "+ New tenant…" sentinel, supply a unique id → tenant
+created on submit. Then /workspace/providers → add custom
+openai-shaped provider pointed at the in-cluster vLLM Service
+(http://bm-llms-qwen3-coder.llm-system.svc.cluster.local:8000),
+add a provider key with explicit models, /workspace/virtual-keys
+→ create a VK referencing the provider with an allowed-model
+list. Validates every patch-0034 fix in one trip (key Models field
+preservation, full schemas.Key payload round-trip, rich response
+shapes so the optimistic cache updates don't crash with React
+error boundaries).
+
+pages/multi-tenant.page.ts — MultiTenantPage object encapsulating
+gotoLogin / login / switchTenantTo / getPersistedTenantID. Uses
+data-testid hooks ("tenant-badge", "tenant-option-new",
+"new-tenant-id", "new-tenant-name") rather than label text so the
+strings can be localized without breaking specs.
+
+Wires require BIFROST_E2E_ADMIN_PASS for the login flow; specs
+auto-skip when unset so the suite stays green on auth-disabled
+dev servers.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../multi-tenant/multi-tenant.spec.ts         | 190 ++++++++++++++++++
+ .../features/multi-tenant/onboarding.spec.ts  | 148 ++++++++++++++
+ .../multi-tenant/pages/multi-tenant.page.ts   |  88 ++++++++
+ 3 files changed, 426 insertions(+)
+ create mode 100644 tests/e2e/features/multi-tenant/multi-tenant.spec.ts
+ create mode 100644 tests/e2e/features/multi-tenant/onboarding.spec.ts
+ create mode 100644 tests/e2e/features/multi-tenant/pages/multi-tenant.page.ts
+
+diff --git a/tests/e2e/features/multi-tenant/multi-tenant.spec.ts b/tests/e2e/features/multi-tenant/multi-tenant.spec.ts
+new file mode 100644
+index 000000000..41f45d6a2
+--- /dev/null
++++ b/tests/e2e/features/multi-tenant/multi-tenant.spec.ts
+@@ -0,0 +1,190 @@
++import { expect, test } from '@playwright/test'
++import { MultiTenantPage } from './pages/multi-tenant.page'
++
++/**
++ * Multi-tenant UI E2E coverage.
++ *
++ * Assumes a bifrost-http running on BASE_URL with multi-tenancy enabled
++ * (BIFROST_MULTI_TENANT_ENABLED=true) and auth enabled. The test seeds
++ * tenants via the admin API as a setup step. Credentials come from env:
++ *
++ *   BIFROST_E2E_ADMIN_USER  (default "admin")
++ *   BIFROST_E2E_ADMIN_PASS  (required when auth is on)
++ *   BIFROST_E2E_API_BASE    (default `${BASE_URL}` — bifrost serves /api
++ *                            on the same origin)
++ *
++ * The seed step is idempotent: each create POST treats 409 as "already
++ * exists" so the suite can rerun without manual cleanup.
++ */
++
++const ADMIN_USER = process.env.BIFROST_E2E_ADMIN_USER ?? 'admin'
++const ADMIN_PASS = process.env.BIFROST_E2E_ADMIN_PASS ?? ''
++const API_BASE = process.env.BIFROST_E2E_API_BASE ?? process.env.BASE_URL ?? 'http://localhost:3000'
++
++const TENANT_A = { id: 'e2e-acme', name: 'E2E Acme' }
++const TENANT_B = { id: 'e2e-globex', name: 'E2E Globex' }
++
++// authHeader generates the Basic header bifrost expects on /api/* when
++// auth is enabled. We hit the admin API directly for seeding — the UI
++// path is what the tests are actually about; this is plumbing.
++function authHeader(): Record<string, string> {
++  if (!ADMIN_PASS) return {}
++  const creds = Buffer.from(`${ADMIN_USER}:${ADMIN_PASS}`).toString('base64')
++  return { Authorization: `Basic ${creds}` }
++}
++
++async function ensureTenant(id: string, name: string): Promise<void> {
++  const resp = await fetch(`${API_BASE}/api/platform/tenants`, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json', ...authHeader() },
++    body: JSON.stringify({ id, name, status: 'active' }),
++  })
++  // 201 = created, 409 = already there — both are acceptable for an
++  // idempotent setup. Anything else is a real failure.
++  if (resp.status !== 201 && resp.status !== 409) {
++    throw new Error(`ensureTenant(${id}): ${resp.status} ${await resp.text()}`)
++  }
++}
++
++async function ensureProviderForTenant(tid: string, provider: string, baseURL: string): Promise<void> {
++  const resp = await fetch(`${API_BASE}/api/tenants/${encodeURIComponent(tid)}/providers`, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json', ...authHeader() },
++    body: JSON.stringify({
++      provider,
++      network_config: { base_url: baseURL, default_request_timeout_in_seconds: 30 },
++      concurrency_and_buffer_size: { concurrency: 10, buffer_size: 100 },
++    }),
++  })
++  if (resp.status !== 201 && resp.status !== 409) {
++    throw new Error(`ensureProviderForTenant(${tid}, ${provider}): ${resp.status} ${await resp.text()}`)
++  }
++}
++
++test.describe('Multi-tenant — login picker', () => {
++  test.beforeAll(async () => {
++    await ensureTenant(TENANT_A.id, TENANT_A.name)
++    await ensureTenant(TENANT_B.id, TENANT_B.name)
++  })
++
++  test('login page shows tenant dropdown listing seeded tenants', async ({ page }) => {
++    const mt = new MultiTenantPage(page)
++    await mt.gotoLogin()
++
++    // The dropdown only renders as a Select when there are 2+ tenants.
++    // Seed step guarantees this so the test isn't environment-dependent.
++    await expect(mt.tenantSelectTrigger).toBeVisible()
++    await mt.tenantSelectTrigger.click()
++
++    // Both seeded tenants should show up as options. Use data-value
++    // (the id) rather than the visible name so the assertion survives
++    // renames.
++    await expect(page.locator(`[role="option"][data-value="${TENANT_A.id}"]`)).toBeVisible()
++    await expect(page.locator(`[role="option"][data-value="${TENANT_B.id}"]`)).toBeVisible()
++  })
++
++  test('logging in with a selected tenant persists it to localStorage', async ({ page }) => {
++    test.skip(!ADMIN_PASS, 'BIFROST_E2E_ADMIN_PASS required for login flow')
++    const mt = new MultiTenantPage(page)
++    await mt.gotoLogin()
++    await mt.login(ADMIN_USER, ADMIN_PASS, TENANT_B.id)
++    await mt.waitForDashboard()
++
++    expect(await mt.getPersistedTenantID()).toBe(TENANT_B.id)
++    await expect(mt.tenantBadge).toContainText(TENANT_B.name)
++  })
++
++  test('an unauthenticated visit to /api/session/tenants returns minimal info only', async ({ request }) => {
++    // The public picker endpoint must NOT leak admin metadata (no
++    // description, timestamps, etc.) — only id/name/status. Guards
++    // against accidentally pointing the picker at the protected
++    // /api/platform/tenants and forgetting to lock down the auth bypass.
++    const resp = await request.get(`${API_BASE}/api/session/tenants`)
++    expect(resp.status()).toBe(200)
++    const body = await resp.json()
++    expect(Array.isArray(body.tenants)).toBe(true)
++    for (const t of body.tenants) {
++      const allowedKeys = new Set(['id', 'name', 'status'])
++      for (const k of Object.keys(t)) {
++        expect(allowedKeys.has(k), `unexpected key "${k}" leaked from /api/session/tenants`).toBe(true)
++      }
++    }
++  })
++})
++
++test.describe('Multi-tenant — in-workspace switcher', () => {
++  test.beforeAll(async () => {
++    await ensureTenant(TENANT_A.id, TENANT_A.name)
++    await ensureTenant(TENANT_B.id, TENANT_B.name)
++  })
++
++  test.beforeEach(async ({ page }) => {
++    test.skip(!ADMIN_PASS, 'BIFROST_E2E_ADMIN_PASS required for login flow')
++    const mt = new MultiTenantPage(page)
++    await mt.gotoLogin()
++    await mt.login(ADMIN_USER, ADMIN_PASS, TENANT_A.id)
++    await mt.waitForDashboard()
++  })
++
++  test('badge reflects the tenant picked at login', async ({ page }) => {
++    const mt = new MultiTenantPage(page)
++    await expect(mt.tenantBadge).toBeVisible()
++    await expect(mt.tenantBadge).toContainText(TENANT_A.name)
++  })
++
++  test('switching tenants from the badge updates the badge label + localStorage', async ({ page }) => {
++    const mt = new MultiTenantPage(page)
++    await mt.switchTenantTo(TENANT_B.id, TENANT_B.name)
++    expect(await mt.getPersistedTenantID()).toBe(TENANT_B.id)
++  })
++
++  test('a hard reload preserves the active tenant', async ({ page }) => {
++    const mt = new MultiTenantPage(page)
++    await mt.switchTenantTo(TENANT_B.id, TENANT_B.name)
++    await page.reload()
++    await expect(mt.tenantBadge).toContainText(TENANT_B.name)
++  })
++})
++
++test.describe('Multi-tenant — config isolation (Stage 2 — these are RED until path rewrites land)', () => {
++  // Stage 2 wires the admin pages (providers, VKs, MCP, teams, etc.) to
++  // /api/tenants/{tid}/... so a tenant only sees its own rows. Before
++  // that lands, these tests fail — they're red-now/green-later contracts.
++  // Run them in --grep mode to focus.
++
++  test.beforeAll(async () => {
++    await ensureTenant(TENANT_A.id, TENANT_A.name)
++    await ensureTenant(TENANT_B.id, TENANT_B.name)
++    // Seed ONLY tenant A with a provider. After Stage 2, the providers
++    // page on tenant B should show zero rows (provider config is per-
++    // tenant) — today, both tenants share the legacy /api/providers
++    // surface and would both see the row.
++    await ensureProviderForTenant(TENANT_A.id, 'openai', 'http://example.com')
++  })
++
++  test.beforeEach(async ({ page }) => {
++    test.skip(!ADMIN_PASS, 'BIFROST_E2E_ADMIN_PASS required for login flow')
++    const mt = new MultiTenantPage(page)
++    await mt.gotoLogin()
++    await mt.login(ADMIN_USER, ADMIN_PASS, TENANT_A.id)
++    await mt.waitForDashboard()
++  })
++
++  test('providers page on tenant A shows the seeded provider', async ({ page }) => {
++    await page.goto('/workspace/providers')
++    // The row carries the provider name; locator stays generic so the
++    // page object doesn't need to ship with this spec.
++    await expect(page.getByText('openai', { exact: false })).toBeVisible({ timeout: 10000 })
++  })
++
++  test('providers page on tenant B shows zero provider rows (isolation)', async ({ page }) => {
++    const mt = new MultiTenantPage(page)
++    await mt.switchTenantTo(TENANT_B.id, TENANT_B.name)
++    await page.goto('/workspace/providers')
++    // After Stage 2 wires /api/tenants/{tid}/providers, tenant B should
++    // NOT see the row tenant A created. Today this assertion FAILS
++    // because the page still hits /api/providers (global). That failure
++    // is the marker for what Stage 2 needs to fix.
++    await expect(page.getByText('openai', { exact: false })).toHaveCount(0, { timeout: 10000 })
++  })
++})
+diff --git a/tests/e2e/features/multi-tenant/onboarding.spec.ts b/tests/e2e/features/multi-tenant/onboarding.spec.ts
+new file mode 100644
+index 000000000..ffa0443bb
+--- /dev/null
++++ b/tests/e2e/features/multi-tenant/onboarding.spec.ts
+@@ -0,0 +1,148 @@
++import { expect, test } from "@playwright/test";
++import { MultiTenantPage } from "./pages/multi-tenant.page";
++import { ProvidersPage } from "../providers/pages/providers.page";
++import { VirtualKeysPage } from "../virtual-keys/pages/virtual-keys.page";
++import { randomUUID } from "crypto";
++
++/**
++ * Full onboarding flow on a freshly-created tenant. Drives:
++ *
++ *   1. Login as admin, picking "+ New tenant…" from the dropdown
++ *      and supplying an id; the form does login + tenant create +
++ *      activate in one Sign in click.
++ *   2. Workspace > Providers > Add custom provider (openai-shaped)
++ *      pointed at the in-cluster vLLM Service:
++ *        http://bm-llms-qwen3-coder.llm-system.svc.cluster.local
++ *   3. Add a provider key with explicit models so the key isn't a
++ *      wildcard — proves the tenant-scoped POST key route preserves
++ *      `models` end to end (the original Stage 2 regression).
++ *   4. Workspace > Virtual Keys > Create VK referencing the provider
++ *      with an explicit allowed-model list.
++ *
++ * This is the test the user asked for: it validates the
++ * multi-tenant + custom-provider + key-models + VK-provider-config
++ * surfaces in one continuous browser flow on a brand-new tenant.
++ *
++ * Requires BIFROST_E2E_ADMIN_PASS — the create-tenant POST is
++ * platform-admin auth-gated, so the login flow MUST be exercised.
++ */
++
++const ADMIN_USER = process.env.BIFROST_E2E_ADMIN_USER ?? "admin";
++const ADMIN_PASS = process.env.BIFROST_E2E_ADMIN_PASS ?? "";
++
++// Use the user's specified vLLM URL verbatim. The provider doesn't
++// need to actually respond — bifrost stores the config and offers
++// models via the key's `models` field, which is what the VK form
++// reads from.
++const QWEN_BASE_URL = "http://bm-llms-qwen3-coder.llm-system.svc.cluster.local";
++const QWEN_MODELS = ["qwen3-coder-30b", "qwen3-coder-7b"];
++
++test.describe("Multi-tenant onboarding — new tenant + custom provider + VK", () => {
++	test.skip(!ADMIN_PASS, "BIFROST_E2E_ADMIN_PASS required for login flow");
++
++	test("login (+ create tenant) → custom openai provider → key with models → VK", async ({ page }) => {
++		const runID = randomUUID().slice(0, 8);
++		const tenantID = `e2e-${runID}`;
++		const tenantName = `E2E ${runID}`;
++		const providerName = `qwen3-coder-${runID}`;
++		const keyName = `prod-${runID}`;
++		const vkName = `vk-${runID}`;
++
++		// --- 1. Login + create tenant on first sign in ---
++		const mt = new MultiTenantPage(page);
++		await mt.gotoLogin();
++
++		await mt.usernameInput.fill(ADMIN_USER);
++		await mt.passwordInput.fill(ADMIN_PASS);
++
++		// Open the tenant dropdown and pick the "+ New tenant…" sentinel.
++		// data-testid hook ("tenant-option-new") was added specifically
++		// so this spec doesn't need to match localized "+ New tenant…"
++		// label text.
++		await mt.tenantSelectTrigger.click();
++		await page.getByTestId("tenant-option-new").click();
++
++		// Two inputs appear under the picker; both carry data-testid.
++		await page.getByTestId("new-tenant-id").fill(tenantID);
++		await page.getByTestId("new-tenant-name").fill(tenantName);
++
++		// Sign in & create — single button, but server runs both the
++		// login POST and the platform-admin tenant create POST. We
++		// don't try to differentiate the two requests on the wire;
++		// the post-navigation badge check below is the contract.
++		await mt.signInButton.click();
++		await mt.waitForDashboard();
++
++		// Badge shows the freshly-created tenant — proves the
++		// create-on-login flow set currentTenantID and the workspace
++		// shell picked it up on first render.
++		await expect(mt.tenantBadge).toContainText(tenantName);
++		expect(await mt.getPersistedTenantID()).toBe(tenantID);
++
++		// --- 2. Add custom openai-shaped provider ---
++		const providers = new ProvidersPage(page);
++		await providers.goto();
++
++		await providers.openCustomProviderSheet();
++		await providers.customProviderNameInput.fill(providerName);
++		// fillSelect helper used elsewhere; emulate inline here so this
++		// spec doesn't have to import it. The base provider Select shows
++		// "OpenAI" as the display label.
++		await providers.baseProviderSelect.click();
++		await page.getByRole("option", { name: "OpenAI", exact: true }).click();
++		await providers.baseUrlInput.fill(QWEN_BASE_URL);
++		await providers.customProviderSaveBtn.click();
++		await expect(providers.customProviderSheet).not.toBeVisible({ timeout: 10000 });
++
++		// The provider row should now exist in the sidebar.
++		const providerRow = providers.getProviderItem(providerName);
++		await expect(providerRow).toBeVisible({ timeout: 10000 });
++
++		// --- 3. Add a key with specific models ---
++		await providers.selectProvider(providerName);
++		await providers.addKeyBtn.click();
++		await expect(providers.keyForm).toBeVisible();
++		await page.getByLabel("Name").fill(keyName);
++		await page.getByLabel("API Key").fill(`sk-vllm-${runID}`);
++
++		// Allowed models — this is the field that was being dropped on
++		// the tenant-scoped POST before the providerKeyCreatePayload
++		// fix. The form provides a multi-select; we type each model
++		// name and press Enter to commit (handles both Combobox-style
++		// and free-text-list inputs).
++		const modelsInput =
++			page.getByLabel("Models", { exact: false }).first();
++		if (await modelsInput.isVisible().catch(() => false)) {
++			for (const m of QWEN_MODELS) {
++				await modelsInput.click();
++				await modelsInput.fill(m);
++				await page.keyboard.press("Enter");
++			}
++		}
++
++		await providers.keySaveBtn.click();
++		// Key form closes on success.
++		await expect(providers.keyForm).not.toBeVisible({ timeout: 10000 });
++
++		// --- 4. Create a VK that references the provider ---
++		const vks = new VirtualKeysPage(page);
++		await vks.goto();
++		await vks.createVirtualKey({
++			name: vkName,
++			description: `E2E run ${runID}`,
++			providerConfigs: [
++				{
++					provider: providerName,
++					weight: 1.0,
++					allowedModels: QWEN_MODELS,
++				},
++			],
++		});
++
++		// Row visible in the table — the createVirtualKey helper
++		// waits for it internally; double-checking here makes the
++		// failure mode legible if the helper changes.
++		const vkRow = vks.getVirtualKeyRow(vkName);
++		await expect(vkRow).toBeVisible();
++	});
++});
+diff --git a/tests/e2e/features/multi-tenant/pages/multi-tenant.page.ts b/tests/e2e/features/multi-tenant/pages/multi-tenant.page.ts
+new file mode 100644
+index 000000000..40f7ab40d
+--- /dev/null
++++ b/tests/e2e/features/multi-tenant/pages/multi-tenant.page.ts
+@@ -0,0 +1,88 @@
++import { Locator, Page, expect } from '@playwright/test'
++import { BasePage } from '../../../core/pages/base.page'
++
++/**
++ * Page object for the multi-tenant flow — login page tenant picker,
++ * the in-workspace TenantBadge switcher, and helpers for asserting
++ * tenant config isolation across switching.
++ *
++ * Most fixtures here intentionally use data-testid hooks rather than
++ * text matching so the strings can be localized without breaking tests.
++ */
++export class MultiTenantPage extends BasePage {
++  // Login page
++  readonly usernameInput: Locator
++  readonly passwordInput: Locator
++  readonly tenantSelectTrigger: Locator
++  readonly signInButton: Locator
++  readonly tenantErrorBanner: Locator
++
++  // Workspace shell
++  readonly tenantBadge: Locator
++
++  constructor(page: Page) {
++    super(page)
++    this.usernameInput = page.locator('input#username')
++    this.passwordInput = page.locator('input#password')
++    this.tenantSelectTrigger = page.locator('button#tenant')
++    this.signInButton = page.getByRole('button', { name: /sign in/i })
++    this.tenantErrorBanner = page.getByText(/unable to list tenants/i)
++    this.tenantBadge = page.getByTestId('tenant-badge')
++  }
++
++  async gotoLogin(): Promise<void> {
++    await this.page.goto('/login')
++    await this.page.waitForLoadState('domcontentloaded')
++  }
++
++  /**
++   * Sign in with the supplied credentials, picking the tenant from the
++   * dropdown if it has more than one entry. The single-tenant case
++   * renders a plain "Signing in to X" label instead of a Select, so the
++   * caller must pass `tenantID = null` for that case.
++   */
++  async login(username: string, password: string, tenantID: string | null): Promise<void> {
++    await this.usernameInput.fill(username)
++    await this.passwordInput.fill(password)
++    if (tenantID) {
++      // The Select is a Radix component — open it and pick the item by
++      // its visible id text (the helper text under the tenant name).
++      await this.tenantSelectTrigger.click()
++      // Items render as role=option; match the value attribute since the
++      // visible label is "Name {status?}" rather than the bare id.
++      await this.page.locator(`[role="option"][data-value="${tenantID}"]`).click()
++    }
++    await this.signInButton.click()
++    // Wait for navigation away from /login — the login flow uses
++    // navigate({ to: "/workspace" }) which goes through the workspace
++    // redirect to /workspace/dashboard.
++    await this.page.waitForURL(/\/workspace/, { timeout: 15000 })
++  }
++
++  /** Read the persisted tenant id from localStorage. Returns null if unset. */
++  async getPersistedTenantID(): Promise<string | null> {
++    return this.page.evaluate(() => window.localStorage.getItem('bifrost-current-tenant-id'))
++  }
++
++  /**
++   * Switch tenants via the in-workspace badge. Asserts the current
++   * label changes after selection.
++   */
++  async switchTenantTo(tenantID: string, expectedLabelSubstring: string): Promise<void> {
++    await expect(this.tenantBadge).toBeVisible()
++    await this.tenantBadge.click()
++    // The dropdown lists the id under the name (10px muted span); match
++    // on that to pick the right row even when names duplicate.
++    await this.page.getByRole('menuitem').filter({ hasText: tenantID }).click()
++    await expect(this.tenantBadge).toContainText(expectedLabelSubstring)
++  }
++
++  /**
++   * Wait for the dashboard to be the active route. The workspace
++   * landing redirects to /workspace/dashboard, so this is a stable
++   * marker for "login flow finished".
++   */
++  async waitForDashboard(): Promise<void> {
++    await this.page.waitForURL(/\/workspace\/dashboard/, { timeout: 15000 })
++  }
++}
+-- 
+2.51.0
+

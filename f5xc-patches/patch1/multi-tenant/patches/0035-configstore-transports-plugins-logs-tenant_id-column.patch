@@ -1,0 +1,342 @@
+From 84a67cc7a27c0af8cc72aeb31dce538cde0dea23 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 08:58:14 -0600
+Subject: [PATCH 3/4] configstore+transports+plugins: logs tenant_id column +
+ filter (Stage 4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the backend half of per-tenant dashboard analytics: every log
+row now carries the multi-tenant scope the inference request was
+resolved into, and the /api/logs/* endpoints honor a tenant_id
+query param so the dashboard can filter charts to a single tenant.
+
+Schema:
+- framework/logstore/tables.go: new Log.TenantID *string column
+  (gorm index idx_logs_tenant_id) + new SearchFilters.TenantIDs
+  []string field. NULL on rows written before MT was on, or by
+  legacy /api/* inference calls that never went through the tenant
+  resolver — those land in the "no tenant" bucket and are hidden
+  whenever a tenant filter is applied.
+
+Migration:
+- framework/logstore/migrations.go: migrationAddTenantIDColumn,
+  wired into triggerMigrations after migrationAddClusterGovernanceColumns.
+  Idempotent column+index add; symmetric rollback.
+
+Query plumbing:
+- framework/logstore/rdb.go applyFilters: adds
+  WHERE tenant_id IN (?) when filters.TenantIDs is non-empty.
+- transports/bifrost-http/handlers/logging.go: tenant_id query
+  param parsed alongside the other governance filters
+  (comma-separated, IN()-shaped) in all three filter-parsing
+  sites — getLogs, getLogsStats, parseHistogramFilters (which
+  backs every histogram endpoint).
+
+Write path:
+- plugins/logging/main.go: reads
+  multitenant.BifrostContextKeyTenantID off ctx (set by the tenant
+  resolver middleware in transports/bifrost-http/handlers/
+  tenant_resolver.go when a VK resolves to a tenant) and threads
+  it into applyOutputFieldsToEntry.
+- plugins/logging/writer.go: persists the value to entry.TenantID
+  when non-empty (matches the pattern of every other governance ID
+  field on the row).
+
+Guard test:
+- framework/logstore/tenant_id_migration_test.go: spins up an
+  in-memory SQLite, runs triggerMigrations, asserts the
+  tenant_id column + idx_logs_tenant_id index landed and the
+  migration row was stamped. Caught a Docker layer-cache
+  regression during dev where the binary on the cluster lacked
+  this migration despite the source containing it.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/logstore/migrations.go              | 52 +++++++++++++++++++
+ framework/logstore/rdb.go                     |  3 ++
+ framework/logstore/tables.go                  | 14 +++++
+ .../logstore/tenant_id_migration_test.go      | 37 +++++++++++++
+ plugins/logging/main.go                       |  9 +++-
+ plugins/logging/writer.go                     |  9 ++++
+ transports/bifrost-http/handlers/logging.go   | 21 ++++++++
+ 7 files changed, 144 insertions(+), 1 deletion(-)
+ create mode 100644 framework/logstore/tenant_id_migration_test.go
+
+diff --git a/framework/logstore/migrations.go b/framework/logstore/migrations.go
+index b7e8a8843..e2da105d8 100644
+--- a/framework/logstore/migrations.go
++++ b/framework/logstore/migrations.go
+@@ -333,6 +333,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
+ 	if err := migrationAddClusterGovernanceColumns(ctx, db); err != nil {
+ 		return err
+ 	}
++	if err := migrationAddTenantIDColumn(ctx, db); err != nil {
++		return err
++	}
+ 	// migrationSplitFilterDataMatView is intentionally NOT invoked in this
+ 	// release. Dropping mv_logs_filterdata while old replicas are still
+ 	// serving /api/logs/filterdata from it would surface "relation does not
+@@ -3185,6 +3188,55 @@ func migrationAddDACColumnsToMCPToolLogs(ctx context.Context, db *gorm.DB) error
+ 	return nil
+ }
+ 
++// migrationAddTenantIDColumn adds the tenant_id column + index to the
++// logs table for the multi-tenant dashboard filter. NULL is the
++// "no tenant resolved" state — single-tenant deployments and legacy
++// /api/* inference calls that don't carry a VK leave it NULL. The
++// dashboard's tenant filter applies `WHERE tenant_id IN (?)` so NULL
++// rows are hidden whenever a tenant is selected; admin-wide views
++// (no filter) include them.
++func migrationAddTenantIDColumn(ctx context.Context, db *gorm.DB) error {
++	opts := *migrator.DefaultOptions
++	opts.UseTransaction = true
++	m := migrator.New(db, &opts, []*migrator.Migration{{
++		ID: "logs_add_tenant_id_column",
++		Migrate: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mg := tx.Migrator()
++			if !mg.HasColumn(&Log{}, "tenant_id") {
++				if err := mg.AddColumn(&Log{}, "tenant_id"); err != nil {
++					return err
++				}
++			}
++			if !mg.HasIndex(&Log{}, "idx_logs_tenant_id") {
++				if err := mg.CreateIndex(&Log{}, "idx_logs_tenant_id"); err != nil {
++					return err
++				}
++			}
++			return nil
++		},
++		Rollback: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mg := tx.Migrator()
++			if mg.HasIndex(&Log{}, "idx_logs_tenant_id") {
++				if err := mg.DropIndex(&Log{}, "idx_logs_tenant_id"); err != nil {
++					return err
++				}
++			}
++			if mg.HasColumn(&Log{}, "tenant_id") {
++				if err := mg.DropColumn(&Log{}, "tenant_id"); err != nil {
++					return err
++				}
++			}
++			return nil
++		},
++	}})
++	if err := m.Migrate(); err != nil {
++		return fmt.Errorf("error while adding tenant_id column to logs: %s", err.Error())
++	}
++	return nil
++}
++
+ // migrationAddClusterGovernanceColumns adds cluster_node_id, budget_ids, and rate_limit_ids
+ // columns to the logs table for node usage recovery in clustered deployments.
+ func migrationAddClusterGovernanceColumns(ctx context.Context, db *gorm.DB) error {
+diff --git a/framework/logstore/rdb.go b/framework/logstore/rdb.go
+index 9bc8dab89..77a0dfdd8 100644
+--- a/framework/logstore/rdb.go
++++ b/framework/logstore/rdb.go
+@@ -132,6 +132,9 @@ func (s *RDBLogStore) applyFilters(baseQuery *gorm.DB, filters SearchFilters) *g
+ 	if len(filters.BusinessUnitIDs) > 0 {
+ 		baseQuery = baseQuery.Where("business_unit_id IN ?", filters.BusinessUnitIDs)
+ 	}
++	if len(filters.TenantIDs) > 0 {
++		baseQuery = baseQuery.Where("tenant_id IN ?", filters.TenantIDs)
++	}
+ 	if len(filters.RoutingEngineUsed) > 0 {
+ 		// Query routing engines (comma-separated values) - find logs containing ANY of the specified engines
+ 		dialect := s.db.Dialector.Name()
+diff --git a/framework/logstore/tables.go b/framework/logstore/tables.go
+index 52a77afae..f48d42387 100644
+--- a/framework/logstore/tables.go
++++ b/framework/logstore/tables.go
+@@ -58,6 +58,12 @@ type SearchFilters struct {
+ 	CustomerIDs       []string          `json:"customer_ids,omitempty"`
+ 	UserIDs           []string          `json:"user_ids,omitempty"`
+ 	BusinessUnitIDs   []string          `json:"business_unit_ids,omitempty"`
++	// TenantIDs filters the log set to rows tagged with these tenant
++	// ids. Multi-valued so the dashboard can show "Acme + Globex"
++	// side-by-side, but the typical call site sets exactly one entry
++	// (the active workspace tenant). Empty slice = no filter
++	// (admin-wide view).
++	TenantIDs         []string          `json:"tenant_ids,omitempty"`
+ 	RoutingEngineUsed []string          `json:"routing_engine_used,omitempty"` // For filtering by routing engine (routing-rule, governance, loadbalancing)
+ 	StartTime         *time.Time        `json:"start_time,omitempty"`
+ 	EndTime           *time.Time        `json:"end_time,omitempty"`
+@@ -153,6 +159,14 @@ type Log struct {
+ 	CustomerName            *string   `gorm:"type:varchar(255)" json:"customer_name"`
+ 	BusinessUnitID          *string   `gorm:"type:varchar(255);index:idx_logs_business_unit_id" json:"business_unit_id"`
+ 	BusinessUnitName        *string   `gorm:"type:varchar(255)" json:"business_unit_name"`
++	// TenantID captures the multi-tenant scope of the inference request
++	// at the time it was logged, resolved from ctx via the tenant
++	// resolver middleware (see transports/bifrost-http/handlers/
++	// tenant_resolver.go). NULL on single-tenant deployments and on
++	// rows written by replicas that haven't been routed through the
++	// resolver (e.g. legacy /api inference calls without a VK). Index
++	// so the dashboard's tenant filter is cheap on large log tables.
++	TenantID                *string   `gorm:"type:varchar(255);index:idx_logs_tenant_id" json:"tenant_id"`
+ 	InputHistory            string    `gorm:"type:text" json:"-"` // JSON serialized []schemas.ChatMessage
+ 	ResponsesInputHistory   string    `gorm:"type:text" json:"-"` // JSON serialized []schemas.ResponsesMessage
+ 	OutputMessage           string    `gorm:"type:text" json:"-"` // JSON serialized *schemas.ChatMessage
+diff --git a/framework/logstore/tenant_id_migration_test.go b/framework/logstore/tenant_id_migration_test.go
+new file mode 100644
+index 000000000..6ab1459cd
+--- /dev/null
++++ b/framework/logstore/tenant_id_migration_test.go
+@@ -0,0 +1,37 @@
++package logstore
++
++import (
++	"context"
++	"testing"
++
++	"gorm.io/driver/sqlite"
++	"gorm.io/gorm"
++)
++
++// TestTenantIDMigrationApplies guards against migrationAddTenantIDColumn
++// silently no-opping. It must run as part of triggerMigrations, leave
++// the tenant_id column + idx_logs_tenant_id index in place, and stamp
++// a row in the migrations table. Without this, the dashboard's
++// tenant_id WHERE clause has nothing to match against.
++func TestTenantIDMigrationApplies(t *testing.T) {
++	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := triggerMigrations(context.Background(), db); err != nil {
++		t.Fatalf("triggerMigrations: %v", err)
++	}
++	if !db.Migrator().HasColumn(&Log{}, "tenant_id") {
++		t.Fatal("tenant_id column missing after migrations")
++	}
++	if !db.Migrator().HasIndex(&Log{}, "idx_logs_tenant_id") {
++		t.Fatal("idx_logs_tenant_id index missing after migrations")
++	}
++	var rowCount int64
++	if err := db.Table("migrations").Where("id = ?", "logs_add_tenant_id_column").Count(&rowCount).Error; err != nil {
++		t.Fatalf("count migrations: %v", err)
++	}
++	if rowCount != 1 {
++		t.Fatalf("migration row absent, count=%d", rowCount)
++	}
++}
+diff --git a/plugins/logging/main.go b/plugins/logging/main.go
+index 4be9640a8..1bc2a8757 100644
+--- a/plugins/logging/main.go
++++ b/plugins/logging/main.go
+@@ -21,6 +21,7 @@ import (
+ 	"github.com/maximhq/bifrost/framework/mcpcatalog"
+ 	"github.com/maximhq/bifrost/framework/modelcatalog"
+ 	"github.com/maximhq/bifrost/framework/streaming"
++	"github.com/maximhq/bifrost/multitenant"
+ )
+ 
+ const (
+@@ -755,6 +756,12 @@ func (p *LoggerPlugin) PostLLMHook(ctx *schemas.BifrostContext, result *schemas.
+ 	userName := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyUserName)
+ 	businessUnitID := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyGovernanceBusinessUnitID)
+ 	businessUnitName := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyGovernanceBusinessUnitName)
++	// tenantID — multi-tenant scope resolved upstream by the tenant
++	// resolver middleware. Empty when MT is off (single-tenant
++	// deployments) or the request didn't carry a VK. Persisted to the
++	// logs.tenant_id column so the dashboard can filter charts per
++	// tenant.
++	tenantID := bifrost.GetStringFromContext(ctx, multitenant.BifrostContextKeyTenantID)
+ 	numberOfRetries := bifrost.GetIntFromContext(ctx, schemas.BifrostContextKeyNumberOfRetries)
+ 	attemptTrail, _ := ctx.Value(schemas.BifrostContextKeyAttemptTrail).([]schemas.KeyAttemptRecord)
+ 
+@@ -865,7 +872,7 @@ func (p *LoggerPlugin) PostLLMHook(ctx *schemas.BifrostContext, result *schemas.
+ 			latency = *ef.CacheDebug.CacheHitLatency
+ 		}
+ 	}
+-	applyOutputFieldsToEntry(entry, selectedKeyID, selectedKeyName, virtualKeyID, virtualKeyName, routingRuleID, routingRuleName, selectedPromptID, selectedPromptName, selectedPromptVersion, teamID, teamName, customerID, customerName, userID, userName, businessUnitID, businessUnitName, numberOfRetries, latency, attemptTrail)
++	applyOutputFieldsToEntry(entry, selectedKeyID, selectedKeyName, virtualKeyID, virtualKeyName, routingRuleID, routingRuleName, selectedPromptID, selectedPromptName, selectedPromptVersion, teamID, teamName, customerID, customerName, userID, userName, businessUnitID, businessUnitName, tenantID, numberOfRetries, latency, attemptTrail)
+ 	// Attach cluster governance metadata for disconnected node usage recovery
+ 	if nodeID, _ := p.clusterNodeID.Load().(string); nodeID != "" {
+ 		entry.ClusterNodeID = &nodeID
+diff --git a/plugins/logging/writer.go b/plugins/logging/writer.go
+index f82f5e941..63c2df9d0 100644
+--- a/plugins/logging/writer.go
++++ b/plugins/logging/writer.go
+@@ -457,6 +457,11 @@ func applyModelAlias(entry *logstore.Log, requestedModel, resolvedModel string)
+ }
+ 
+ // applyOutputFieldsToEntry sets common output fields on a log entry.
++// tenantID is the multi-tenant scope resolved from the inference
++// request's ctx (set by the tenant resolver middleware that runs
++// when BIFROST_MULTI_TENANT_ENABLED is on). Empty string leaves the
++// column NULL — single-tenant deployments + requests that never went
++// through the resolver land in the "no tenant" bucket.
+ func applyOutputFieldsToEntry(
+ 	entry *logstore.Log,
+ 	selectedKeyID, selectedKeyName string,
+@@ -467,6 +472,7 @@ func applyOutputFieldsToEntry(
+ 	customerID, customerName string,
+ 	userID, userName string,
+ 	businessUnitID, businessUnitName string,
++	tenantID string,
+ 	numberOfRetries int,
+ 	latency int64,
+ 	attemptTrail []schemas.KeyAttemptRecord,
+@@ -518,6 +524,9 @@ func applyOutputFieldsToEntry(
+ 	if businessUnitName != "" {
+ 		entry.BusinessUnitName = &businessUnitName
+ 	}
++	if tenantID != "" {
++		entry.TenantID = &tenantID
++	}
+ 	if numberOfRetries != 0 {
+ 		entry.NumberOfRetries = numberOfRetries
+ 	}
+diff --git a/transports/bifrost-http/handlers/logging.go b/transports/bifrost-http/handlers/logging.go
+index 3c54bf442..538f63e7e 100644
+--- a/transports/bifrost-http/handlers/logging.go
++++ b/transports/bifrost-http/handlers/logging.go
+@@ -415,6 +415,13 @@ func (h *LoggingHandler) getLogs(ctx *fasthttp.RequestCtx) {
+ 	if businessUnitIDs := string(ctx.QueryArgs().Peek("business_unit_ids")); businessUnitIDs != "" {
+ 		filters.BusinessUnitIDs = parseCommaSeparated(businessUnitIDs)
+ 	}
++	// tenant_id supports comma-separated values so an admin-wide
++	// dashboard can compare tenants side-by-side. The usual call site
++	// (the workspace dashboard with a single tenant in scope) sends a
++	// single id; SQL applyFilters() uses IN() either way.
++	if tenantIDs := string(ctx.QueryArgs().Peek("tenant_id")); tenantIDs != "" {
++		filters.TenantIDs = parseCommaSeparated(tenantIDs)
++	}
+ 	if routingEngines := string(ctx.QueryArgs().Peek("routing_engine_used")); routingEngines != "" {
+ 		filters.RoutingEngineUsed = parseCommaSeparated(routingEngines)
+ 	}
+@@ -656,6 +663,13 @@ func (h *LoggingHandler) getLogsStats(ctx *fasthttp.RequestCtx) {
+ 	if businessUnitIDs := string(ctx.QueryArgs().Peek("business_unit_ids")); businessUnitIDs != "" {
+ 		filters.BusinessUnitIDs = parseCommaSeparated(businessUnitIDs)
+ 	}
++	// tenant_id supports comma-separated values so an admin-wide
++	// dashboard can compare tenants side-by-side. The usual call site
++	// (the workspace dashboard with a single tenant in scope) sends a
++	// single id; SQL applyFilters() uses IN() either way.
++	if tenantIDs := string(ctx.QueryArgs().Peek("tenant_id")); tenantIDs != "" {
++		filters.TenantIDs = parseCommaSeparated(tenantIDs)
++	}
+ 	if routingEngines := string(ctx.QueryArgs().Peek("routing_engine_used")); routingEngines != "" {
+ 		filters.RoutingEngineUsed = parseCommaSeparated(routingEngines)
+ 	}
+@@ -815,6 +829,13 @@ func parseHistogramFilters(ctx *fasthttp.RequestCtx) *logstore.SearchFilters {
+ 	if businessUnitIDs := string(ctx.QueryArgs().Peek("business_unit_ids")); businessUnitIDs != "" {
+ 		filters.BusinessUnitIDs = parseCommaSeparated(businessUnitIDs)
+ 	}
++	// tenant_id supports comma-separated values so an admin-wide
++	// dashboard can compare tenants side-by-side. The usual call site
++	// (the workspace dashboard with a single tenant in scope) sends a
++	// single id; SQL applyFilters() uses IN() either way.
++	if tenantIDs := string(ctx.QueryArgs().Peek("tenant_id")); tenantIDs != "" {
++		filters.TenantIDs = parseCommaSeparated(tenantIDs)
++	}
+ 	if routingEngines := string(ctx.QueryArgs().Peek("routing_engine_used")); routingEngines != "" {
+ 		filters.RoutingEngineUsed = parseCommaSeparated(routingEngines)
+ 	}
+-- 
+2.51.0
+
