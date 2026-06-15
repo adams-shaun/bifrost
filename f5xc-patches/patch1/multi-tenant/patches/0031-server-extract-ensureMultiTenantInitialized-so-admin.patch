@@ -1,0 +1,171 @@
+From f54e1f703d764db359e7dcd0f4688ab455c91cc1 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 03:14:27 -0600
+Subject: [PATCH 2/3] server: extract ensureMultiTenantInitialized so admin
+ routes mount
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The first kind E2E run (TestMultiTenantSanity) caught a real
+mount-order bug: `POST /api/tenants/{tid}/providers` returned 405
+even with BIFROST_MULTI_TENANT_ENABLED=true. Root cause: the
+multitenant.Manager was built inside buildInferenceRouter (called by
+RegisterInferenceRoutes), but RegisterAPIRoutes runs FIRST in the
+boot sequence — at line 1716 vs 1750. The tenant-scoped admin
+handler block in RegisterAPIRoutes guards on `s.multitenantManager
+!= nil`, which is still nil at that point, so the routes silently
+skip and the request hits a non-POST route at the same path,
+producing 405.
+
+Fix: extract Manager + CachedVKResolver construction into a new
+idempotent helper `ensureMultiTenantInitialized(ctx)`, call it from
+both RegisterAPIRoutes (just before the tenant-scoped admin block,
+gated on multiTenantEnabled()) and buildInferenceRouter (after the
+multiTenantEnabled() short-circuit). The second call is a no-op
+because the method early-returns when s.multitenantManager is
+already set. No behavior change for single-tenant deployments —
+ensureMultiTenantInitialized is never invoked when MT is off.
+
+This is exactly the kind of cross-cutting init ordering an
+integration test catches that unit tests can't: every unit test
+constructs the Manager directly, so the boot-sequence ordering
+between two `Register*` calls was never exercised.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ transports/bifrost-http/server/server.go | 88 ++++++++++++++----------
+ 1 file changed, 50 insertions(+), 38 deletions(-)
+
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 9cc83df78..ee5f2bb80 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1155,10 +1155,45 @@ func (s *BifrostHTTPServer) buildInferenceRouter(ctx context.Context, middleware
+ 	if !multiTenantEnabled() {
+ 		return lib.NewSingleTenantRouter(s.Client), middlewares, nil
+ 	}
++	if err := s.ensureMultiTenantInitialized(ctx); err != nil {
++		return nil, nil, err
++	}
++
++	router := lib.NewMultiTenantRouter(lib.MultiTenantRouterConfig{
++		Manager: s.multitenantManager,
++		// FallbackClient covers requests that don't carry a tenant id
++		// (e.g. health probes, /api/platform admin endpoints that the
++		// resolver explicitly skips). Once every inference path is
++		// guaranteed to carry a tenant id via the resolver, we can drop
++		// this and surface 5xx for unscoped requests.
++		FallbackClient: s.Client,
++	})
++
++	// Tenant resolver runs BEFORE everything else so all downstream
++	// middlewares and the handler see the same tenant id on the ctx.
++	tenantMiddleware := handlers.TenantResolverMiddleware(s.multitenantVKResolver)
++	chained := make([]schemas.BifrostHTTPMiddleware, 0, len(middlewares)+1)
++	chained = append(chained, tenantMiddleware)
++	chained = append(chained, middlewares...)
+ 
++	return router, chained, nil
++}
++
++// ensureMultiTenantInitialized lazily builds the multitenant.Manager +
++// CachedVKResolver pair the first time anything asks for them, then
++// caches the result on the server. Idempotent — subsequent calls
++// return nil immediately. Must be safe to call BEFORE
++// RegisterInferenceRoutes so the tenant-scoped admin routes in
++// RegisterAPIRoutes can see s.multitenantManager. No-op when
++// BIFROST_MULTI_TENANT_ENABLED is off; callers should branch on
++// multiTenantEnabled() before calling.
++func (s *BifrostHTTPServer) ensureMultiTenantInitialized(ctx context.Context) error {
++	if s.multitenantManager != nil {
++		return nil
++	}
+ 	store := s.Config.ConfigStore
+ 	if store == nil {
+-		return nil, nil, fmt.Errorf("multi-tenant routing requires a ConfigStore")
++		return fmt.Errorf("multi-tenant routing requires a ConfigStore")
+ 	}
+ 
+ 	// Tenant loader: queries the per-tenant provider + MCP snapshots,
+@@ -1184,56 +1219,23 @@ func (s *BifrostHTTPServer) buildInferenceRouter(ctx context.Context, middleware
+ 		return schemas.BifrostConfig{
+ 			Account:   lib.NewTenantScopedAccount(providers),
+ 			MCPConfig: mcpConfig,
+-			// InitialPoolSize / DropExcessRequests / etc. intentionally
+-			// left at their bifrost.Init defaults. A future patch will
+-			// extract those from per-tenant settings.
+ 		}, nil
+ 	}
+ 
+ 	// Tie the Manager's root context to the server's so per-tenant
+-	// runtimes drain automatically on shutdown — multitenant.Manager
+-	// owns a goroutine that calls Shutdown when its root ctx is
+-	// canceled, matching the cancel s.Ctx triggers on server stop.
++	// runtimes drain automatically on shutdown.
+ 	mgr, err := multitenant.NewManager(s.Ctx, multitenant.ManagerConfig{
+ 		Loader: tenantLoader,
+-		// MaxActiveRuntimes intentionally left at zero (unbounded) —
+-		// LRU eviction tuning lands in the same patch that promotes the
+-		// flag to a config field.
+ 	})
+ 	if err != nil {
+-		return nil, nil, fmt.Errorf("init multi-tenant manager: %w", err)
++		return fmt.Errorf("init multi-tenant manager: %w", err)
+ 	}
+-	// Stash on the server so RegisterAPIRoutes can pass an evictor
+-	// into the tenant-scoped admin handlers.
+ 	s.multitenantManager = mgr
+-
+-	resolver := multitenant.NewCachedVKResolver(
++	s.multitenantVKResolver = multitenant.NewCachedVKResolver(
+ 		multitenant.NewConfigStoreVKResolver(store),
+ 		60*time.Second,
+ 	)
+-	tenantMiddleware := handlers.TenantResolverMiddleware(resolver)
+-	// Stash the cached resolver so admin VK mutations can invalidate
+-	// the same-replica cache entry immediately instead of waiting for
+-	// the 60s TTL.
+-	s.multitenantVKResolver = resolver
+-
+-	router := lib.NewMultiTenantRouter(lib.MultiTenantRouterConfig{
+-		Manager: mgr,
+-		// FallbackClient covers requests that don't carry a tenant id
+-		// (e.g. health probes, /api/platform admin endpoints that the
+-		// resolver explicitly skips). Once every inference path is
+-		// guaranteed to carry a tenant id via the resolver, we can drop
+-		// this and surface 5xx for unscoped requests.
+-		FallbackClient: s.Client,
+-	})
+-
+-	// Tenant resolver runs BEFORE everything else so all downstream
+-	// middlewares and the handler see the same tenant id on the ctx.
+-	chained := make([]schemas.BifrostHTTPMiddleware, 0, len(middlewares)+1)
+-	chained = append(chained, tenantMiddleware)
+-	chained = append(chained, middlewares...)
+-
+-	return router, chained, nil
++	return nil
+ }
+ 
+ // multiTenantEnabled returns true when the env var
+@@ -1346,6 +1348,16 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 	// caller as a platform-admin; Phase 4 swaps in the OIDC-backed
+ 	// authorization plugin. The path middleware lifts the URL's
+ 	// {tenant_id} onto ctx before the handler runs.
++	//
++	// RegisterAPIRoutes runs BEFORE RegisterInferenceRoutes in the boot
++	// sequence, so the Manager has to be initialized here (idempotent) —
++	// otherwise s.multitenantManager would be nil when this check fires
++	// and the per-tenant admin surface would never mount.
++	if multiTenantEnabled() {
++		if err := s.ensureMultiTenantInitialized(ctx); err != nil {
++			return fmt.Errorf("init multi-tenant: %w", err)
++		}
++	}
+ 	if s.multitenantManager != nil {
+ 		adminAuthz := lib.NewStubPlatformAdminAuthz()
+ 		tenantPathMW := handlers.RequireTenantPathMiddleware(adminAuthz)
+-- 
+2.51.0
+

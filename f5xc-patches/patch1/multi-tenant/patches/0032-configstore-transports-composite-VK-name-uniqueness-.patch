@@ -1,0 +1,177 @@
+From 2e39c7e3892b50e0010e14853b3cb2b5ce0bf7f3 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 03:16:35 -0600
+Subject: [PATCH 3/3] configstore+transports: composite VK name uniqueness +
+ tenant key Models default
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two unrelated multi-tenant gaps the first kind E2E run caught back
+to back, fixed together because the test's per-tenant VK creation
+path exercises both:
+
+1) governance_virtual_keys.name unique index was global
+   (idx_virtual_key_name on a single column) — the inverse of what
+   provider/key/MCP names got in patch 0006. Two tenants both trying
+   to create a VK called "primary" hit a 409.
+
+   Fix:
+   - TableVirtualKey struct tag: replace
+     idx_virtual_key_name with composite
+     idx_virtual_keys_tenant_name covering (TenantID, Name).
+     VK Value stays globally unique (idx_virtual_key_value) — the
+     value is what an inference request supplies via x-bf-vk and has
+     to resolve to exactly one tenant.
+   - migrationTenantScopedVKNameUnique: drops the legacy single
+     index, creates the composite. Wired into RunMultiTenantMigrations
+     after the providers/keys/MCP version (siblings landed in patch
+     0006, so this one is the missing twin). Rollback symmetric.
+
+2) POST /api/tenants/{tid}/providers/{provider}/keys persisted the
+   key with Models empty, so every inference using that key 400'd
+   with "no keys found that support model: X". The legacy single
+   tenant key handler defaulted Models to ["*"]; the tenant-scoped
+   v1 payload simply doesn't expose Models yet.
+
+   Fix:
+   - tenant_providers.createProviderKey: default Models to ["*"] at
+     persist time. A follow-on patch will surface Models as an
+     optional payload field and only fall back to "*" when omitted.
+
+3) Scenario: TestMultiTenantSanity now creates both tenants' VKs
+   under the same Name ("primary") — proves the composite index
+   accepts it. With the legacy single-column index this fails on the
+   second iteration of the seed loop; with the migration it passes.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/migrations.go           | 50 +++++++++++++++++++
+ framework/configstore/tables/virtualkey.go    |  6 ++-
+ .../k8s/scenarios/multitenant_sanity_test.go  |  4 ++
+ .../bifrost-http/handlers/tenant_providers.go |  5 ++
+ 4 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/framework/configstore/migrations.go b/framework/configstore/migrations.go
+index e9055e713..23530891a 100644
+--- a/framework/configstore/migrations.go
++++ b/framework/configstore/migrations.go
+@@ -808,6 +808,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
+ 	if err := migrationTenantScopedNameUniques(ctx, db); err != nil {
+ 		return err
+ 	}
++	if err := migrationTenantScopedVKNameUnique(ctx, db); err != nil {
++		return err
++	}
+ 	return nil
+ }
+ 
+@@ -8875,3 +8878,50 @@ func migrationTenantScopedNameUniques(ctx context.Context, db *gorm.DB) error {
+ 	}
+ 	return nil
+ }
++
++// migrationTenantScopedVKNameUnique is the sibling of
++// migrationTenantScopedNameUniques for governance_virtual_keys. The
++// initial multi-tenant patches scoped the (Name) unique to (TenantID,
++// Name) for providers / MCP clients / keys but missed virtual keys —
++// the first kind E2E run (TestMultiTenantSanity) caught it when two
++// tenants both tried to create a VK named "primary" and the second
++// got 409.
++//
++// VK Value remains globally unique (idx_virtual_key_value): the value
++// is what an inference request supplies via x-bf-vk and must resolve
++// to exactly one tenant, regardless of how many tenants are in play.
++func migrationTenantScopedVKNameUnique(ctx context.Context, db *gorm.DB) error {
++	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
++		ID: "tenant_scoped_name_unique_virtual_keys",
++		Migrate: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++
++			if mig.HasIndex(&tables.TableVirtualKey{}, "idx_virtual_key_name") {
++				if err := mig.DropIndex(&tables.TableVirtualKey{}, "idx_virtual_key_name"); err != nil {
++					return fmt.Errorf("drop legacy index idx_virtual_key_name: %w", err)
++				}
++			}
++			if !mig.HasIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name") {
++				if err := mig.CreateIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name"); err != nil {
++					return fmt.Errorf("create composite index idx_virtual_keys_tenant_name: %w", err)
++				}
++			}
++			return nil
++		},
++		Rollback: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++			if mig.HasIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name") {
++				if err := mig.DropIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name"); err != nil {
++					return fmt.Errorf("drop composite index idx_virtual_keys_tenant_name: %w", err)
++				}
++			}
++			return nil
++		},
++	}})
++	if err := m.Migrate(); err != nil {
++		return fmt.Errorf("error running tenant_scoped_name_unique_virtual_keys migration: %s", err.Error())
++	}
++	return nil
++}
+diff --git a/framework/configstore/tables/virtualkey.go b/framework/configstore/tables/virtualkey.go
+index 910b1bcb0..7b6ac4ea1 100644
+--- a/framework/configstore/tables/virtualkey.go
++++ b/framework/configstore/tables/virtualkey.go
+@@ -198,7 +198,7 @@ func (mc *TableVirtualKeyMCPConfig) UnmarshalJSON(data []byte) error {
+ // TableVirtualKey represents a virtual key with budget, rate limits, and team/customer association
+ type TableVirtualKey struct {
+ 	ID              string                          `gorm:"primaryKey;type:varchar(255)" json:"id"`
+-	Name            string                          `gorm:"uniqueIndex:idx_virtual_key_name;type:varchar(255);not null" json:"name"`
++	Name            string                          `gorm:"uniqueIndex:idx_virtual_keys_tenant_name;type:varchar(255);not null" json:"name"`
+ 	Description     string                          `gorm:"type:text" json:"description,omitempty"`
+ 	Value           string                          `gorm:"uniqueIndex:idx_virtual_key_value;type:text;not null" json:"value"`           // The virtual key value
+ 	IsActive        *bool                           `gorm:"default:true" json:"is_active,omitempty"`                                     // Nil means true (DB default); false means inactive
+@@ -208,7 +208,9 @@ type TableVirtualKey struct {
+ 	// TenantID scopes this virtual key to a tenant for multi-tenant deployments.
+ 	// The HTTP tenant-resolver middleware reads this via the VK lookup before
+ 	// dispatching to the per-tenant Bifrost runtime. See TableCustomer.TenantID.
+-	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
++	// idx_virtual_keys_tenant_name is composite with Name above so two tenants
++	// can both register a VK named e.g. "primary".
++	TenantID string `gorm:"type:varchar(255);not null;uniqueIndex:idx_virtual_keys_tenant_name;default:default" json:"tenant_id"`
+ 
+ 	// Foreign key relationships (mutually exclusive: TeamID, CustomerID, or AccessProfileID)
+ 	TeamID          *string `gorm:"type:varchar(255);index" json:"team_id,omitempty"`
+diff --git a/tests/k8s/scenarios/multitenant_sanity_test.go b/tests/k8s/scenarios/multitenant_sanity_test.go
+index ff4d74fa8..0d9b6a1be 100644
+--- a/tests/k8s/scenarios/multitenant_sanity_test.go
++++ b/tests/k8s/scenarios/multitenant_sanity_test.go
+@@ -69,6 +69,10 @@ func TestMultiTenantSanity(t *testing.T) {
+ 		mt.CreateTenant(t, ctx, tn.ID, tn.Name)
+ 		mt.CreateProvider(t, ctx, tn.ID, "openai", mockURL)
+ 		mt.CreateProviderKey(t, ctx, tn.ID, "openai", "mock", "mock-key")
++		// Same Name across tenants exercises the composite
++		// (tenant_id, name) unique index on governance_virtual_keys —
++		// see migrationTenantScopedVKNameUnique. With the legacy
++		// single-column index this POST would 409 on the second loop.
+ 		vkByTenant[tn.ID] = mt.CreateVirtualKey(t, ctx, tn.ID, "primary")
+ 	}
+ 
+diff --git a/transports/bifrost-http/handlers/tenant_providers.go b/transports/bifrost-http/handlers/tenant_providers.go
+index c2e47a2bb..ba35dddac 100644
+--- a/transports/bifrost-http/handlers/tenant_providers.go
++++ b/transports/bifrost-http/handlers/tenant_providers.go
+@@ -436,6 +436,11 @@ func (h *TenantProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ 		ID:    payload.ID,
+ 		Name:  payload.Name,
+ 		Value: *schemas.NewEnvVar(payload.Value),
++		// Default Models to wildcard so a freshly-attached key can
++		// drive inference without a follow-up edit. v1 payload doesn't
++		// expose Models; a follow-on patch will add it as an optional
++		// payload field and only fall back to "*" when omitted.
++		Models: []string{"*"},
+ 	}
+ 	if err := h.configStore.CreateProviderKeyForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), key); err != nil {
+ 		if errors.Is(err, configstore.ErrNotFound) {
+-- 
+2.51.0
+
