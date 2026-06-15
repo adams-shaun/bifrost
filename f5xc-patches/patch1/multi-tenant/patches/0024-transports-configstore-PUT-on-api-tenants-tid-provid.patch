@@ -1,0 +1,547 @@
+From 452100d966e90e0b91595951e1b2b1b5604d3436 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Sun, 14 Jun 2026 21:46:31 -0600
+Subject: [PATCH] transports+configstore: PUT on
+ /api/tenants/{tid}/providers/{provider}
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the per-tenant admin surface for the three inference-plane
+entities. Operators can now flip a tenant's provider concurrency,
+network config, proxy, and OpenAI/custom provider fields without
+recreating the row (which would invalidate the existing keys + any
+VK provider configs that reference them). Keys carry over from the
+existing row via an in-memory merge — rotation flows continue to use
+the nested /keys routes from patch 0022.
+
+configstore — UpdateProvider refactor:
+- Extracted updateProviderInternal(ctx, tenantID, provider, config, tx)
+  so the existing UpdateProvider and the new UpdateProviderForTenant
+  share the key-cascade + VKPC-resync logic.
+- updateProviderInternal scopes everything by tenant_id when non-empty:
+  - Provider lookup gains WHERE tenant_id = ? so two tenants with
+    same-named providers can't trample each other under the legacy
+    or the new path.
+  - VKPC lock acquisition now JOINs governance_virtual_keys and
+    filters by virtual_keys.tenant_id, so we only lock the calling
+    tenant's VKPCs (other tenants' rows stay available for concurrent
+    UpdateVirtualKeyProviderConfig work).
+  - Every newly created or save-updated TableKey pins tenant_id =
+    tenantID so a future GetProviderKeys-by-tenant only returns the
+    intended scope.
+- UpdateProvider (legacy) is now a wrapper that calls
+  updateProviderInternal with tenantID = tables.DefaultTenantID, so
+  single-tenant deployments behave exactly as before but
+  multi-tenant deployments using the legacy path can't accidentally
+  reach into another tenant.
+- UpdateProviderForTenant is the new public, tenant-explicit form.
+- MockConfigStore stub added (single-implementation delegation).
+- Tests cover: own-tenant update visible to GET; same-name providers
+  in two tenants stay isolated under update; new keys added via the
+  cascade get tenant_id pinned (defaultTenant GET should not see
+  them); cross-tenant update returns ErrNotFound with the target
+  row untouched.
+
+Transport additions:
+- handlers.TenantProviderHandler gains updateProvider under
+  PUT /api/tenants/{tid}/providers/{provider}. Reuses the legacy
+  providerUpdatePayload shape so the same UI / OpenAPI spec works
+  for both the legacy /api/providers and the new tenant-scoped form.
+  Reads the existing config to carry keys forward (the PUT body
+  doesn't ship keys; rotation uses the nested /keys routes). Same
+  validations as the legacy PUT (concurrency vs buffer, retry
+  backoff, custom-provider immutability). On success: evicts the
+  per-tenant runtime so the next inference acquires with the new
+  concurrency / network config in scope.
+- Handler tests cover: happy-path update with evict, missing parent
+  404, invalid-concurrency-vs-buffer 400.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  49 ++++++-
+ framework/configstore/rdb_test.go             | 120 ++++++++++++++++++
+ framework/configstore/store.go                |   6 +
+ .../bifrost-http/handlers/tenant_providers.go |  96 ++++++++++++++
+ .../handlers/tenant_providers_test.go         | 103 +++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |   4 +
+ 6 files changed, 371 insertions(+), 7 deletions(-)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 133e98f2f..a2a28da44 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -829,19 +829,43 @@ func (s *RDBConfigStore) cleanupVirtualKeyProviderConfigsForDeletedProvider(ctx
+ 	return nil
+ }
+ 
+-// UpdateProvider updates a single provider configuration in the database without deleting/recreating.
++// UpdateProvider updates a single provider configuration in the database
++// without deleting/recreating. Legacy single-tenant call shape — scoped
++// to DefaultTenantID through updateProviderInternal so a multi-tenant
++// deployment can't accidentally touch another tenant's row via the
++// non-tenant-aware path.
+ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
++	return s.updateProviderInternal(ctx, tables.DefaultTenantID, provider, config, tx...)
++}
++
++// UpdateProviderForTenant is the tenant-scoped form. tenantID is used
++// throughout: the provider lookup, the VKPC lookup (joined through
++// governance_virtual_keys.tenant_id), and the tenant_id pinned on every
++// newly created or updated TableKey row.
++func (s *RDBConfigStore) UpdateProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	return s.updateProviderInternal(ctx, tenantID, provider, config, tx...)
++}
++
++func (s *RDBConfigStore) updateProviderInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
+ 	if len(tx) == 0 {
+ 		return s.DB().WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+-			return s.UpdateProvider(ctx, provider, config, transaction)
++			return s.updateProviderInternal(ctx, tenantID, provider, config, transaction)
+ 		})
+ 	}
+ 
+ 	var txDB *gorm.DB
+ 	txDB = tx[0]
+-	// Find the existing provider
++	// Find the existing provider, scoped by tenant_id so two tenants
++	// with same-named providers can't trample each other's rows.
++	providerQ := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider))
++	if tenantID != "" {
++		providerQ = providerQ.Where("tenant_id = ?", tenantID)
++	}
+ 	var dbProvider tables.TableProvider
+-	if err := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
++	if err := providerQ.First(&dbProvider).Error; err != nil {
+ 		if errors.Is(err, gorm.ErrRecordNotFound) {
+ 			return ErrNotFound
+ 		}
+@@ -875,10 +899,20 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
+ 	// resource order matches DeleteProvider and concurrent UpdateVirtualKeyProviderConfig
+ 	// (which holds a VKPC row and then needs FK locks on config_keys via the join table).
+ 	// Without this pre-lock the two paths invert on config_keys vs. VKPC and deadlock (40P01).
++	//
++	// VKPC has no tenant_id of its own — scoping is via the FK to
++	// governance_virtual_keys whose tenant_id matches. Join through to
++	// keep this tenant's VKPCs locked and leave other tenants' alone.
++	vkpcQ := dbForUpdate(txDB.WithContext(ctx)).
++		Table("governance_virtual_key_provider_configs").
++		Where("governance_virtual_key_provider_configs.provider = ?", dbProvider.Name)
++	if tenantID != "" {
++		vkpcQ = vkpcQ.
++			Joins("JOIN governance_virtual_keys ON governance_virtual_keys.id = governance_virtual_key_provider_configs.virtual_key_id").
++			Where("governance_virtual_keys.tenant_id = ?", tenantID)
++	}
+ 	var providerVKPCs []tables.TableVirtualKeyProviderConfig
+-	if err := dbForUpdate(txDB.WithContext(ctx)).
+-		Where("provider = ?", dbProvider.Name).
+-		Order("id ASC").
++	if err := vkpcQ.Order("governance_virtual_key_provider_configs.id ASC").
+ 		Find(&providerVKPCs).Error; err != nil {
+ 		return err
+ 	}
+@@ -905,6 +939,7 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
+ 		dbKey := tables.TableKey{
+ 			Provider:           dbProvider.Name,
+ 			ProviderID:         dbProvider.ID,
++			TenantID:           tenantID,
+ 			KeyID:              key.ID,
+ 			Name:               key.Name,
+ 			Value:              key.Value,
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index aadf6fba5..57d88390a 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -2191,6 +2191,126 @@ func TestDeleteVirtualKeyForTenant_OnlyOwnTenant(t *testing.T) {
+ 	assert.ErrorIs(t, err, ErrNotFound)
+ }
+ 
++// TestUpdateProviderForTenant_OwnTenantSucceeds covers the happy path —
++// updating a tenant's provider config flips the requested field and
++// is observable through the tenant-scoped read API.
++func TestUpdateProviderForTenant_OwnTenantSucceeds(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	concurrency1, buf1 := 4, 16
++	original := ProviderConfig{
++		Keys:                     []schemas.Key{{ID: "acme-k1", Name: "acme-primary", Value: *schemas.NewEnvVar("sk-acme-1")}},
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency1, BufferSize: buf1},
++	}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", original))
++
++	concurrency2, buf2 := 8, 32
++	updated := ProviderConfig{
++		Keys:                     []schemas.Key{{ID: "acme-k1", Name: "acme-primary", Value: *schemas.NewEnvVar("sk-acme-1")}},
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency2, BufferSize: buf2},
++	}
++	require.NoError(t, store.UpdateProviderForTenant(ctx, "acme", "openai", updated))
++
++	got, err := store.GetProviderConfigByTenant(ctx, "acme", "openai")
++	require.NoError(t, err)
++	require.NotNil(t, got.ConcurrencyAndBufferSize)
++	assert.Equal(t, concurrency2, got.ConcurrencyAndBufferSize.Concurrency)
++	assert.Equal(t, buf2, got.ConcurrencyAndBufferSize.BufferSize)
++}
++
++// TestUpdateProviderForTenant_OnlyOwnTenant proves a tenant-scoped
++// UpdateProvider cannot trample another tenant's row even when the
++// two share a provider name. The lookup is filtered by tenant_id, so
++// acme's update operates on acme's openai; globex's openai keeps its
++// original concurrency.
++func TestUpdateProviderForTenant_OnlyOwnTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	concurrency1, buf1 := 4, 16
++	concurrency2, buf2 := 8, 32
++	make := func(c, b int, keyID string) ProviderConfig {
++		return ProviderConfig{
++			Keys:                     []schemas.Key{{ID: keyID, Name: keyID, Value: *schemas.NewEnvVar(keyID)}},
++			ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: c, BufferSize: b},
++		}
++	}
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", make(concurrency1, buf1, "acme-k")))
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", make(concurrency1, buf1, "globex-k")))
++
++	// Acme bumps concurrency. Globex's row should not move.
++	require.NoError(t, store.UpdateProviderForTenant(ctx, "acme", "openai", make(concurrency2, buf2, "acme-k")))
++
++	acme, err := store.GetProviderConfigByTenant(ctx, "acme", "openai")
++	require.NoError(t, err)
++	assert.Equal(t, concurrency2, acme.ConcurrencyAndBufferSize.Concurrency)
++
++	globex, err := store.GetProviderConfigByTenant(ctx, "globex", "openai")
++	require.NoError(t, err)
++	assert.Equal(t, concurrency1, globex.ConcurrencyAndBufferSize.Concurrency,
++		"globex's openai must not have moved under acme's update")
++}
++
++// TestUpdateProviderForTenant_NewKey_PinsTenantID exercises the
++// keys-cascade branch: adding a key via UpdateProvider's diff machinery
++// should pin tenant_id on the new TableKey row so it stays visible
++// only to the calling tenant.
++func TestUpdateProviderForTenant_NewKey_PinsTenantID(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	concurrency, buf := 4, 16
++	require.NoError(t, store.AddProviderForTenant(ctx, "acme", "openai", ProviderConfig{
++		Keys:                     []schemas.Key{{ID: "acme-k1", Name: "acme-primary", Value: *schemas.NewEnvVar("sk-acme-1")}},
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency, BufferSize: buf},
++	}))
++
++	// Add a second key via update.
++	require.NoError(t, store.UpdateProviderForTenant(ctx, "acme", "openai", ProviderConfig{
++		Keys: []schemas.Key{
++			{ID: "acme-k1", Name: "acme-primary", Value: *schemas.NewEnvVar("sk-acme-1")},
++			{ID: "acme-k2", Name: "acme-secondary", Value: *schemas.NewEnvVar("sk-acme-2")},
++		},
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency, BufferSize: buf},
++	}))
++
++	// Both keys must be visible to acme.
++	acmeKeys, err := store.GetProviderKeysForTenant(ctx, "acme", "openai")
++	require.NoError(t, err)
++	assert.Len(t, acmeKeys, 2)
++
++	// The new key's tenant_id is acme — not the column-default "default"
++	// — so a default-tenant read would NOT see it.
++	def, err := store.GetProvidersConfigByTenant(ctx, tables.DefaultTenantID)
++	require.NoError(t, err)
++	assert.Empty(t, def, "default tenant must not see acme's keys created via UpdateProvider")
++}
++
++// TestUpdateProviderForTenant_CrossTenantNotFound asserts that even
++// when a provider with the requested name exists in some other
++// tenant's scope, an update from the wrong tenant returns ErrNotFound.
++func TestUpdateProviderForTenant_CrossTenantNotFound(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	concurrency, buf := 4, 16
++	require.NoError(t, store.AddProviderForTenant(ctx, "globex", "openai", ProviderConfig{
++		Keys:                     []schemas.Key{{ID: "g-k", Name: "g-k", Value: *schemas.NewEnvVar("sk-g")}},
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: concurrency, BufferSize: buf},
++	}))
++
++	err := store.UpdateProviderForTenant(ctx, "acme", "openai", ProviderConfig{
++		ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: 99, BufferSize: 99},
++	})
++	assert.ErrorIs(t, err, ErrNotFound)
++
++	// Globex's row stays at the original concurrency.
++	globex, err := store.GetProviderConfigByTenant(ctx, "globex", "openai")
++	require.NoError(t, err)
++	assert.Equal(t, concurrency, globex.ConcurrencyAndBufferSize.Concurrency)
++}
++
+ // TestUpdateVirtualKeyForTenant_OwnTenantSucceeds confirms a tenant
+ // can update its own VK and observe the change.
+ func TestUpdateVirtualKeyForTenant_OwnTenantSucceeds(t *testing.T) {
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index fe2c8e25e..970e93f56 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -130,6 +130,12 @@ type ConfigStore interface {
+ 	// default tenant.
+ 	AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
++	// UpdateProviderForTenant is the tenant-scoped form of UpdateProvider.
++	// The provider lookup, VKPC lookup, and new TableKey rows are all
++	// scoped by tenant_id so a multi-tenant deployment with the same
++	// provider name across tenants cannot have an update on tenant A
++	// touch tenant B's row. Empty tenantID normalizes to DefaultTenantID.
++	UpdateProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+ 	DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error
+ 	// DeleteProviderForTenant is the tenant-scoped form of DeleteProvider:
+ 	// only removes the row whose (tenant_id, name) matches. Empty
+diff --git a/transports/bifrost-http/handlers/tenant_providers.go b/transports/bifrost-http/handlers/tenant_providers.go
+index 968950151..c2e47a2bb 100644
+--- a/transports/bifrost-http/handlers/tenant_providers.go
++++ b/transports/bifrost-http/handlers/tenant_providers.go
+@@ -67,6 +67,7 @@ func (h *TenantProviderHandler) RegisterRoutes(r *router.Router, middlewares ...
+ 	r.GET("/api/tenants/{tenant_id}/providers", lib.ChainMiddlewares(h.listProviders, middlewares...))
+ 	r.POST("/api/tenants/{tenant_id}/providers", lib.ChainMiddlewares(h.createProvider, middlewares...))
+ 	r.GET("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.getProvider, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.updateProvider, middlewares...))
+ 	r.DELETE("/api/tenants/{tenant_id}/providers/{provider}", lib.ChainMiddlewares(h.deleteProvider, middlewares...))
+ 	r.GET("/api/tenants/{tenant_id}/providers/{provider}/keys", lib.ChainMiddlewares(h.listProviderKeys, middlewares...))
+ 	r.POST("/api/tenants/{tenant_id}/providers/{provider}/keys", lib.ChainMiddlewares(h.createProviderKey, middlewares...))
+@@ -229,6 +230,101 @@ func (h *TenantProviderHandler) getProvider(ctx *fasthttp.RequestCtx) {
+ 	})
+ }
+ 
++// updateProvider — PUT /api/tenants/{tenant_id}/providers/{provider}
++//
++// Body uses the same providerUpdatePayload shape as the legacy
++// /api/providers PUT (NetworkConfig + ConcurrencyAndBufferSize +
++// ProxyConfig + raw-request/response flags + CustomProviderConfig +
++// OpenAIConfig). Keys carry over from the existing provider via the
++// in-memory merge below — operators rotate keys through the nested
++// /keys routes rather than passing them in the provider payload.
++//
++// On success: per-tenant runtime is evicted so the next inference
++// request acquires with the new config.
++func (h *TenantProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	providerStr, _ := ctx.UserValue("provider").(string)
++	if providerStr == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "provider is required")
++		return
++	}
++
++	var payload providerUpdatePayload
++	if err := sonic.Unmarshal(ctx.PostBody(), &payload); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if payload.ConcurrencyAndBufferSize.Concurrency != 0 || payload.ConcurrencyAndBufferSize.BufferSize != 0 {
++		cb := payload.ConcurrencyAndBufferSize
++		if cb.Concurrency == 0 {
++			SendError(ctx, fasthttp.StatusBadRequest, "Concurrency must be greater than 0")
++			return
++		}
++		if cb.BufferSize == 0 {
++			SendError(ctx, fasthttp.StatusBadRequest, "Buffer size must be greater than 0")
++			return
++		}
++		if cb.Concurrency > cb.BufferSize {
++			SendError(ctx, fasthttp.StatusBadRequest, "Concurrency must be less than or equal to buffer size")
++			return
++		}
++	}
++	if err := validateRetryBackoff(&payload.NetworkConfig); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid retry backoff: %v", err))
++		return
++	}
++
++	// Load the existing config so we can carry keys forward (the legacy
++	// /api/providers PUT shape doesn't ship keys; rotation flows go
++	// through the nested /keys routes instead).
++	existing, err := h.configStore.GetProviderConfigByTenant(ctx, string(tid), schemas.ModelProvider(providerStr))
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load provider: %v", err))
++		return
++	}
++
++	updated := configstore.ProviderConfig{
++		Keys:                     existing.Keys,
++		NetworkConfig:            &payload.NetworkConfig,
++		ConcurrencyAndBufferSize: &payload.ConcurrencyAndBufferSize,
++		ProxyConfig:              payload.ProxyConfig,
++		SendBackRawRequest:       payload.SendBackRawRequest != nil && *payload.SendBackRawRequest,
++		SendBackRawResponse:      payload.SendBackRawResponse != nil && *payload.SendBackRawResponse,
++		StoreRawRequestResponse:  payload.StoreRawRequestResponse != nil && *payload.StoreRawRequestResponse,
++		CustomProviderConfig:     payload.CustomProviderConfig,
++		OpenAIConfig:             payload.OpenAIConfig,
++	}
++	if err := lib.ValidateCustomProviderUpdate(updated, *existing, schemas.ModelProvider(providerStr)); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid custom provider update: %v", err))
++		return
++	}
++
++	if err := h.configStore.UpdateProviderForTenant(ctx, string(tid), schemas.ModelProvider(providerStr), updated); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider %s not found for tenant %s", providerStr, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update provider: %v", err))
++		return
++	}
++	if h.evictor != nil {
++		h.evictor.Evict(tid)
++	}
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"provider":  providerStr,
++		"config":    updated.Redacted(),
++	})
++}
++
+ // deleteProvider — DELETE /api/tenants/{tenant_id}/providers/{provider}
+ //
+ // 404 when the provider doesn't exist in this tenant's scope, 204 on
+diff --git a/transports/bifrost-http/handlers/tenant_providers_test.go b/transports/bifrost-http/handlers/tenant_providers_test.go
+index fca2d9bd7..ac11aff62 100644
+--- a/transports/bifrost-http/handlers/tenant_providers_test.go
++++ b/transports/bifrost-http/handlers/tenant_providers_test.go
+@@ -544,6 +544,109 @@ func TestTenantProviderHandler_GetProviderKey_CrossTenantNotFound(t *testing.T)
+ 	}
+ }
+ 
++// stubProviderStore extension for the PUT path: capture update calls
++// and back GetProviderConfigByTenant from the existing seed list.
++func (s *stubProviderStore) UpdateProviderForTenant(_ context.Context, tenantID string, provider schemas.ModelProvider, config configstore.ProviderConfig, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, c := range s.calls {
++		if c.tenantID == tenantID && c.provider == provider {
++			s.calls[i].config = config
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func TestTenantProviderHandler_UpdateProvider_HappyPath_Evicts(t *testing.T) {
++	store := &stubProviderStore{}
++	store.calls = append(store.calls, addProviderForTenantCall{
++		tenantID: "acme", provider: "openai", config: configstore.ProviderConfig{
++			ConcurrencyAndBufferSize: &schemas.ConcurrencyAndBufferSize{Concurrency: 4, BufferSize: 16},
++		},
++	})
++	evictor := &stubEvictor{}
++	h, _ := NewTenantProviderHandler(store, evictor)
++
++	body, _ := sonic.Marshal(map[string]any{
++		"network_config":              schemas.NetworkConfig{},
++		"concurrency_and_buffer_size": map[string]any{"concurrency": 8, "buffer_size": 32},
++	})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers/openai")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("provider", "openai")
++
++	h.updateProvider(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusOK; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if got := store.calls[0].config.ConcurrencyAndBufferSize.Concurrency; got != 8 {
++		t.Fatalf("concurrency should have flipped to 8; got %d", got)
++	}
++	evictor.mu.Lock()
++	defer evictor.mu.Unlock()
++	if len(evictor.called) != 1 || evictor.called[0] != multitenant.TenantID("acme") {
++		t.Fatalf("Evict should fire; got %v", evictor.called)
++	}
++}
++
++func TestTenantProviderHandler_UpdateProvider_NotFound(t *testing.T) {
++	store := &stubProviderStore{}
++	// Acme has nothing; payload targets acme/openai.
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{
++		"network_config":              schemas.NetworkConfig{},
++		"concurrency_and_buffer_size": map[string]any{"concurrency": 4, "buffer_size": 16},
++	})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers/openai")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("provider", "openai")
++
++	h.updateProvider(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("missing parent should be 404; got %d body=%s", got, string(ctx.Response.Body()))
++	}
++}
++
++func TestTenantProviderHandler_UpdateProvider_RejectsInvalidConcurrency(t *testing.T) {
++	store := &stubProviderStore{}
++	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "acme", provider: "openai"})
++	h, _ := NewTenantProviderHandler(store, nil)
++
++	body, _ := sonic.Marshal(map[string]any{
++		"concurrency_and_buffer_size": map[string]any{"concurrency": 32, "buffer_size": 4}, // concurrency > buffer
++	})
++	var req fasthttp.Request
++	req.SetRequestURI("/api/tenants/acme/providers/openai")
++	req.Header.SetMethod(fasthttp.MethodPut)
++	req.SetBody(body)
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), "acme")
++	ctx.SetUserValue("provider", "openai")
++
++	h.updateProvider(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("concurrency > buffer should be 400; got %d", got)
++	}
++}
++
+ func TestTenantProviderHandler_DeleteProviderKey_HappyPath_Evicts(t *testing.T) {
+ 	store := &stubKeyStore{}
+ 	store.calls = append(store.calls, addProviderForTenantCall{tenantID: "acme", provider: "openai"})
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index 6658c7799..161a25dee 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -501,6 +501,10 @@ func (m *MockConfigStore) UpdateProvider(ctx context.Context, provider schemas.M
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) UpdateProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
++	return m.UpdateProvider(ctx, provider, config, tx...)
++}
++
+ func (m *MockConfigStore) DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error {
+ 	delete(m.providers, provider)
+ 	return nil
+-- 
+2.51.0
+
