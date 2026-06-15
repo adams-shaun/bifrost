@@ -1,0 +1,455 @@
+From 02109e7c0e9a35ea55f69de7b8d44ec57c559a8c Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 09:46:29 -0600
+Subject: [PATCH] ui: rename customer label to namespace (display-only)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In the multi-tenant context, the governance "customer" entity is more
+accurately framed as a namespace within a tenant: a grouping of teams,
+budgets, and rate limits. Flip user-facing labels (JSX text, dialog
+titles, form labels, placeholders, toasts, aria-labels, sidebar nav,
+empty-state copy) from Customer/Customers to Namespace/Namespaces.
+
+Code identifiers, API paths, type names, Redux tags, URL routes,
+RBAC resource names, and prop names are unchanged — this is purely a
+copy refresh. Unrelated "customer support" placeholder text in prompt
+sheets is left as-is.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../components/user-groups/teamsView.tsx       |  2 +-
+ ui/app/workspace/governance/customers/page.tsx |  2 +-
+ .../governance/views/customerDialog.tsx        | 18 +++++++++---------
+ .../governance/views/customerTable.tsx         | 16 ++++++++--------
+ .../governance/views/customersEmptyState.tsx   | 10 +++++-----
+ .../workspace/governance/views/teamDialog.tsx  |  4 ++--
+ .../workspace/governance/views/teamsTable.tsx  |  2 +-
+ .../workspace/governance/virtual-keys/page.tsx |  2 +-
+ ui/app/workspace/logs/sheets/logDetailView.tsx |  2 +-
+ .../routing-rules/views/routingRuleSheet.tsx   |  8 ++++----
+ .../views/virtualKeyDetailsSheet.tsx           |  2 +-
+ .../virtual-keys/views/virtualKeySheet.tsx     | 10 +++++-----
+ .../virtual-keys/views/virtualKeysTable.tsx    |  4 ++--
+ ui/components/sidebar.tsx                      |  6 +++---
+ ui/lib/utils/routingRules.ts                   |  2 +-
+ 15 files changed, 45 insertions(+), 45 deletions(-)
+
+diff --git a/ui/app/_fallbacks/enterprise/components/user-groups/teamsView.tsx b/ui/app/_fallbacks/enterprise/components/user-groups/teamsView.tsx
+index 997da5fae..aa64ec51f 100644
+--- a/ui/app/_fallbacks/enterprise/components/user-groups/teamsView.tsx
++++ b/ui/app/_fallbacks/enterprise/components/user-groups/teamsView.tsx
+@@ -81,7 +81,7 @@ export function TeamsView() {
+ 			toast.error("Failed to load governance data.");
+ 		} else {
+ 			if (vkError) toast.error(`Failed to load virtual keys: ${getErrorMessage(vkError)}`);
+-			if (customersError) toast.error(`Failed to load customers: ${getErrorMessage(customersError)}`);
++			if (customersError) toast.error(`Failed to load namespaces: ${getErrorMessage(customersError)}`);
+ 			if (teamsError) toast.error(`Failed to load teams: ${getErrorMessage(teamsError)}`);
+ 		}
+ 	}, [vkError, customersError, teamsError]);
+diff --git a/ui/app/workspace/governance/customers/page.tsx b/ui/app/workspace/governance/customers/page.tsx
+index 051973d94..f7324fef8 100644
+--- a/ui/app/workspace/governance/customers/page.tsx
++++ b/ui/app/workspace/governance/customers/page.tsx
+@@ -75,7 +75,7 @@ export default function GovernanceCustomersPage() {
+ 		} else {
+ 			if (vkError) toast.error(`Failed to load virtual keys: ${getErrorMessage(vkError)}`);
+ 			if (teamsError) toast.error(`Failed to load teams: ${getErrorMessage(teamsError)}`);
+-			if (customersError) toast.error(`Failed to load customers: ${getErrorMessage(customersError)}`);
++			if (customersError) toast.error(`Failed to load namespaces: ${getErrorMessage(customersError)}`);
+ 		}
+ 	}, [vkError, teamsError, customersError]);
+ 
+diff --git a/ui/app/workspace/governance/views/customerDialog.tsx b/ui/app/workspace/governance/views/customerDialog.tsx
+index 2578ce504..62b9b9de1 100644
+--- a/ui/app/workspace/governance/views/customerDialog.tsx
++++ b/ui/app/workspace/governance/views/customerDialog.tsx
+@@ -102,7 +102,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 		() =>
+ 			new Validator([
+ 				// Basic validation
+-				Validator.required(formData.name.trim(), "Customer name is required"),
++				Validator.required(formData.name.trim(), "Namespace name is required"),
+ 
+ 				// Check if anything is dirty
+ 				Validator.custom(formData.isDirty, "No changes to save"),
+@@ -183,7 +183,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 				}
+ 
+ 				await updateCustomer({ customerId: customer.id, data: updateData }).unwrap();
+-				toast.success("Customer updated successfully");
++				toast.success("Namespace updated successfully");
+ 			} else {
+ 				// Create new customer
+ 				const createData: CreateCustomerRequest = {
+@@ -213,7 +213,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 				}
+ 
+ 				await createCustomer(createData).unwrap();
+-				toast.success("Customer created successfully");
++				toast.success("Namespace created successfully");
+ 			}
+ 
+ 			onSave();
+@@ -226,11 +226,11 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 		<Dialog open onOpenChange={onCancel}>
+ 			<DialogContent className="max-w-2xl" data-testid="customer-dialog-content">
+ 				<DialogHeader>
+-					<DialogTitle className="flex items-center gap-2">{isEditing ? "Edit Customer" : "Create Customer"}</DialogTitle>
++					<DialogTitle className="flex items-center gap-2">{isEditing ? "Edit Namespace" : "Create Namespace"}</DialogTitle>
+ 					<DialogDescription>
+ 						{isEditing
+-							? "Update the customer information and settings."
+-							: "Create a new customer account to organize teams and manage resources."}
++							? "Update the namespace information and settings."
++							: "Create a new namespace to organize teams and manage resources."}
+ 					</DialogDescription>
+ 				</DialogHeader>
+ 
+@@ -239,7 +239,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 						{/* Basic Information */}
+ 						<div className="space-y-4">
+ 							<div className="space-y-2">
+-								<Label htmlFor="name">Customer Name *</Label>
++								<Label htmlFor="name">Namespace Name *</Label>
+ 								<Input
+ 									id="name"
+ 									data-testid="customer-name-input"
+@@ -248,7 +248,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 									maxLength={50}
+ 									onChange={(e) => updateField("name", e.target.value)}
+ 								/>
+-								<p className="text-muted-foreground text-sm">This name will be used to identify the customer account.</p>
++								<p className="text-muted-foreground text-sm">This name will be used to identify the namespace.</p>
+ 							</div>
+ 						</div>
+ 
+@@ -361,7 +361,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
+ 
+ 					<FormFooter
+ 						validator={validator}
+-						label="Customer"
++						label="Namespace"
+ 						onCancel={onCancel}
+ 						isLoading={loading}
+ 						isEditing={isEditing}
+diff --git a/ui/app/workspace/governance/views/customerTable.tsx b/ui/app/workspace/governance/views/customerTable.tsx
+index a5415a558..960834735 100644
+--- a/ui/app/workspace/governance/views/customerTable.tsx
++++ b/ui/app/workspace/governance/views/customerTable.tsx
+@@ -53,7 +53,7 @@ function CustomerActionsMenu({ customer, canUpdate, canDelete, onEdit, onDelete
+ 					variant="ghost"
+ 					size="icon"
+ 					className="h-8 w-8"
+-					aria-label={`Customer actions ${customer.name}`}
++					aria-label={`Namespace actions ${customer.name}`}
+ 					data-testid={`customer-actions-btn-${customer.id}`}
+ 					onClick={(e) => e.stopPropagation()}
+ 					onPointerDown={(e) => e.stopPropagation()}
+@@ -130,7 +130,7 @@ export default function CustomersTable({
+ 	const handleDelete = async (customerId: string) => {
+ 		try {
+ 			await deleteCustomer(customerId).unwrap();
+-			toast.success("Customer deleted successfully");
++			toast.success("Namespace deleted successfully");
+ 		} catch (error) {
+ 			toast.error(getErrorMessage(error));
+ 		} finally {
+@@ -187,12 +187,12 @@ export default function CustomersTable({
+ 				<div className="space-y-4">
+ 					<div className="flex items-center justify-between">
+ 						<div>
+-							<h2 className="text-lg font-semibold">Customers</h2>
+-							<p className="text-muted-foreground text-sm">Manage customer accounts with their own teams, budgets, and access controls.</p>
++							<h2 className="text-lg font-semibold">Namespaces</h2>
++							<p className="text-muted-foreground text-sm">Manage namespaces with their own teams, budgets, and access controls.</p>
+ 						</div>
+ 						<Button data-testid="customer-button-create" onClick={handleAddCustomer} disabled={!hasCreateAccess}>
+ 							<Plus className="h-4 w-4" />
+-							Add Customer
++							Add Namespace
+ 						</Button>
+ 					</div>
+ 
+@@ -200,7 +200,7 @@ export default function CustomersTable({
+ 						<div className="relative max-w-sm flex-1">
+ 							<Search className="text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
+ 							<Input
+-								aria-label="Search customers by name"
++								aria-label="Search namespaces by name"
+ 								placeholder="Search by name..."
+ 								value={search}
+ 								onChange={(e) => onSearchChange(e.target.value)}
+@@ -226,7 +226,7 @@ export default function CustomersTable({
+ 								{customers.length === 0 ? (
+ 									<TableRow>
+ 										<TableCell colSpan={6} className="h-24 text-center">
+-											<span className="text-muted-foreground text-sm">No matching customers found.</span>
++											<span className="text-muted-foreground text-sm">No matching namespaces found.</span>
+ 										</TableCell>
+ 									</TableRow>
+ 								) : (
+@@ -482,7 +482,7 @@ export default function CustomersTable({
+ 				<AlertDialog open={!!confirmDeleteCustomer} onOpenChange={(open) => !open && setConfirmDeleteCustomer(null)}>
+ 					<AlertDialogContent>
+ 						<AlertDialogHeader>
+-							<AlertDialogTitle>Delete Customer</AlertDialogTitle>
++							<AlertDialogTitle>Delete Namespace</AlertDialogTitle>
+ 							<AlertDialogDescription>
+ 								Are you sure you want to delete &quot;{confirmDeleteCustomer?.name}&quot;? This will also delete all associated teams and
+ 								unassign any virtual keys. This action cannot be undone.
+diff --git a/ui/app/workspace/governance/views/customersEmptyState.tsx b/ui/app/workspace/governance/views/customersEmptyState.tsx
+index 5b3edfffb..e7845f2ef 100644
+--- a/ui/app/workspace/governance/views/customersEmptyState.tsx
++++ b/ui/app/workspace/governance/views/customersEmptyState.tsx
+@@ -16,14 +16,14 @@ export function CustomersEmptyState({ onAddClick, canCreate = true }: CustomersE
+ 				<WalletCards className="h-[5.5rem] w-[5.5rem]" strokeWidth={1} />
+ 			</div>
+ 			<div className="flex flex-col gap-1">
+-				<h1 className="text-muted-foreground text-xl font-medium">Customers have their own teams, budgets, and access controls</h1>
++				<h1 className="text-muted-foreground text-xl font-medium">Namespaces have their own teams, budgets, and access controls</h1>
+ 				<div className="text-muted-foreground mx-auto mt-2 max-w-[600px] text-sm font-normal">
+-					Create customer accounts to manage multi-tenant usage, assign teams, and set spending and rate limits per customer.
++					Create namespaces to group teams, assign spending limits, and set rate limits per namespace.
+ 				</div>
+ 				<div className="mx-auto mt-6 flex flex-row flex-wrap items-center justify-center gap-2">
+ 					<Button
+ 						variant="outline"
+-						aria-label="Read more about customers (opens in new tab)"
++						aria-label="Read more about namespaces (opens in new tab)"
+ 						data-testid="customer-button-read-more"
+ 						onClick={() => {
+ 							window.open(`${CUSTOMERS_DOCS_URL}?utm_source=bfd`, "_blank", "noopener,noreferrer");
+@@ -31,8 +31,8 @@ export function CustomersEmptyState({ onAddClick, canCreate = true }: CustomersE
+ 					>
+ 						Read more <ArrowUpRight className="text-muted-foreground h-3 w-3" />
+ 					</Button>
+-					<Button aria-label="Add your first customer" onClick={onAddClick} disabled={!canCreate} data-testid="customer-button-create">
+-						Add Customer
++					<Button aria-label="Add your first namespace" onClick={onAddClick} disabled={!canCreate} data-testid="customer-button-create">
++						Add Namespace
+ 					</Button>
+ 				</div>
+ 			</div>
+diff --git a/ui/app/workspace/governance/views/teamDialog.tsx b/ui/app/workspace/governance/views/teamDialog.tsx
+index 579663cc9..e5f6517cd 100644
+--- a/ui/app/workspace/governance/views/teamDialog.tsx
++++ b/ui/app/workspace/governance/views/teamDialog.tsx
+@@ -413,7 +413,7 @@ export default function TeamDialog({
+               {/* Customer Assignment */}
+               {customers?.length > 0 && (
+                 <div className="space-y-2">
+-                  <Label htmlFor="customer">Customer (optional)</Label>
++                  <Label htmlFor="customer">Namespace (optional)</Label>
+                   <Select
+                     value={formData.customerId || "__none__"}
+                     onValueChange={(value) =>
+@@ -428,7 +428,7 @@ export default function TeamDialog({
+                       className="w-full"
+                       data-testid="team-customer-select-trigger"
+                     >
+-                      <SelectValue placeholder="Select a customer" />
++                      <SelectValue placeholder="Select a namespace" />
+                     </SelectTrigger>
+                     <SelectContent>
+                       <SelectItem
+diff --git a/ui/app/workspace/governance/views/teamsTable.tsx b/ui/app/workspace/governance/views/teamsTable.tsx
+index 316b6742d..3d725c2cd 100644
+--- a/ui/app/workspace/governance/views/teamsTable.tsx
++++ b/ui/app/workspace/governance/views/teamsTable.tsx
+@@ -247,7 +247,7 @@ export default function TeamsTable({
+ 							<TableHeader>
+ 								<TableRow>
+ 									<TableHead>Name</TableHead>
+-									<TableHead>Customer</TableHead>
++									<TableHead>Namespace</TableHead>
+ 									<TableHead>Budget</TableHead>
+ 									<TableHead>Rate Limit</TableHead>
+ 									<TableHead>Virtual Keys</TableHead>
+diff --git a/ui/app/workspace/governance/virtual-keys/page.tsx b/ui/app/workspace/governance/virtual-keys/page.tsx
+index 7934d0a20..e221108f6 100644
+--- a/ui/app/workspace/governance/virtual-keys/page.tsx
++++ b/ui/app/workspace/governance/virtual-keys/page.tsx
+@@ -114,7 +114,7 @@ export default function GovernanceVirtualKeysPage() {
+         toast.error(`Failed to load teams: ${getErrorMessage(teamsError)}`);
+       if (customersError)
+         toast.error(
+-          `Failed to load customers: ${getErrorMessage(customersError)}`,
++          `Failed to load namespaces: ${getErrorMessage(customersError)}`,
+         );
+     }
+   }, [vkError, teamsError, customersError]);
+diff --git a/ui/app/workspace/logs/sheets/logDetailView.tsx b/ui/app/workspace/logs/sheets/logDetailView.tsx
+index 214193685..69e1dc6a6 100644
+--- a/ui/app/workspace/logs/sheets/logDetailView.tsx
++++ b/ui/app/workspace/logs/sheets/logDetailView.tsx
+@@ -1256,7 +1256,7 @@ export function LogDetailView({
+               {log.customer_id && (
+                 <LogEntryDetailsView
+                   className="w-full"
+-                  label="Customer"
++                  label="Namespace"
+                   value={
+                     <Link
+                       to="/workspace/logs"
+diff --git a/ui/app/workspace/routing-rules/views/routingRuleSheet.tsx b/ui/app/workspace/routing-rules/views/routingRuleSheet.tsx
+index ae19662ed..684166558 100644
+--- a/ui/app/workspace/routing-rules/views/routingRuleSheet.tsx
++++ b/ui/app/workspace/routing-rules/views/routingRuleSheet.tsx
+@@ -173,7 +173,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
+ 	const onSubmit = (data: RoutingRuleFormData) => {
+ 		// Validate scope_id is required when scope is not global
+ 		if (data.scope !== "global" && !data.scope_id?.trim()) {
+-			toast.error(`${data.scope === "team" ? "Team" : data.scope === "customer" ? "Customer" : "Virtual Key"} is required`);
++			toast.error(`${data.scope === "team" ? "Team" : data.scope === "customer" ? "Namespace" : "Virtual Key"} is required`);
+ 			return;
+ 		}
+ 
+@@ -369,7 +369,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
+ 						{scope !== "global" && (
+ 							<div className="space-y-2">
+ 								<Label htmlFor="scope_id">
+-									{scope === "team" ? "Team" : scope === "customer" ? "Customer" : "Virtual Key"} <span className="text-red-500">*</span>
++									{scope === "team" ? "Team" : scope === "customer" ? "Namespace" : "Virtual Key"} <span className="text-red-500">*</span>
+ 								</Label>
+ 								{scope === "team" && teamsData.teams.length > 0 && (
+ 									<ComboboxSelect
+@@ -385,7 +385,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
+ 										options={customersData.customers.map((customer) => ({ label: customer.name, value: customer.id }))}
+ 										value={scopeId || null}
+ 										onValueChange={(value) => setValue("scope_id", value ?? "")}
+-										placeholder="Select a customer..."
++										placeholder="Select a namespace..."
+ 										noPortal
+ 									/>
+ 								)}
+@@ -402,7 +402,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
+ 									(scope === "customer" && customersData.customers.length === 0) ||
+ 									(scope === "virtual_key" && vksData.virtual_keys.length === 0)) && (
+ 									<p className="text-muted-foreground text-sm">
+-										No {scope === "team" ? "teams" : scope === "customer" ? "customers" : "virtual keys"} available
++										No {scope === "team" ? "teams" : scope === "customer" ? "namespaces" : "virtual keys"} available
+ 									</p>
+ 								)}
+ 								{errors.scope_id && <p className="text-destructive text-sm">{errors.scope_id.message}</p>}
+diff --git a/ui/app/workspace/virtual-keys/views/virtualKeyDetailsSheet.tsx b/ui/app/workspace/virtual-keys/views/virtualKeyDetailsSheet.tsx
+index a9b452b6b..fda30f6d8 100644
+--- a/ui/app/workspace/virtual-keys/views/virtualKeyDetailsSheet.tsx
++++ b/ui/app/workspace/virtual-keys/views/virtualKeyDetailsSheet.tsx
+@@ -58,7 +58,7 @@ export default function VirtualKeyDetailSheet({ virtualKey, onClose }: VirtualKe
+ 			return { type: "Team", name: virtualKey.team.name };
+ 		}
+ 		if (virtualKey.customer) {
+-			return { type: "Customer", name: virtualKey.customer.name };
++			return { type: "Namespace", name: virtualKey.customer.name };
+ 		}
+ 		return { type: "None", name: "" };
+ 	};
+diff --git a/ui/app/workspace/virtual-keys/views/virtualKeySheet.tsx b/ui/app/workspace/virtual-keys/views/virtualKeySheet.tsx
+index bf5362d3e..244427cd8 100644
+--- a/ui/app/workspace/virtual-keys/views/virtualKeySheet.tsx
++++ b/ui/app/workspace/virtual-keys/views/virtualKeySheet.tsx
+@@ -152,7 +152,7 @@ const formSchema = z
+ 			return true;
+ 		},
+ 		{
+-			message: "Please select a valid team, customer, or access profile when assignment type is chosen",
++			message: "Please select a valid team, namespace, or access profile when assignment type is chosen",
+ 			path: ["entityType"],
+ 		},
+ 	);
+@@ -1792,7 +1792,7 @@ export default function VirtualKeySheet({
+ 																options={[
+ 																	{ value: "none", label: "No Assignment" },
+ 																	...(teams?.length > 0 ? [{ value: "team", label: "Assign to Team" }] : []),
+-																	...(customers?.length > 0 ? [{ value: "customer", label: "Assign to Customer" }] : []),
++																	...(customers?.length > 0 ? [{ value: "customer", label: "Assign to Namespace" }] : []),
+ 																	...(accessProfiles?.length > 0 || virtualKey?.access_profile_id || defaultAccessProfileId
+ 																		? [{ value: "access_profile", label: "Assign to Access Profile" }]
+ 																		: []),
+@@ -1889,7 +1889,7 @@ export default function VirtualKeySheet({
+ 														name="customerId"
+ 														render={({ field }) => (
+ 															<FormItem>
+-																<FormLabel className="font-normal">Select Customer</FormLabel>
++																<FormLabel className="font-normal">Select Namespace</FormLabel>
+ 																<ComboboxSelect
+ 																	options={customers.map((customer) => ({
+ 																		value: customer.id,
+@@ -1897,8 +1897,8 @@ export default function VirtualKeySheet({
+ 																	}))}
+ 																	value={field.value || null}
+ 																	onValueChange={(val) => field.onChange(val ?? "")}
+-																	placeholder="Select a customer"
+-																	emptyMessage="No customers found."
++																	placeholder="Select a namespace"
++																	emptyMessage="No namespaces found."
+ 																	className="h-9"
+ 																/>
+ 																<FormMessage />
+diff --git a/ui/app/workspace/virtual-keys/views/virtualKeysTable.tsx b/ui/app/workspace/virtual-keys/views/virtualKeysTable.tsx
+index 7de9e77a4..3a03a39f4 100644
+--- a/ui/app/workspace/virtual-keys/views/virtualKeysTable.tsx
++++ b/ui/app/workspace/virtual-keys/views/virtualKeysTable.tsx
+@@ -616,7 +616,7 @@ export default function VirtualKeysTable({
+ 						{hasActiveFilters && (
+ 							<p className="text-muted-foreground text-xs">
+ 								Filters applied:{" "}
+-								{[debouncedSearch && `search "${debouncedSearch}"`, customerFilter && "customer filter", teamFilter && "team filter"]
++								{[debouncedSearch && `search "${debouncedSearch}"`, customerFilter && "namespace filter", teamFilter && "team filter"]
+ 									.filter(Boolean)
+ 									.join(", ")}
+ 							</p>
+@@ -718,7 +718,7 @@ export default function VirtualKeysTable({
+ 						options={customers.map((c) => ({ label: c.name, value: c.id }))}
+ 						value={customerFilter || null}
+ 						onValueChange={(val) => onCustomerFilterChange(val ?? "")}
+-						placeholder="All Customers"
++						placeholder="All Namespaces"
+ 						className="h-9 w-[180px]"
+ 					/>
+ 					{customerFilter && teamFilter && <span className="text-muted-foreground text-xs font-medium">or</span>}
+diff --git a/ui/components/sidebar.tsx b/ui/components/sidebar.tsx
+index 5d8049c5c..733dababc 100644
+--- a/ui/components/sidebar.tsx
++++ b/ui/components/sidebar.tsx
+@@ -856,7 +856,7 @@ export default function AppSidebar() {
+         title: "Governance",
+         url: "/workspace/governance",
+         icon: Landmark,
+-        description: "Virtual keys, users, teams, customers & roles",
++        description: "Virtual keys, users, teams, namespaces & roles",
+         hasAccess: hasAnyGovernanceAccess,
+         subItems: [
+           {
+@@ -888,10 +888,10 @@ export default function AppSidebar() {
+             hasAccess: hasBusinessUnitsAccess,
+           },
+           {
+-            title: "Customers",
++            title: "Namespaces",
+             url: "/workspace/governance/customers",
+             icon: WalletCards,
+-            description: "Manage customers",
++            description: "Manage namespaces",
+             hasAccess: hasCustomersAccess,
+           },
+           {
+diff --git a/ui/lib/utils/routingRules.ts b/ui/lib/utils/routingRules.ts
+index 56c5f9129..669459f84 100644
+--- a/ui/lib/utils/routingRules.ts
++++ b/ui/lib/utils/routingRules.ts
+@@ -91,7 +91,7 @@ export function getScopeLabel(scope: string): string {
+ 	const labels: Record<string, string> = {
+ 		global: "Global",
+ 		team: "Team",
+-		customer: "Customer",
++		customer: "Namespace",
+ 		virtual_key: "Virtual Key",
+ 	};
+ 	return labels[scope] || scope;
+-- 
+2.51.0
+
