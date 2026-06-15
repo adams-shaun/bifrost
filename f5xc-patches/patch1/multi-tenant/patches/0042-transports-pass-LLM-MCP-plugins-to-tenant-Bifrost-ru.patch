@@ -1,0 +1,59 @@
+From dc385f5c7fb8199d0561b603a1e11abb0bbb6d1a Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 10:34:00 -0600
+Subject: [PATCH 2/3] transports: pass LLM + MCP plugins to tenant Bifrost
+ runtime
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The tenant loader produced a BifrostConfig with only Account + MCPConfig,
+so per-tenant Bifrost runtimes ran with no plugins at all:
+
+  - logging plugin not attached → /v1 calls routed through a tenant
+    runtime never wrote a row to logs (dashboard's tenant_id-filtered
+    view stayed empty even with Stage 4 stamping wired)
+  - governance plugin not attached → budget / rate-limit enforcement
+    silently skipped for tenant traffic
+  - telemetry plugin not attached → no metrics for tenant traffic
+
+LLM + MCP plugin slots are stateless wrappers over shared logstore /
+config; the same instances are safe to share with the root Bifrost
+client.  Pass them (plus the shared logger) through the tenant loader
+so every tenant runtime exercises the same plugin chain the root
+runtime does.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ transports/bifrost-http/server/server.go | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index ee5f2bb80..74931839b 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1216,9 +1216,19 @@ func (s *BifrostHTTPServer) ensureMultiTenantInitialized(ctx context.Context) er
+ 		if err != nil {
+ 			return schemas.BifrostConfig{}, fmt.Errorf("load MCP config for tenant %q: %w", tid, err)
+ 		}
++		// Plugins (logging, governance, telemetry, etc.) are shared with
++		// the root Bifrost instance — they're stateless wrappers around
++		// the shared logstore / config and need to run on every request
++		// regardless of which Bifrost.Client handles it.  Without this,
++		// tenant-routed /v1 calls bypass logging entirely (dashboard
++		// shows zero rows even with tenant_id stamping wired up) and
++		// budget / rate-limit enforcement is silently skipped.
+ 		return schemas.BifrostConfig{
+-			Account:   lib.NewTenantScopedAccount(providers),
+-			MCPConfig: mcpConfig,
++			Account:    lib.NewTenantScopedAccount(providers),
++			MCPConfig:  mcpConfig,
++			LLMPlugins: s.Config.GetLoadedLLMPlugins(),
++			MCPPlugins: s.Config.GetLoadedMCPPlugins(),
++			Logger:     logger,
+ 		}, nil
+ 	}
+ 
+-- 
+2.51.0
+

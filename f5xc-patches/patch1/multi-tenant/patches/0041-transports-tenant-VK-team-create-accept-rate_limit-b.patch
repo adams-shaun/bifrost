@@ -1,0 +1,621 @@
+From 96401c6a24d1aadf7e80a11cd6d0a60e2cec05cc Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 10:28:37 -0600
+Subject: [PATCH 1/3] transports: tenant VK + team create accept rate_limit /
+ budgets / provider_configs
+
+The v1 tenant CRUD bodies (CreateTenantVirtualKeyRequest +
+CreateTenantTeamRequest) were name-and-description only.  Anything
+else in the payload silently dropped, so the resulting VKs had
+empty provider_configs and bifrost's catalog auto-resolve sent every
+/v1 call to whichever global provider claimed the model.  That bypass
+left logs unstamped (no tenant_id on the request ctx) and the
+dashboard's tenant_id-filtered logs view empty.
+
+Extend the bodies to the legacy create shape:
+
+  VK:
+    rate_limit       *CreateRateLimitRequest
+    budgets          []CreateBudgetRequest
+    provider_configs []{provider, weight?, allowed_models}
+
+  Team:
+    rate_limit       *CreateRateLimitRequest
+    budgets          []CreateBudgetRequest
+    calendar_aligned bool
+
+provider_configs entries are validated against the tenant's provider
+set (via configStore.GetProvidersConfigByTenant); unknown providers
+get a 400 instead of silently breaking routing later.  Owned
+rate_limit / budgets get pinned to tenant_id through the existing
+ForTenant configstore methods, so cross-tenant lookups stay scoped.
+
+Backward compat: when none of the new fields are present, both
+handlers take the original direct-create path (no transaction) so
+existing stub-store happy-path tests keep passing.  Rich-path tests
+exercise the new code via a stubbed ExecuteTransaction + per-row
+recorders.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../bifrost-http/handlers/tenant_teams.go     | 107 ++++++++-
+ .../handlers/tenant_virtualkeys.go            | 210 +++++++++++++++++-
+ .../handlers/tenant_virtualkeys_test.go       | 138 ++++++++++++
+ 3 files changed, 436 insertions(+), 19 deletions(-)
+
+diff --git a/transports/bifrost-http/handlers/tenant_teams.go b/transports/bifrost-http/handlers/tenant_teams.go
+index 6202bcd1b..c65209d17 100644
+--- a/transports/bifrost-http/handlers/tenant_teams.go
++++ b/transports/bifrost-http/handlers/tenant_teams.go
+@@ -10,6 +10,8 @@ package handlers
+ import (
+ 	"errors"
+ 	"fmt"
++	"strings"
++	"time"
+ 
+ 	"github.com/bytedance/sonic"
+ 	"github.com/fasthttp/router"
+@@ -19,6 +21,7 @@ import (
+ 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ 	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
+ )
+ 
+ // TenantTeamsHandler exposes tenant-scoped team CRUD.
+@@ -48,10 +51,16 @@ func (h *TenantTeamsHandler) RegisterRoutes(r *router.Router, middlewares ...sch
+ }
+ 
+ // CreateTenantTeamRequest is the POST body. id is optional (UUID minted).
++// RateLimit + Budgets mirror the legacy CreateTeamRequest so a team can
++// own enforcement state at create time (otherwise the only way to add
++// limits was via the rich legacy route, which is single-tenant scoped).
+ type CreateTenantTeamRequest struct {
+-	ID         string  `json:"id,omitempty"`
+-	Name       string  `json:"name"`
+-	CustomerID *string `json:"customer_id,omitempty"`
++	ID              string                  `json:"id,omitempty"`
++	Name            string                  `json:"name"`
++	CustomerID      *string                 `json:"customer_id,omitempty"`
++	CalendarAligned bool                    `json:"calendar_aligned,omitempty"`
++	RateLimit       *CreateRateLimitRequest `json:"rate_limit,omitempty"`
++	Budgets         []CreateBudgetRequest   `json:"budgets,omitempty"`
+ }
+ 
+ // UpdateTenantTeamRequest is the PUT body. Pointer fields are optional.
+@@ -103,16 +112,100 @@ func (h *TenantTeamsHandler) createTeam(ctx *fasthttp.RequestCtx) {
+ 	if req.ID == "" {
+ 		req.ID = uuid.NewString()
+ 	}
++
++	// Budget validation up-front so an invalid duration doesn't half-create
++	// the team row inside a transaction we then have to roll back.
++	if len(req.Budgets) > 0 {
++		seen := make(map[string]bool, len(req.Budgets))
++		for _, b := range req.Budgets {
++			if b.MaxLimit < 0 {
++				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Budget max_limit cannot be negative: %.2f", b.MaxLimit))
++				return
++			}
++			if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
++				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid reset duration format: %s", b.ResetDuration))
++				return
++			}
++			if seen[b.ResetDuration] {
++				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Duplicate reset_duration in budgets: %s", b.ResetDuration))
++				return
++			}
++			seen[b.ResetDuration] = true
++		}
++	}
++
+ 	team := &configstoreTables.TableTeam{
+-		ID:         req.ID,
+-		Name:       req.Name,
+-		CustomerID: req.CustomerID,
++		ID:              req.ID,
++		Name:            req.Name,
++		CustomerID:      req.CustomerID,
++		CalendarAligned: req.CalendarAligned,
++	}
++
++	// Minimal POST (no rate_limit / budgets) keeps the direct
++	// CreateTeamForTenant path so existing stub-store tests keep working.
++	if req.RateLimit == nil && len(req.Budgets) == 0 {
++		if err := h.configStore.CreateTeamForTenant(ctx, string(tid), team); err != nil {
++			if errors.Is(err, configstore.ErrAlreadyExists) {
++				SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Team %s already exists for tenant %s", req.Name, tid))
++				return
++			}
++			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create team: %v", err))
++			return
++		}
++		SendJSONWithStatus(ctx, map[string]any{
++			"message": "Team created successfully",
++			"team":    team,
++		}, fasthttp.StatusCreated)
++		return
+ 	}
+-	if err := h.configStore.CreateTeamForTenant(ctx, string(tid), team); err != nil {
++
++	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
++		// Team-level rate limit
++		if req.RateLimit != nil {
++			rl := &configstoreTables.TableRateLimit{
++				ID:                   uuid.NewString(),
++				TokenMaxLimit:        req.RateLimit.TokenMaxLimit,
++				TokenResetDuration:   req.RateLimit.TokenResetDuration,
++				RequestMaxLimit:      req.RateLimit.RequestMaxLimit,
++				RequestResetDuration: req.RateLimit.RequestResetDuration,
++				TokenLastReset:       time.Now(),
++				RequestLastReset:     time.Now(),
++			}
++			if err := h.configStore.CreateRateLimitForTenant(ctx, string(tid), rl, tx); err != nil {
++				return err
++			}
++			team.RateLimitID = &rl.ID
++		}
++		if err := h.configStore.CreateTeamForTenant(ctx, string(tid), team, tx); err != nil {
++			return err
++		}
++		// Team-level multi-budget
++		for _, b := range req.Budgets {
++			budget := &configstoreTables.TableBudget{
++				ID:            uuid.NewString(),
++				MaxLimit:      b.MaxLimit,
++				ResetDuration: b.ResetDuration,
++				LastReset:     budgetLastReset(team.CalendarAligned, b.ResetDuration),
++				CurrentUsage:  0,
++				TeamID:        &team.ID,
++			}
++			if err := h.configStore.CreateBudgetForTenant(ctx, string(tid), budget, tx); err != nil {
++				return err
++			}
++		}
++		return nil
++	}); err != nil {
+ 		if errors.Is(err, configstore.ErrAlreadyExists) {
+ 			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Team %s already exists for tenant %s", req.Name, tid))
+ 			return
+ 		}
++		// Budget / rate-limit input errors bubble up as plain Go errors —
++		// surface them as 400 instead of 500 so the UI can show them.
++		msg := err.Error()
++		if strings.Contains(msg, "rate limit") || strings.Contains(msg, "budget") {
++			SendError(ctx, fasthttp.StatusBadRequest, msg)
++			return
++		}
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create team: %v", err))
+ 		return
+ 	}
+diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys.go b/transports/bifrost-http/handlers/tenant_virtualkeys.go
+index 51dc61e28..f04dab1be 100644
+--- a/transports/bifrost-http/handlers/tenant_virtualkeys.go
++++ b/transports/bifrost-http/handlers/tenant_virtualkeys.go
+@@ -16,6 +16,8 @@ package handlers
+ import (
+ 	"errors"
+ 	"fmt"
++	"strings"
++	"time"
+ 
+ 	"github.com/bytedance/sonic"
+ 	"github.com/fasthttp/router"
+@@ -23,9 +25,11 @@ import (
+ 	"github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/framework/configstore"
+ 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
+ 	"github.com/maximhq/bifrost/plugins/governance"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ 	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
+ )
+ 
+ // VKCacheInvalidator is the narrow contract the VK admin handlers need
+@@ -87,10 +91,24 @@ type UpdateTenantVirtualKeyRequest struct {
+ 	IsActive    *bool   `json:"is_active,omitempty"`
+ }
+ 
+-// CreateTenantVirtualKeyRequest is the minimum-viable payload. The
+-// legacy CreateVirtualKeyRequest under /api/governance/virtual-keys
+-// supports many more fields; this v1 form keeps the surface tight so
+-// E2E can drive it with a one-line POST.
++// TenantVKProviderConfigRequest mirrors the per-provider config block
++// from the legacy CreateVirtualKeyRequest, narrowed to the fields the
++// tenant CRUD needs (provider name, weight, allowed_models). Provider
++// config rate_limit / budgets / key_ids are not exposed here — they
++// can be added when a use case requires it.
++type TenantVKProviderConfigRequest struct {
++	Provider      string            `json:"provider"`
++	Weight        *float64          `json:"weight,omitempty"`
++	AllowedModels schemas.WhiteList `json:"allowed_models,omitempty"`
++}
++
++// CreateTenantVirtualKeyRequest accepts the subset of the legacy
++// CreateVirtualKeyRequest that the tenant golden-flow exercises: a
++// top-level rate_limit + multi-budget set, and provider_configs that
++// constrain which providers + models the VK can hit. MCP configs,
++// access_profile_id, and team/customer linkage stay on the legacy
++// single-tenant route; the same configstore methods power both so
++// expanding here later is a struct change rather than handler logic.
+ type CreateTenantVirtualKeyRequest struct {
+ 	Name string `json:"name"`
+ 	// Value is optional. When empty, the server mints a fresh
+@@ -100,6 +118,12 @@ type CreateTenantVirtualKeyRequest struct {
+ 	Value string `json:"value,omitempty"`
+ 	// Description is informational; safe to leave empty.
+ 	Description string `json:"description,omitempty"`
++	// IsActive defaults to true when omitted.
++	IsActive        *bool                           `json:"is_active,omitempty"`
++	CalendarAligned bool                            `json:"calendar_aligned,omitempty"`
++	RateLimit       *CreateRateLimitRequest         `json:"rate_limit,omitempty"`
++	Budgets         []CreateBudgetRequest           `json:"budgets,omitempty"`
++	ProviderConfigs []TenantVKProviderConfigRequest `json:"provider_configs,omitempty"`
+ }
+ 
+ // CreateTenantVirtualKeyResponse is what we return on success — the
+@@ -129,26 +153,160 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
++	// Top-level budget validation: same shape as legacy createVirtualKey
++	// — must have unique reset_duration values across the multi-budget set.
++	if len(req.Budgets) > 0 {
++		seen := make(map[string]bool, len(req.Budgets))
++		for _, b := range req.Budgets {
++			if b.MaxLimit < 0 {
++				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Budget max_limit cannot be negative: %.2f", b.MaxLimit))
++				return
++			}
++			if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
++				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid reset duration format: %s", b.ResetDuration))
++				return
++			}
++			if seen[b.ResetDuration] {
++				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Duplicate reset_duration in budgets: %s", b.ResetDuration))
++				return
++			}
++			seen[b.ResetDuration] = true
++		}
++	}
++
++	// Provider validation: every provider in provider_configs must
++	// already be configured for this tenant. Empty provider_configs
++	// means "no providers allowed" (deny-by-default) — the legacy
++	// handler's semantics — but for the tenant route we currently
++	// have no MCP/team linkage so an empty list is the only signal.
++	var tenantProviderSet map[schemas.ModelProvider]struct{}
++	if len(req.ProviderConfigs) > 0 {
++		var err error
++		tenantProviderSet, err = h.getTenantProviderSet(ctx, string(tid))
++		if err != nil {
++			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load tenant providers: %v", err))
++			return
++		}
++	}
++
+ 	value := req.Value
+ 	if value == "" {
+ 		value = governance.GenerateVirtualKey()
+ 	}
+-
+ 	isActive := true
++	if req.IsActive != nil {
++		isActive = *req.IsActive
++	}
++
+ 	vk := &configstoreTables.TableVirtualKey{
+-		ID:          uuid.NewString(),
+-		TenantID:    string(tid),
+-		Name:        req.Name,
+-		Value:       value,
+-		Description: req.Description,
+-		IsActive:    &isActive,
++		ID:              uuid.NewString(),
++		TenantID:        string(tid),
++		Name:            req.Name,
++		Value:           value,
++		Description:     req.Description,
++		IsActive:        &isActive,
++		CalendarAligned: req.CalendarAligned,
+ 	}
+ 
+-	if err := h.configStore.CreateVirtualKey(ctx, vk); err != nil {
++	// Minimal POST (no rate_limit / budgets / provider_configs) takes the
++	// direct CreateVirtualKey path so existing happy-path tests (with
++	// stub stores that don't implement ExecuteTransaction) keep working.
++	if req.RateLimit == nil && len(req.Budgets) == 0 && len(req.ProviderConfigs) == 0 {
++		if err := h.configStore.CreateVirtualKey(ctx, vk); err != nil {
++			if errors.Is(err, configstore.ErrAlreadyExists) {
++				SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Virtual key %s already exists for tenant %s", req.Name, tid))
++				return
++			}
++			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create virtual key: %v", err))
++			return
++		}
++		h.postCreateInvalidate(tid, vk.Value)
++		SendJSONWithStatus(ctx, map[string]any{
++			"message":     "Virtual key created successfully",
++			"virtual_key": vk,
++		}, fasthttp.StatusCreated)
++		return
++	}
++
++	// Rich POST: VK + owned rate_limit / budgets / provider_configs run
++	// inside a single transaction so a half-built VK can't leak when a
++	// later step fails.
++	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
++		// VK-level rate limit
++		if req.RateLimit != nil {
++			rl := &configstoreTables.TableRateLimit{
++				ID:                   uuid.NewString(),
++				TokenMaxLimit:        req.RateLimit.TokenMaxLimit,
++				TokenResetDuration:   req.RateLimit.TokenResetDuration,
++				RequestMaxLimit:      req.RateLimit.RequestMaxLimit,
++				RequestResetDuration: req.RateLimit.RequestResetDuration,
++				TokenLastReset:       time.Now(),
++				RequestLastReset:     time.Now(),
++			}
++			if err := h.configStore.CreateRateLimitForTenant(ctx, string(tid), rl, tx); err != nil {
++				return err
++			}
++			vk.RateLimitID = &rl.ID
++		}
++
++		if err := h.configStore.CreateVirtualKey(ctx, vk, tx); err != nil {
++			return err
++		}
++
++		// VK-level multi-budget
++		for _, b := range req.Budgets {
++			budget := &configstoreTables.TableBudget{
++				ID:            uuid.NewString(),
++				MaxLimit:      b.MaxLimit,
++				ResetDuration: b.ResetDuration,
++				LastReset:     budgetLastReset(vk.CalendarAligned, b.ResetDuration),
++				CurrentUsage:  0,
++				VirtualKeyID:  &vk.ID,
++			}
++			if err := h.configStore.CreateBudgetForTenant(ctx, string(tid), budget, tx); err != nil {
++				return err
++			}
++		}
++
++		// Provider configs: pin which providers + models this VK may use.
++		for _, pc := range req.ProviderConfigs {
++			providerName := schemas.ModelProvider(strings.TrimSpace(pc.Provider))
++			if providerName == "" {
++				return fmt.Errorf("provider name is required in provider_configs entry")
++			}
++			if _, configured := tenantProviderSet[providerName]; !configured {
++				return fmt.Errorf("provider %s is not configured for tenant %s", pc.Provider, tid)
++			}
++			if err := pc.AllowedModels.Validate(); err != nil {
++				return fmt.Errorf("invalid allowed_models for provider %s: %w", pc.Provider, err)
++			}
++			pcRow := &configstoreTables.TableVirtualKeyProviderConfig{
++				VirtualKeyID:  vk.ID,
++				Provider:      string(providerName),
++				Weight:        pc.Weight,
++				AllowedModels: pc.AllowedModels,
++				// Tenant route doesn't expose key_ids — default to "allow all
++				// keys for the provider" so requests through this VK can use
++				// whatever keys the tenant has configured for the provider.
++				AllowAllKeys: true,
++			}
++			if err := h.configStore.CreateVirtualKeyProviderConfig(ctx, pcRow, tx); err != nil {
++				return err
++			}
++		}
++		return nil
++	}); err != nil {
+ 		if errors.Is(err, configstore.ErrAlreadyExists) {
+ 			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Virtual key %s already exists for tenant %s", req.Name, tid))
+ 			return
+ 		}
++		// Provider-validation and budget-validation errors are user input
++		// errors — surface as 400 instead of 500.
++		msg := err.Error()
++		if strings.Contains(msg, "is not configured for tenant") || strings.Contains(msg, "invalid allowed_models") || strings.Contains(msg, "provider name is required") {
++			SendError(ctx, fasthttp.StatusBadRequest, msg)
++			return
++		}
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create virtual key: %v", err))
+ 		return
+ 	}
+@@ -182,6 +340,34 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
+ 	}, fasthttp.StatusCreated)
+ }
+ 
++// postCreateInvalidate centralises the runtime evictor + resolver-
++// cache invalidator calls that both the minimal and rich VK create
++// paths need to make.
++func (h *TenantVirtualKeyHandler) postCreateInvalidate(tenantID multitenant.TenantID, vkValue string) {
++	if h.evictor != nil {
++		h.evictor.Evict(tenantID)
++	}
++	if h.vkInvalidator != nil {
++		h.vkInvalidator.Invalidate(vkValue)
++	}
++}
++
++// getTenantProviderSet returns the set of providers configured for a
++// tenant, used to validate VK provider_configs entries. Mirrors the
++// global getConfiguredProviderSet helper in governance.go but scopes
++// the lookup to a single tenant.
++func (h *TenantVirtualKeyHandler) getTenantProviderSet(ctx *fasthttp.RequestCtx, tenantID string) (map[schemas.ModelProvider]struct{}, error) {
++	cfgs, err := h.configStore.GetProvidersConfigByTenant(ctx, tenantID)
++	if err != nil {
++		return nil, err
++	}
++	set := make(map[schemas.ModelProvider]struct{}, len(cfgs))
++	for p := range cfgs {
++		set[p] = struct{}{}
++	}
++	return set, nil
++}
++
+ // listVirtualKeys — GET /api/tenants/{tenant_id}/governance/virtual-keys
+ func (h *TenantVirtualKeyHandler) listVirtualKeys(ctx *fasthttp.RequestCtx) {
+ 	tid, ok := tenantIDFromCtx(ctx)
+diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+index ec92eb613..3847e1072 100644
+--- a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
++++ b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/framework/configstore"
+ 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
+ 	"github.com/maximhq/bifrost/multitenant"
+@@ -171,6 +172,143 @@ func TestTenantVirtualKeyHandler_NewWithNilStore(t *testing.T) {
+ 	}
+ }
+ 
++// richVKStore augments stubVKStore with the ConfigStore surface the
++// rate_limit / budgets / provider_configs path exercises. Each method
++// records the row it was given so the test can assert on persisted
++// shape.
++type richVKStore struct {
++	stubVKStore
++	providers       map[schemas.ModelProvider]configstore.ProviderConfig
++	rateLimits      []*configstoreTables.TableRateLimit
++	budgets         []*configstoreTables.TableBudget
++	providerConfigs []*configstoreTables.TableVirtualKeyProviderConfig
++}
++
++func (s *richVKStore) GetProvidersConfigByTenant(_ context.Context, _ string) (map[schemas.ModelProvider]configstore.ProviderConfig, error) {
++	return s.providers, nil
++}
++
++func (s *richVKStore) ExecuteTransaction(_ context.Context, fn func(*gorm.DB) error) error {
++	return fn(nil)
++}
++
++func (s *richVKStore) CreateRateLimitForTenant(_ context.Context, _ string, rl *configstoreTables.TableRateLimit, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	cp := *rl
++	s.rateLimits = append(s.rateLimits, &cp)
++	return nil
++}
++
++func (s *richVKStore) CreateBudgetForTenant(_ context.Context, _ string, b *configstoreTables.TableBudget, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	cp := *b
++	s.budgets = append(s.budgets, &cp)
++	return nil
++}
++
++func (s *richVKStore) CreateVirtualKeyProviderConfig(_ context.Context, pc *configstoreTables.TableVirtualKeyProviderConfig, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	cp := *pc
++	s.providerConfigs = append(s.providerConfigs, &cp)
++	return nil
++}
++
++func TestTenantVirtualKeyHandler_Create_WithRateLimitBudgetAndProviderConfig(t *testing.T) {
++	store := &richVKStore{
++		providers: map[schemas.ModelProvider]configstore.ProviderConfig{
++			schemas.ModelProvider("qwen"): {},
++		},
++	}
++	h, err := NewTenantVirtualKeyHandler(store, nil, nil)
++	if err != nil {
++		t.Fatalf("NewTenantVirtualKeyHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{
++		"name": "rich-vk",
++		"rate_limit": map[string]any{
++			"token_max_limit":      1500,
++			"token_reset_duration": "1m",
++		},
++		"budgets": []map[string]any{
++			{"max_limit": 0.05, "reset_duration": "1h"},
++		},
++		"provider_configs": []map[string]any{
++			{"provider": "qwen", "allowed_models": []string{"qwen3.6-coder"}},
++		},
++	})
++	ctx := newTenantVKCtx(t, string(body), "acme")
++
++	h.createVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusCreated {
++		t.Fatalf("status got %d want 201 (body=%s)", got, string(ctx.Response.Body()))
++	}
++	if len(store.created) != 1 {
++		t.Fatalf("VK creates got %d want 1", len(store.created))
++	}
++	vk := store.created[0]
++	if vk.RateLimitID == nil {
++		t.Fatal("rate_limit id should be linked to VK")
++	}
++	if len(store.rateLimits) != 1 {
++		t.Fatalf("rate_limit creates got %d want 1", len(store.rateLimits))
++	}
++	rl := store.rateLimits[0]
++	if rl.TokenMaxLimit == nil || *rl.TokenMaxLimit != 1500 {
++		t.Fatalf("rate_limit token_max_limit got %v want 1500", rl.TokenMaxLimit)
++	}
++	if len(store.budgets) != 1 {
++		t.Fatalf("budget creates got %d want 1", len(store.budgets))
++	}
++	b := store.budgets[0]
++	if b.MaxLimit != 0.05 || b.ResetDuration != "1h" {
++		t.Fatalf("budget got max=%.3f reset=%s want max=0.05 reset=1h", b.MaxLimit, b.ResetDuration)
++	}
++	if b.VirtualKeyID == nil || *b.VirtualKeyID != vk.ID {
++		t.Fatalf("budget should be linked to VK %s; got %v", vk.ID, b.VirtualKeyID)
++	}
++	if len(store.providerConfigs) != 1 {
++		t.Fatalf("provider_config creates got %d want 1", len(store.providerConfigs))
++	}
++	pc := store.providerConfigs[0]
++	if pc.Provider != "qwen" {
++		t.Fatalf("provider_config provider got %q want qwen", pc.Provider)
++	}
++	if pc.VirtualKeyID != vk.ID {
++		t.Fatalf("provider_config virtual_key_id mismatch; got %q want %q", pc.VirtualKeyID, vk.ID)
++	}
++	if !pc.AllowAllKeys {
++		t.Fatal("tenant route should default AllowAllKeys=true on provider_config")
++	}
++}
++
++func TestTenantVirtualKeyHandler_Create_ProviderConfig_UnconfiguredProvider_Returns400(t *testing.T) {
++	store := &richVKStore{
++		providers: map[schemas.ModelProvider]configstore.ProviderConfig{
++			schemas.ModelProvider("openai"): {},
++		},
++	}
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++
++	body, _ := sonic.Marshal(map[string]any{
++		"name": "rich-vk-bad-provider",
++		"provider_configs": []map[string]any{
++			{"provider": "never-registered", "allowed_models": []string{"*"}},
++		},
++	})
++	ctx := newTenantVKCtx(t, string(body), "acme")
++
++	h.createVirtualKey(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("status got %d want 400 (body=%s)", got, string(ctx.Response.Body()))
++	}
++}
++
+ // stubVKStore extensions to back GET single + PUT tests.
+ 
+ func (s *stubVKStore) GetVirtualKeyByIDForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableVirtualKey, error) {
+-- 
+2.51.0
+
