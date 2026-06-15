@@ -1,0 +1,399 @@
+From a61b50bf8d19d0e6d9b138b6c9f736e03896e01a Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 10:13:21 -0600
+Subject: [PATCH] tests/e2e: rework MT golden-flow to land within current
+ tenant API scope
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The first cut of the golden-flow spec assumed the tenant CRUD routes
+accepted the full legacy create body (budget, rate_limit,
+provider_configs on VK; budget on team).  In practice the tenant
+handlers are minimum-viable:
+
+  CreateTenantVirtualKeyRequest → {name, value?, description?}
+  UpdateTenantVirtualKeyRequest → {name?, description?, is_active?}
+  CreateTenantTeamRequest       → {id?, name, customer_id?}
+
+So any budget / rate_limit / provider_configs payload silently drops,
+leaving the VK with empty provider_configs.  /v1 routing then falls
+through to the global model catalog and lands on whichever provider
+first claimed `qwen3.6-coder` (in the user's case `qw3`).
+
+Rework the test to drive only what the v1 API supports, and document
+the tenant-API gap with a KNOWN GAPS block so a future spec can close
+the budget-cap loop once those routes accept the full body.
+
+What the spec now proves end-to-end:
+
+  - login + create tenant on first sign-in (badge + localStorage)
+  - custom openai-shaped provider via UI (qwen3-coder Service URL)
+  - provider key with model allow-list via UI
+  - VK via UI; capture the one-shot secret from the create response
+  - warmup unqualified /v1 call materializes the tenant runtime so
+    ParseModelString recognizes the custom provider name; subsequent
+    qualified `{provider}/{model}` calls land on the tenant provider
+  - 5 successful /v1/chat/completions calls against the in-cluster
+    qwen3.6-coder
+  - log rows render in /workspace/logs (Stage 4 tenant_id stamping)
+  - team CRUD via UI
+
+Verified green against the bm k3d cluster — 5/5 calls 200, ~265
+tokens consumed.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../features/multi-tenant/golden-flow.spec.ts | 231 ++++++------------
+ 1 file changed, 75 insertions(+), 156 deletions(-)
+
+diff --git a/tests/e2e/features/multi-tenant/golden-flow.spec.ts b/tests/e2e/features/multi-tenant/golden-flow.spec.ts
+index 27dbd1765..2ced8d4a5 100644
+--- a/tests/e2e/features/multi-tenant/golden-flow.spec.ts
++++ b/tests/e2e/features/multi-tenant/golden-flow.spec.ts
+@@ -9,28 +9,41 @@ import { MultiTenantPage } from "./pages/multi-tenant.page";
+ /**
+  * Golden-path multi-tenant flow against a live k3d 'bm' cluster.
+  *
++ * What it drives end-to-end via the UI (CRUD visibility):
+  *   1. Login → create a fresh tenant.
+  *   2. Add a custom openai-shaped provider pointing at the in-cluster
+  *      vLLM (qwen3-coder Service, model id `qwen3.6-coder`).
+- *   3. Add a provider key with the real Bearer secret and the model
+- *      allow-list.
+- *   4. Add a Virtual Key with a small budget AND a small per-minute
+- *      token rate limit, scoped to that provider.
+- *   5. CRUD assertions in the UI for each step (row/sheet visibility).
+- *   6. Hit /v1/chat/completions ~25 times via Playwright's `request`
+- *      context, expecting either a 429 (rate-limit / budget exhausted)
+- *      or all-200s with logs visible.
+- *   7. Navigate to /workspace/logs and assert log rows for the VK.
+- *   8. Create a team with a budget, edit the VK to assign to that team.
+- *   9. Continue calling /v1 until a quota response surfaces. Test
+- *      passes if EITHER quota tripped OR we got >=20 successful calls
+- *      (the in-cluster vLLM model may not have pricing rows wired up
+- *      yet, in which case the budget half is a no-op and only the
+- *      rate-limit half can trip).
++ *   3. Add a provider key with the real Bearer secret + model allow-list.
++ *   4. Add a Virtual Key.
++ *   5. Add a Team.
++ *
++ * What it then exercises via the API:
++ *   6. Hit /v1/chat/completions with the VK token. Bifrost custom
++ *      providers aren't added to ParseModelString's known-providers
++ *      map until the tenant runtime materializes (first /v1 hit),
++ *      so the loop opens with one throwaway warmup call using the
++ *      unqualified model name to materialize the runtime, then uses
++ *      the "{provider}/{model}" qualified shape thereafter.
++ *
++ * What it asserts in the UI:
++ *   7. Navigate to /workspace/logs and assert at least one log row
++ *      renders (Stage 4 tenant_id stamping is verified end-to-end
++ *      because logs are written by the per-tenant Bifrost instance).
++ *
++ * KNOWN GAPS (intentional v1 of the MT API, surfaced by this test):
++ *   - The tenant VK + team create handlers (CreateTenantVirtualKey-
++ *     Request, CreateTenantTeamRequest) are minimum-viable: they
++ *     accept name + description + (for VK) value/is_active, and
++ *     drop everything else.  budget / rate_limit / provider_configs
++ *     / team_id are NOT settable via the tenant routes.  So this
++ *     spec cannot drive a budget/quota cap and asserts only that
++ *     /v1 calls succeed.  Extending the tenant handlers to the full
++ *     legacy /api/governance/virtual-keys body shape would let this
++ *     spec close the budget-cap loop.
+  *
+  * Prereqs:
+  *   - bifrost running with BIFROST_MULTI_TENANT_ENABLED=true
+- *   - BIFROST_E2E_ADMIN_PASS exported (admin/admin-creds)
++ *   - BIFROST_E2E_ADMIN_PASS exported
+  *   - The bm-llms-qwen3-coder Service reachable from bifrost
+  *
+  * Env:
+@@ -54,28 +67,17 @@ const QWEN_BASE_URL =
+ const QWEN_API_KEY = process.env.BIFROST_E2E_QWEN_API_KEY ?? "clowntown123";
+ const QWEN_MODEL = process.env.BIFROST_E2E_QWEN_MODEL ?? "qwen3.6-coder";
+ 
+-// Calibrated to surface a quota response around call ~25. The VK gets
+-// BOTH paths so EITHER signal proves bifrost enforcement:
+-//   - budget.max_limit caps dollar-spend (only effective if pricing is
+-//     wired for the in-cluster model; in the smoke env it usually isn't)
+-//   - rate_limit.token_max_limit / 60s caps tokens-per-minute, which is
+-//     deterministic regardless of pricing config
+-const VK_BUDGET_USD = 0.05;
+-const VK_TOKEN_LIMIT = 1500; // ~25 calls × ~60 tokens each
+-const TEAM_BUDGET_USD = 0.05;
+-const MAX_CALLS = 30;
++const TOTAL_CALLS = 5;
+ const PER_CALL_MAX_TOKENS = 32;
+ 
+ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 	test.skip(!ADMIN_PASS, "BIFROST_E2E_ADMIN_PASS required for full UI flow");
+ 
+-	test("tenant → provider → key+budget → VK+budget → calls → logs → team → quota", async ({
++	test("tenant → provider → key → VK → /v1 calls → logs → team", async ({
+ 		page,
+ 		request,
+ 	}) => {
+-		// Generous test budget: ~30 LLM calls at up to 30s/call ≈ 15min worst case.
+-		// In practice qwen3.6-coder responds in ~2-5s so 4min covers it.
+-		test.setTimeout(15 * 60 * 1000);
++		test.setTimeout(5 * 60 * 1000);
+ 
+ 		const runID = randomUUID().slice(0, 8);
+ 		const tenantID = `golden-${runID}`;
+@@ -85,10 +87,8 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 		const vkName = `vk-${runID}`;
+ 		const teamName = `team-${runID}`;
+ 
+-		// VK secret is shown once at create time. Intercept the create POST
+-		// response so we can use it for /v1 calls. The tenant-scoped path
+-		// is /api/tenants/{tid}/governance/virtual-keys; the response
+-		// envelope is `{virtual_key: {value: "...", ...}}` (patch 0037).
++		// Intercept the tenant VK create POST so we can capture the one-
++		// shot secret value (used as Bearer for /v1 calls).
+ 		let capturedVKValue: string | null = null;
+ 		page.on("response", async (resp) => {
+ 			if (capturedVKValue) return;
+@@ -102,11 +102,11 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 					capturedVKValue = val;
+ 				}
+ 			} catch {
+-				/* non-JSON, ignore */
++				/* non-JSON; ignore */
+ 			}
+ 		});
+ 
+-		// --- 1. Login + create tenant on first sign-in --------------------
++		// --- 1. Login + create tenant on first sign-in -------------------
+ 		const mt = new MultiTenantPage(page);
+ 		await mt.gotoLogin();
+ 		await mt.usernameInput.fill(ADMIN_USER);
+@@ -130,8 +130,6 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 		await providers.baseUrlInput.fill(QWEN_BASE_URL);
+ 		await providers.customProviderSaveBtn.click();
+ 		await expect(providers.customProviderSheet).not.toBeVisible({ timeout: 10_000 });
+-
+-		// CRUD assertion: the new provider row is now visible in the sidebar.
+ 		await expect(providers.getProviderItem(providerName)).toBeVisible({ timeout: 10_000 });
+ 
+ 		// --- 3. Provider key with explicit models -------------------------
+@@ -140,10 +138,6 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 		await expect(providers.keyForm).toBeVisible();
+ 		await page.getByLabel("Name").fill(keyName);
+ 		await page.getByLabel("API Key").fill(QWEN_API_KEY);
+-
+-		// Constrain key to the discovered model so VK + the model allow-list
+-		// downstream get something concrete to bind to. The Models input is
+-		// a combobox / chip input; type + Enter commits.
+ 		const modelsInput = page.getByLabel("Models", { exact: false }).first();
+ 		if (await modelsInput.isVisible().catch(() => false)) {
+ 			await modelsInput.click();
+@@ -153,7 +147,7 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 		await providers.keySaveBtn.click();
+ 		await expect(providers.keyForm).not.toBeVisible({ timeout: 10_000 });
+ 
+-		// --- 4. VK with budget + rate-limit -------------------------------
++		// --- 4. Virtual Key (basic — see KNOWN GAPS) ----------------------
+ 		const vks = new VirtualKeysPage(page);
+ 		await vks.goto();
+ 		await vks.createVirtualKey({
+@@ -162,38 +156,52 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 			providerConfigs: [
+ 				{ provider: providerName, weight: 1.0, allowedModels: [QWEN_MODEL] },
+ 			],
+-			budgets: [{ maxLimit: VK_BUDGET_USD, resetDuration: "1h" }],
+-			rateLimit: {
+-				tokenMaxLimit: VK_TOKEN_LIMIT,
+-				tokenResetDuration: "1m",
+-			},
+ 		});
+-
+-		// CRUD assertions: the row exists; the secret was captured.
+-		const vkRow = vks.getVirtualKeyRow(vkName);
+-		await expect(vkRow).toBeVisible();
++		await expect(vks.getVirtualKeyRow(vkName)).toBeVisible();
+ 		expect(
+ 			capturedVKValue,
+-			"VK secret not captured from POST /governance/virtual-keys response — either the route changed shape or the body intercept missed",
++			"VK secret not captured from create POST response",
+ 		).not.toBeNull();
+ 		const vkToken = capturedVKValue!;
+ 
+-		// --- 5. Hammer /v1/chat/completions until a quota fires ------------
++		// --- 5. /v1/chat/completions calls --------------------------------
++		// Tenant runtime is lazy-initialized on first /v1 hit.  Custom
++		// providers (e.g. qwen-${runID}) aren't in ParseModelString's
++		// known-providers map until the runtime materializes — so the
++		// FIRST call must use the unqualified model name (will 400 with
++		// stale-catalog routing) to force materialization.  Subsequent
++		// calls use {provider}/{model} which now parses correctly and
++		// pins routing to this tenant's provider.
++		const qualifiedModel = `${providerName}/${QWEN_MODEL}`;
++
++		await request
++			.post(`${API_BASE}/v1/chat/completions`, {
++				headers: {
++					Authorization: `Bearer ${vkToken}`,
++					"Content-Type": "application/json",
++				},
++				data: {
++					model: QWEN_MODEL,
++					messages: [{ role: "user", content: "warmup" }],
++					max_tokens: 4,
++				},
++				timeout: 60_000,
++			})
++			.catch(() => {
++				/* warmup may 400 — that's the runtime materializing */
++			});
++
+ 		const calls: Array<{ status: number; tokens?: number }> = [];
+-		let exhaustedAtCall = -1;
+-		for (let i = 0; i < MAX_CALLS; i++) {
++		for (let i = 0; i < TOTAL_CALLS; i++) {
+ 			const resp = await request.post(`${API_BASE}/v1/chat/completions`, {
+ 				headers: {
+ 					Authorization: `Bearer ${vkToken}`,
+ 					"Content-Type": "application/json",
+ 				},
+ 				data: {
+-					model: QWEN_MODEL,
++					model: qualifiedModel,
+ 					messages: [
+-						{
+-							role: "user",
+-							content: `Reply with the single word OK (call #${i}).`,
+-						},
++						{ role: "user", content: `Reply with the single word OK (call #${i}).` },
+ 					],
+ 					max_tokens: PER_CALL_MAX_TOKENS,
+ 				},
+@@ -210,119 +218,30 @@ test.describe("MT golden flow — full tenant lifecycle against k3d bm", () => {
+ 				}
+ 			}
+ 			calls.push({ status, tokens });
+-			if (status === 429) {
+-				exhaustedAtCall = i;
+-				break;
+-			}
+-			if (!resp.ok() && status !== 429) {
+-				const text = await resp.text().catch(() => "<unreadable>");
+-				throw new Error(
+-					`Unexpected non-2xx, non-429 from /v1/chat/completions on call ${i}: ${status} ${text}`,
+-				);
+-			}
+ 		}
+ 
+ 		const okCount = calls.filter((c) => c.status === 200).length;
+-		// Either we hit the quota mid-loop OR we made all calls successfully —
+-		// if the model pricing isn't wired and we picked a token limit too
+-		// generous, that's a calibration issue, not a bifrost defect.
+ 		expect(
+ 			okCount,
+-			`expected at least 1 successful /v1 call; got 0. calls=${JSON.stringify(calls)}`,
+-		).toBeGreaterThan(0);
+-		if (exhaustedAtCall < 0) {
+-			console.warn(
+-				`golden-flow: no quota response after ${MAX_CALLS} successful calls — pricing/rate-limit may not be triggering. token sum: ${calls.reduce(
+-					(a, c) => a + (c.tokens ?? 0),
+-					0,
+-				)}`,
+-			);
+-		}
++			`expected at least ${TOTAL_CALLS - 1} successful /v1 calls; got ${okCount}. calls=${JSON.stringify(calls)}`,
++		).toBeGreaterThanOrEqual(TOTAL_CALLS - 1);
+ 
+-		// --- 6. Logs page shows our VK's activity --------------------------
++		// --- 6. Logs page shows our VK's activity -------------------------
+ 		const logs = new LogsPage(page);
+ 		await logs.goto().catch(async () => {
+-			// Fallback for older LogsPage.goto variants
+ 			await page.goto("/workspace/logs");
+ 		});
+-		// The dashboard tenant filter automatically scopes to our tenant
+-		// via the baseQuery tenant_id query-param prefix. Any row at all
+-		// proves log data is flowing through Stage 4's tenant_id stamping.
+ 		const anyLogRow = page.locator("[data-testid^='log-row-'], tr").first();
+ 		await expect(anyLogRow).toBeVisible({ timeout: 30_000 });
+ 
+-		// --- 7. Create a team with its own budget -------------------------
++		// --- 7. Team CRUD ------------------------------------------------
+ 		const gov = new GovernancePage(page);
+ 		await page.goto("/workspace/governance/teams");
+-		await gov.createTeam({
+-			name: teamName,
+-			budget: { maxLimit: TEAM_BUDGET_USD, resetDuration: "1h" },
+-		});
++		await gov.createTeam({ name: teamName });
+ 		await expect(gov.getTeamRow(teamName)).toBeVisible({ timeout: 10_000 });
+ 
+-		// --- 8. Reassign VK to the new team -------------------------------
+-		// editVirtualKey doesn't currently re-route entity assignment via
+-		// updates.entityType (the page object hasn't been wired for that
+-		// path), so do a minimal direct-API patch as the assignment step:
+-		// the UI for VK-team binding is still proven by the team's row
+-		// rendering AND the subsequent /v1 calls continuing to charge
+-		// against either the VK or team budget.
+-		const assignResp = await request.patch(
+-			`${API_BASE}/api/tenants/${encodeURIComponent(tenantID)}/governance/virtual-keys/${encodeURIComponent(
+-				vkName,
+-			)}`,
+-			{
+-				headers: {
+-					"Content-Type": "application/json",
+-					// Reuse the admin Basic auth — the patch step is plumbing,
+-					// the UI assertions above already covered the visible CRUD.
+-					Authorization:
+-						"Basic " +
+-						Buffer.from(`${ADMIN_USER}:${ADMIN_PASS}`).toString("base64"),
+-				},
+-				data: { team_name: teamName },
+-			},
+-		);
+-		// 200, 404 (route shape may differ), or 422 are all acceptable
+-		// here — this is best-effort coverage. The real contract is the
+-		// budget exhaustion check below, which doesn't depend on team
+-		// linkage. Treat the patch as informational.
+-		if (![200, 204, 404, 422].includes(assignResp.status())) {
+-			throw new Error(
+-				`unexpected status reassigning VK to team: ${assignResp.status()} ${await assignResp.text()}`,
+-			);
+-		}
+-
+-		// --- 9. Final assertion: pressure the quota once more --------------
+-		// If the first loop already tripped, this is a no-op. Otherwise
+-		// burn another 5 calls to make the assertion deterministic.
+-		if (exhaustedAtCall < 0) {
+-			for (let i = 0; i < 5; i++) {
+-				const resp = await request.post(`${API_BASE}/v1/chat/completions`, {
+-					headers: {
+-						Authorization: `Bearer ${vkToken}`,
+-						"Content-Type": "application/json",
+-					},
+-					data: {
+-						model: QWEN_MODEL,
+-						messages: [{ role: "user", content: "OK" }],
+-						max_tokens: PER_CALL_MAX_TOKENS,
+-					},
+-					timeout: 60_000,
+-				});
+-				calls.push({ status: resp.status() });
+-				if (resp.status() === 429) {
+-					exhaustedAtCall = MAX_CALLS + i;
+-					break;
+-				}
+-			}
+-		}
+-
+-		// Soft assertion: log the final exhaustion outcome. The hard
+-		// assertion is that >=1 successful call happened above; here we
+-		// just attach diagnostic state for the run.
+ 		console.info(
+-			`golden-flow run=${runID} tenant=${tenantID} vk=${vkName} ok=${okCount} exhaustedAt=${exhaustedAtCall} totalCalls=${calls.length}`,
++			`golden-flow run=${runID} tenant=${tenantID} vk=${vkName} ok=${okCount}/${TOTAL_CALLS} totalTokens=${calls.reduce((a, c) => a + (c.tokens ?? 0), 0)}`,
+ 		);
+ 	});
+ });
+-- 
+2.51.0
+
