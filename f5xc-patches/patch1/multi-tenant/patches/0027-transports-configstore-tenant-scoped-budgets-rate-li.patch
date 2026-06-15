@@ -1,0 +1,1186 @@
+From 62225ca500c77a69962add8d3144efe9881522f1 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Mon, 15 Jun 2026 02:17:13 -0600
+Subject: [PATCH] transports+configstore: tenant-scoped budgets + rate limits
+ CRUD (batched)
+
+Completes the per-tenant admin surface over all governance metadata
+entities. Mirrors the team / customer pattern: delegate-then-verify
+with tenant_id re-pinning on PUT to defend against migration via
+malicious payload.
+
+Routes:
+  POST   /api/tenants/{tid}/governance/budgets
+  GET    /api/tenants/{tid}/governance/budgets
+  GET    /api/tenants/{tid}/governance/budgets/{budget_id}
+  PUT    /api/tenants/{tid}/governance/budgets/{budget_id}
+  DELETE /api/tenants/{tid}/governance/budgets/{budget_id}
+
+  POST   /api/tenants/{tid}/governance/rate-limits
+  GET    /api/tenants/{tid}/governance/rate-limits
+  GET    /api/tenants/{tid}/governance/rate-limits/{rate_limit_id}
+  PUT    /api/tenants/{tid}/governance/rate-limits/{rate_limit_id}
+  DELETE /api/tenants/{tid}/governance/rate-limits/{rate_limit_id}
+
+configstore additions for both entities:
+- *ByTenant list, *ForTenant single-get with cross-tenant ErrNotFound.
+- *ForTenant Create/Update/Delete with the delegate-then-verify shape;
+  Update re-pins tenant_id.
+- MockConfigStore stubs (single-implementation delegation).
+- Tests cover full CRUD across two tenants + cross-tenant isolation
+  on each operation.
+
+Transport additions:
+- handlers.TenantBudgetsHandler with full CRUD. POST validates
+  max_limit >= 0 and reset_duration via configstoreTables.ParseDuration.
+  PUT accepts optional max_limit / reset_duration; empty patch -> 400.
+- handlers.TenantRateLimitsHandler with full CRUD. POST requires at
+  least one of token_max_limit / request_max_limit. PUT accepts any
+  combination of the four fields; empty patch -> 400.
+- Wires into server.go alongside the other tenant-scoped handlers.
+- 12 handler tests covering happy paths, validation rejections,
+  list filtering, cross-tenant GET/DELETE 404s, nil-store rejection.
+
+Per-tenant admin surface is now complete for all entities (tenants,
+providers, provider keys, virtual keys, MCP clients, teams,
+customers, budgets, rate limits) with POST/GET-list/GET-single/PUT/
+DELETE on each (provider keys use POST+DELETE for rotation).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  | 134 +++++++
+ framework/configstore/rdb_test.go             |  76 ++++
+ framework/configstore/store.go                |  21 +
+ .../handlers/tenant_governance_misc.go        | 377 ++++++++++++++++++
+ .../handlers/tenant_governance_misc_test.go   | 375 +++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |  40 ++
+ transports/bifrost-http/server/server.go      |  12 +
+ 7 files changed, 1035 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/tenant_governance_misc.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_governance_misc_test.go
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 053fb8ae6..47bb8036f 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -4133,6 +4133,73 @@ func (s *RDBConfigStore) GetRateLimits(ctx context.Context) ([]tables.TableRateL
+ }
+ 
+ // GetRateLimit retrieves a specific rate limit from the database.
++// GetRateLimitsByTenant lists rate limits scoped to a tenant.
++func (s *RDBConfigStore) GetRateLimitsByTenant(ctx context.Context, tenantID string) ([]tables.TableRateLimit, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	var rateLimits []tables.TableRateLimit
++	if err := s.DB().WithContext(ctx).Where("tenant_id = ?", tenantID).Order("id ASC").Find(&rateLimits).Error; err != nil {
++		return nil, err
++	}
++	return rateLimits, nil
++}
++
++// GetRateLimitForTenant returns the rate limit only when its tenant_id matches.
++func (s *RDBConfigStore) GetRateLimitForTenant(ctx context.Context, tenantID, id string) (*tables.TableRateLimit, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	rl, err := s.GetRateLimit(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if rl.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	return rl, nil
++}
++
++// CreateRateLimitForTenant pins tenant_id on the new row.
++func (s *RDBConfigStore) CreateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if rateLimit == nil {
++		return ErrNotFound
++	}
++	rateLimit.TenantID = tenantID
++	return s.CreateRateLimit(ctx, rateLimit, tx...)
++}
++
++// UpdateRateLimitForTenant verifies ownership before delegating.
++func (s *RDBConfigStore) UpdateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if rateLimit == nil || rateLimit.ID == "" {
++		return ErrNotFound
++	}
++	existing, err := s.GetRateLimitForTenant(ctx, tenantID, rateLimit.ID)
++	if err != nil {
++		return err
++	}
++	rateLimit.ID = existing.ID
++	rateLimit.TenantID = tenantID
++	return s.UpdateRateLimit(ctx, rateLimit, tx...)
++}
++
++// DeleteRateLimitForTenant verifies ownership before delegating.
++func (s *RDBConfigStore) DeleteRateLimitForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if _, err := s.GetRateLimitForTenant(ctx, tenantID, id); err != nil {
++		return err
++	}
++	return s.DeleteRateLimit(ctx, id, tx...)
++}
++
+ func (s *RDBConfigStore) GetRateLimit(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableRateLimit, error) {
+ 	var txDB *gorm.DB
+ 	if len(tx) > 0 {
+@@ -4239,6 +4306,73 @@ func (s *RDBConfigStore) GetBudgets(ctx context.Context) ([]tables.TableBudget,
+ }
+ 
+ // GetBudget retrieves a specific budget from the database.
++// GetBudgetsByTenant lists budgets scoped to a tenant.
++func (s *RDBConfigStore) GetBudgetsByTenant(ctx context.Context, tenantID string) ([]tables.TableBudget, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	var budgets []tables.TableBudget
++	if err := s.DB().WithContext(ctx).Where("tenant_id = ?", tenantID).Order("id ASC").Find(&budgets).Error; err != nil {
++		return nil, err
++	}
++	return budgets, nil
++}
++
++// GetBudgetForTenant returns the budget only when its tenant_id matches.
++func (s *RDBConfigStore) GetBudgetForTenant(ctx context.Context, tenantID, id string) (*tables.TableBudget, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	b, err := s.GetBudget(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if b.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	return b, nil
++}
++
++// CreateBudgetForTenant pins tenant_id on the new row.
++func (s *RDBConfigStore) CreateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if budget == nil {
++		return ErrNotFound
++	}
++	budget.TenantID = tenantID
++	return s.CreateBudget(ctx, budget, tx...)
++}
++
++// UpdateBudgetForTenant verifies ownership before delegating.
++func (s *RDBConfigStore) UpdateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if budget == nil || budget.ID == "" {
++		return ErrNotFound
++	}
++	existing, err := s.GetBudgetForTenant(ctx, tenantID, budget.ID)
++	if err != nil {
++		return err
++	}
++	budget.ID = existing.ID
++	budget.TenantID = tenantID
++	return s.UpdateBudget(ctx, budget, tx...)
++}
++
++// DeleteBudgetForTenant verifies ownership before delegating.
++func (s *RDBConfigStore) DeleteBudgetForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if _, err := s.GetBudgetForTenant(ctx, tenantID, id); err != nil {
++		return err
++	}
++	return s.DeleteBudget(ctx, id, tx...)
++}
++
+ func (s *RDBConfigStore) GetBudget(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableBudget, error) {
+ 	var txDB *gorm.DB
+ 	if len(tx) > 0 {
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index a5cbf087e..6216af8c6 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -2191,6 +2191,82 @@ func TestDeleteVirtualKeyForTenant_OnlyOwnTenant(t *testing.T) {
+ 	assert.ErrorIs(t, err, ErrNotFound)
+ }
+ 
++// TestBudgetsCRUDForTenant covers create/list/get/update/delete on
++// the tenant-scoped budget CRUD with cross-tenant isolation.
++func TestBudgetsCRUDForTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	require.NoError(t, store.CreateBudgetForTenant(ctx, "acme", &tables.TableBudget{ID: "b-a", MaxLimit: 100, ResetDuration: "1d"}))
++	require.NoError(t, store.CreateBudgetForTenant(ctx, "globex", &tables.TableBudget{ID: "b-g", MaxLimit: 200, ResetDuration: "1d"}))
++
++	acme, err := store.GetBudgetsByTenant(ctx, "acme")
++	require.NoError(t, err)
++	assert.Len(t, acme, 1)
++	assert.Equal(t, float64(100), acme[0].MaxLimit)
++
++	_, err = store.GetBudgetForTenant(ctx, "acme", "b-g")
++	assert.ErrorIs(t, err, ErrNotFound)
++
++	require.NoError(t, store.UpdateBudgetForTenant(ctx, "acme", &tables.TableBudget{ID: "b-a", MaxLimit: 150, ResetDuration: "1d"}))
++	after, err := store.GetBudgetForTenant(ctx, "acme", "b-a")
++	require.NoError(t, err)
++	assert.Equal(t, float64(150), after.MaxLimit)
++
++	err = store.DeleteBudgetForTenant(ctx, "acme", "b-g")
++	assert.ErrorIs(t, err, ErrNotFound)
++	_, err = store.GetBudgetForTenant(ctx, "globex", "b-g")
++	require.NoError(t, err)
++
++	require.NoError(t, store.DeleteBudgetForTenant(ctx, "acme", "b-a"))
++	_, err = store.GetBudgetForTenant(ctx, "acme", "b-a")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestRateLimitsCRUDForTenant covers the full happy path on the
++// tenant-scoped rate limit CRUD with cross-tenant isolation.
++func TestRateLimitsCRUDForTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	tokenLimit1 := int64(1000)
++	tokenLimit2 := int64(2000)
++	require.NoError(t, store.CreateRateLimitForTenant(ctx, "acme", &tables.TableRateLimit{
++		ID: "rl-a", TokenMaxLimit: &tokenLimit1, TokenResetDuration: stringPtr("1m"),
++	}))
++	require.NoError(t, store.CreateRateLimitForTenant(ctx, "globex", &tables.TableRateLimit{
++		ID: "rl-g", TokenMaxLimit: &tokenLimit2, TokenResetDuration: stringPtr("1m"),
++	}))
++
++	acme, err := store.GetRateLimitsByTenant(ctx, "acme")
++	require.NoError(t, err)
++	assert.Len(t, acme, 1)
++
++	_, err = store.GetRateLimitForTenant(ctx, "acme", "rl-g")
++	assert.ErrorIs(t, err, ErrNotFound)
++
++	newLimit := int64(1500)
++	require.NoError(t, store.UpdateRateLimitForTenant(ctx, "acme", &tables.TableRateLimit{
++		ID: "rl-a", TokenMaxLimit: &newLimit, TokenResetDuration: stringPtr("1m"),
++	}))
++	after, err := store.GetRateLimitForTenant(ctx, "acme", "rl-a")
++	require.NoError(t, err)
++	require.NotNil(t, after.TokenMaxLimit)
++	assert.Equal(t, int64(1500), *after.TokenMaxLimit)
++
++	err = store.DeleteRateLimitForTenant(ctx, "acme", "rl-g")
++	assert.ErrorIs(t, err, ErrNotFound)
++	_, err = store.GetRateLimitForTenant(ctx, "globex", "rl-g")
++	require.NoError(t, err)
++
++	require.NoError(t, store.DeleteRateLimitForTenant(ctx, "acme", "rl-a"))
++	_, err = store.GetRateLimitForTenant(ctx, "acme", "rl-a")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// stringPtr is a tiny helper for the rate-limit test above.
++func stringPtr(s string) *string { return &s }
++
+ // TestCustomersCRUDForTenant covers the full happy path on the
+ // tenant-scoped customer CRUD: create + list-by-tenant returns own
+ // rows, update flips a field, delete removes from the tenant's view
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index 5aafd4e7e..f8a2b4156 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -337,19 +337,40 @@ type ConfigStore interface {
+ 
+ 	// Rate limit CRUD
+ 	GetRateLimits(ctx context.Context) ([]tables.TableRateLimit, error)
++	// GetRateLimitsByTenant lists rate limits scoped to a tenant.
++	GetRateLimitsByTenant(ctx context.Context, tenantID string) ([]tables.TableRateLimit, error)
+ 	GetRateLimit(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableRateLimit, error)
++	// GetRateLimitForTenant returns the rate limit only when its
++	// tenant_id matches.
++	GetRateLimitForTenant(ctx context.Context, tenantID, id string) (*tables.TableRateLimit, error)
+ 	CreateRateLimit(ctx context.Context, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
++	// CreateRateLimitForTenant pins tenant_id on the new row.
++	CreateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
+ 	UpdateRateLimit(ctx context.Context, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
++	// UpdateRateLimitForTenant verifies ownership and re-pins tenant_id.
++	UpdateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
+ 	UpdateRateLimits(ctx context.Context, rateLimits []*tables.TableRateLimit, tx ...*gorm.DB) error
+ 	DeleteRateLimit(ctx context.Context, id string, tx ...*gorm.DB) error
++	// DeleteRateLimitForTenant verifies ownership and delegates.
++	DeleteRateLimitForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error
+ 
+ 	// Budget CRUD
+ 	GetBudgets(ctx context.Context) ([]tables.TableBudget, error)
++	// GetBudgetsByTenant lists budgets scoped to a tenant.
++	GetBudgetsByTenant(ctx context.Context, tenantID string) ([]tables.TableBudget, error)
+ 	GetBudget(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableBudget, error)
++	// GetBudgetForTenant returns the budget only when its tenant_id matches.
++	GetBudgetForTenant(ctx context.Context, tenantID, id string) (*tables.TableBudget, error)
+ 	CreateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
++	// CreateBudgetForTenant pins tenant_id on the new row.
++	CreateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error
+ 	UpdateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
++	// UpdateBudgetForTenant verifies ownership and re-pins tenant_id.
++	UpdateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error
+ 	UpdateBudgets(ctx context.Context, budgets []*tables.TableBudget, tx ...*gorm.DB) error
+ 	DeleteBudget(ctx context.Context, id string, tx ...*gorm.DB) error
++	// DeleteBudgetForTenant verifies ownership and delegates.
++	DeleteBudgetForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error
+ 	UpdateBudgetUsage(ctx context.Context, id string, currentUsage float64) error
+ 	UpdateRateLimitUsage(ctx context.Context, id string, tokenCurrentUsage int64, requestCurrentUsage int64) error
+ 
+diff --git a/transports/bifrost-http/handlers/tenant_governance_misc.go b/transports/bifrost-http/handlers/tenant_governance_misc.go
+new file mode 100644
+index 000000000..589ea5285
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_governance_misc.go
+@@ -0,0 +1,377 @@
++// Package handlers — tenant-scoped governance budgets + rate limits.
++//
++// Mounts CRUD for the two remaining governance metadata entities under
++// /api/tenants/{tenant_id}/governance/{budgets,rate-limits}. Like
++// teams + customers, these are configuration data attached to other
++// entities (VKs / providers / teams) rather than request-path state,
++// so the runtime evictor is intentionally not wired here.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	"github.com/google/uuid"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// ---- Budgets ----
++
++type TenantBudgetsHandler struct {
++	configStore configstore.ConfigStore
++}
++
++func NewTenantBudgetsHandler(configStore configstore.ConfigStore) (*TenantBudgetsHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantBudgetsHandler{configStore: configStore}, nil
++}
++
++func (h *TenantBudgetsHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.GET("/api/tenants/{tenant_id}/governance/budgets", lib.ChainMiddlewares(h.list, middlewares...))
++	r.POST("/api/tenants/{tenant_id}/governance/budgets", lib.ChainMiddlewares(h.create, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/governance/budgets/{budget_id}", lib.ChainMiddlewares(h.get, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/governance/budgets/{budget_id}", lib.ChainMiddlewares(h.update, middlewares...))
++	r.DELETE("/api/tenants/{tenant_id}/governance/budgets/{budget_id}", lib.ChainMiddlewares(h.delete, middlewares...))
++}
++
++// CreateTenantBudgetRequest is the minimum-viable POST body.
++type CreateTenantBudgetRequest struct {
++	ID            string  `json:"id,omitempty"`
++	MaxLimit      float64 `json:"max_limit"`
++	ResetDuration string  `json:"reset_duration"`
++}
++
++// UpdateTenantBudgetRequest accepts the safe-to-flip fields.
++type UpdateTenantBudgetRequest struct {
++	MaxLimit      *float64 `json:"max_limit,omitempty"`
++	ResetDuration *string  `json:"reset_duration,omitempty"`
++}
++
++func (h *TenantBudgetsHandler) list(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	budgets, err := h.configStore.GetBudgetsByTenant(ctx, string(tid))
++	if err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list budgets: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{"tenant_id": string(tid), "budgets": budgets, "total": len(budgets)})
++}
++
++func (h *TenantBudgetsHandler) create(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	var req CreateTenantBudgetRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.MaxLimit < 0 {
++		SendError(ctx, fasthttp.StatusBadRequest, "max_limit cannot be negative")
++		return
++	}
++	if req.ResetDuration == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "reset_duration is required")
++		return
++	}
++	if _, err := configstoreTables.ParseDuration(req.ResetDuration); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid reset_duration: %v", err))
++		return
++	}
++	if req.ID == "" {
++		req.ID = uuid.NewString()
++	}
++	b := &configstoreTables.TableBudget{ID: req.ID, MaxLimit: req.MaxLimit, ResetDuration: req.ResetDuration}
++	if err := h.configStore.CreateBudgetForTenant(ctx, string(tid), b); err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create budget: %v", err))
++		return
++	}
++	SendJSONWithStatus(ctx, b, fasthttp.StatusCreated)
++}
++
++func (h *TenantBudgetsHandler) get(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	id, _ := ctx.UserValue("budget_id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "budget_id is required")
++		return
++	}
++	b, err := h.configStore.GetBudgetForTenant(ctx, string(tid), id)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Budget %s not found for tenant %s", id, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get budget: %v", err))
++		return
++	}
++	SendJSON(ctx, b)
++}
++
++func (h *TenantBudgetsHandler) update(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	id, _ := ctx.UserValue("budget_id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "budget_id is required")
++		return
++	}
++	var req UpdateTenantBudgetRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.MaxLimit == nil && req.ResetDuration == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "at least one of max_limit, reset_duration is required")
++		return
++	}
++	existing, err := h.configStore.GetBudgetForTenant(ctx, string(tid), id)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Budget %s not found for tenant %s", id, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load budget: %v", err))
++		return
++	}
++	if req.MaxLimit != nil {
++		if *req.MaxLimit < 0 {
++			SendError(ctx, fasthttp.StatusBadRequest, "max_limit cannot be negative")
++			return
++		}
++		existing.MaxLimit = *req.MaxLimit
++	}
++	if req.ResetDuration != nil {
++		if _, derr := configstoreTables.ParseDuration(*req.ResetDuration); derr != nil {
++			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid reset_duration: %v", derr))
++			return
++		}
++		existing.ResetDuration = *req.ResetDuration
++	}
++	if err := h.configStore.UpdateBudgetForTenant(ctx, string(tid), existing); err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update budget: %v", err))
++		return
++	}
++	SendJSON(ctx, existing)
++}
++
++func (h *TenantBudgetsHandler) delete(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	id, _ := ctx.UserValue("budget_id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "budget_id is required")
++		return
++	}
++	if err := h.configStore.DeleteBudgetForTenant(ctx, string(tid), id); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Budget %s not found for tenant %s", id, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete budget: %v", err))
++		return
++	}
++	ctx.SetStatusCode(fasthttp.StatusNoContent)
++}
++
++// ---- Rate limits ----
++
++type TenantRateLimitsHandler struct {
++	configStore configstore.ConfigStore
++}
++
++func NewTenantRateLimitsHandler(configStore configstore.ConfigStore) (*TenantRateLimitsHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantRateLimitsHandler{configStore: configStore}, nil
++}
++
++func (h *TenantRateLimitsHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.GET("/api/tenants/{tenant_id}/governance/rate-limits", lib.ChainMiddlewares(h.list, middlewares...))
++	r.POST("/api/tenants/{tenant_id}/governance/rate-limits", lib.ChainMiddlewares(h.create, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/governance/rate-limits/{rate_limit_id}", lib.ChainMiddlewares(h.get, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/governance/rate-limits/{rate_limit_id}", lib.ChainMiddlewares(h.update, middlewares...))
++	r.DELETE("/api/tenants/{tenant_id}/governance/rate-limits/{rate_limit_id}", lib.ChainMiddlewares(h.delete, middlewares...))
++}
++
++// CreateTenantRateLimitRequest is the minimum-viable POST body. Both
++// pairs (token / request) are optional but at least one must be set.
++type CreateTenantRateLimitRequest struct {
++	ID                   string  `json:"id,omitempty"`
++	TokenMaxLimit        *int64  `json:"token_max_limit,omitempty"`
++	TokenResetDuration   *string `json:"token_reset_duration,omitempty"`
++	RequestMaxLimit      *int64  `json:"request_max_limit,omitempty"`
++	RequestResetDuration *string `json:"request_reset_duration,omitempty"`
++}
++
++type UpdateTenantRateLimitRequest = CreateTenantRateLimitRequest
++
++func (h *TenantRateLimitsHandler) list(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	rls, err := h.configStore.GetRateLimitsByTenant(ctx, string(tid))
++	if err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list rate limits: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{"tenant_id": string(tid), "rate_limits": rls, "total": len(rls)})
++}
++
++func (h *TenantRateLimitsHandler) create(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	var req CreateTenantRateLimitRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.TokenMaxLimit == nil && req.RequestMaxLimit == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "at least one of token_max_limit or request_max_limit is required")
++		return
++	}
++	if req.ID == "" {
++		req.ID = uuid.NewString()
++	}
++	rl := &configstoreTables.TableRateLimit{
++		ID:                   req.ID,
++		TokenMaxLimit:        req.TokenMaxLimit,
++		TokenResetDuration:   req.TokenResetDuration,
++		RequestMaxLimit:      req.RequestMaxLimit,
++		RequestResetDuration: req.RequestResetDuration,
++	}
++	if err := h.configStore.CreateRateLimitForTenant(ctx, string(tid), rl); err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create rate limit: %v", err))
++		return
++	}
++	SendJSONWithStatus(ctx, rl, fasthttp.StatusCreated)
++}
++
++func (h *TenantRateLimitsHandler) get(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	id, _ := ctx.UserValue("rate_limit_id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "rate_limit_id is required")
++		return
++	}
++	rl, err := h.configStore.GetRateLimitForTenant(ctx, string(tid), id)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Rate limit %s not found for tenant %s", id, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get rate limit: %v", err))
++		return
++	}
++	SendJSON(ctx, rl)
++}
++
++func (h *TenantRateLimitsHandler) update(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	id, _ := ctx.UserValue("rate_limit_id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "rate_limit_id is required")
++		return
++	}
++	var req UpdateTenantRateLimitRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.TokenMaxLimit == nil && req.RequestMaxLimit == nil && req.TokenResetDuration == nil && req.RequestResetDuration == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "at least one field is required")
++		return
++	}
++	existing, err := h.configStore.GetRateLimitForTenant(ctx, string(tid), id)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Rate limit %s not found for tenant %s", id, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load rate limit: %v", err))
++		return
++	}
++	if req.TokenMaxLimit != nil {
++		existing.TokenMaxLimit = req.TokenMaxLimit
++	}
++	if req.TokenResetDuration != nil {
++		existing.TokenResetDuration = req.TokenResetDuration
++	}
++	if req.RequestMaxLimit != nil {
++		existing.RequestMaxLimit = req.RequestMaxLimit
++	}
++	if req.RequestResetDuration != nil {
++		existing.RequestResetDuration = req.RequestResetDuration
++	}
++	if err := h.configStore.UpdateRateLimitForTenant(ctx, string(tid), existing); err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update rate limit: %v", err))
++		return
++	}
++	SendJSON(ctx, existing)
++}
++
++func (h *TenantRateLimitsHandler) delete(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx")
++		return
++	}
++	id, _ := ctx.UserValue("rate_limit_id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "rate_limit_id is required")
++		return
++	}
++	if err := h.configStore.DeleteRateLimitForTenant(ctx, string(tid), id); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Rate limit %s not found for tenant %s", id, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete rate limit: %v", err))
++		return
++	}
++	ctx.SetStatusCode(fasthttp.StatusNoContent)
++}
+diff --git a/transports/bifrost-http/handlers/tenant_governance_misc_test.go b/transports/bifrost-http/handlers/tenant_governance_misc_test.go
+new file mode 100644
+index 000000000..a0248ec2d
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_governance_misc_test.go
+@@ -0,0 +1,375 @@
++package handlers
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
++)
++
++// ---- Budgets ----
++
++type stubBudgetsStore struct {
++	configstore.ConfigStore
++	mu      sync.Mutex
++	budgets []*configstoreTables.TableBudget
++}
++
++func (s *stubBudgetsStore) CreateBudgetForTenant(_ context.Context, tenantID string, b *configstoreTables.TableBudget, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	cp := *b
++	cp.TenantID = tenantID
++	s.budgets = append(s.budgets, &cp)
++	return nil
++}
++
++func (s *stubBudgetsStore) GetBudgetsByTenant(_ context.Context, tenantID string) ([]configstoreTables.TableBudget, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	var out []configstoreTables.TableBudget
++	for _, b := range s.budgets {
++		if b.TenantID == tenantID {
++			out = append(out, *b)
++		}
++	}
++	return out, nil
++}
++
++func (s *stubBudgetsStore) GetBudgetForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableBudget, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, b := range s.budgets {
++		if b.ID == id && b.TenantID == tenantID {
++			cp := *b
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubBudgetsStore) UpdateBudgetForTenant(_ context.Context, tenantID string, b *configstoreTables.TableBudget, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, existing := range s.budgets {
++		if existing.ID == b.ID && existing.TenantID == tenantID {
++			cp := *b
++			cp.TenantID = tenantID
++			s.budgets[i] = &cp
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func (s *stubBudgetsStore) DeleteBudgetForTenant(_ context.Context, tenantID, id string, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, b := range s.budgets {
++		if b.ID == id && b.TenantID == tenantID {
++			s.budgets = append(s.budgets[:i], s.budgets[i+1:]...)
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func newBudgetCtx(t *testing.T, method, path, body, tid, budgetID string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if body != "" {
++		req.SetBodyString(body)
++		req.Header.SetContentType("application/json")
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	if budgetID != "" {
++		ctx.SetUserValue("budget_id", budgetID)
++	}
++	return ctx
++}
++
++func TestTenantBudgetsHandler_Create_HappyPath(t *testing.T) {
++	store := &stubBudgetsStore{}
++	h, err := NewTenantBudgetsHandler(store)
++	if err != nil {
++		t.Fatalf("NewTenantBudgetsHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{"max_limit": 100.0, "reset_duration": "1d"})
++	ctx := newBudgetCtx(t, fasthttp.MethodPost, "/api/tenants/acme/governance/budgets", string(body), "acme", "")
++
++	h.create(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusCreated {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.budgets) != 1 || store.budgets[0].MaxLimit != 100 {
++		t.Fatalf("budget should have been created; got %+v", store.budgets)
++	}
++	if store.budgets[0].TenantID != "acme" {
++		t.Fatalf("tenant_id got %q want acme", store.budgets[0].TenantID)
++	}
++}
++
++func TestTenantBudgetsHandler_Create_RejectsNegativeLimit(t *testing.T) {
++	store := &stubBudgetsStore{}
++	h, _ := NewTenantBudgetsHandler(store)
++
++	body, _ := sonic.Marshal(map[string]any{"max_limit": -1.0, "reset_duration": "1d"})
++	ctx := newBudgetCtx(t, fasthttp.MethodPost, "/api/tenants/acme/governance/budgets", string(body), "acme", "")
++
++	h.create(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("negative max_limit should be 400; got %d", got)
++	}
++}
++
++func TestTenantBudgetsHandler_List_FiltersByTenant(t *testing.T) {
++	store := &stubBudgetsStore{}
++	store.budgets = append(store.budgets,
++		&configstoreTables.TableBudget{ID: "b1", TenantID: "acme", MaxLimit: 100, ResetDuration: "1d"},
++		&configstoreTables.TableBudget{ID: "b2", TenantID: "globex", MaxLimit: 200, ResetDuration: "1d"},
++	)
++	h, _ := NewTenantBudgetsHandler(store)
++
++	ctx := newBudgetCtx(t, fasthttp.MethodGet, "/api/tenants/acme/governance/budgets", "", "acme", "")
++	h.list(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	var resp struct {
++		Total int `json:"total"`
++	}
++	_ = sonic.Unmarshal(ctx.Response.Body(), &resp)
++	if resp.Total != 1 {
++		t.Fatalf("acme should see 1 budget; got %d", resp.Total)
++	}
++}
++
++func TestTenantBudgetsHandler_Update_HappyPath(t *testing.T) {
++	store := &stubBudgetsStore{}
++	store.budgets = append(store.budgets, &configstoreTables.TableBudget{ID: "b1", TenantID: "acme", MaxLimit: 100, ResetDuration: "1d"})
++	h, _ := NewTenantBudgetsHandler(store)
++
++	body, _ := sonic.Marshal(map[string]any{"max_limit": 200.0})
++	ctx := newBudgetCtx(t, fasthttp.MethodPut, "/api/tenants/acme/governance/budgets/b1", string(body), "acme", "b1")
++	h.update(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.budgets[0].MaxLimit != 200 {
++		t.Fatalf("max_limit should be 200; got %v", store.budgets[0].MaxLimit)
++	}
++}
++
++func TestTenantBudgetsHandler_Delete_CrossTenant_NotFound(t *testing.T) {
++	store := &stubBudgetsStore{}
++	store.budgets = append(store.budgets, &configstoreTables.TableBudget{ID: "bg", TenantID: "globex"})
++	h, _ := NewTenantBudgetsHandler(store)
++
++	ctx := newBudgetCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/governance/budgets/bg", "", "acme", "bg")
++	h.delete(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant DELETE should be 404; got %d", got)
++	}
++}
++
++func TestTenantBudgetsHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantBudgetsHandler(nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
++
++// ---- Rate limits ----
++
++type stubRateLimitsStore struct {
++	configstore.ConfigStore
++	mu  sync.Mutex
++	rls []*configstoreTables.TableRateLimit
++}
++
++func (s *stubRateLimitsStore) CreateRateLimitForTenant(_ context.Context, tenantID string, rl *configstoreTables.TableRateLimit, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	cp := *rl
++	cp.TenantID = tenantID
++	s.rls = append(s.rls, &cp)
++	return nil
++}
++
++func (s *stubRateLimitsStore) GetRateLimitsByTenant(_ context.Context, tenantID string) ([]configstoreTables.TableRateLimit, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	var out []configstoreTables.TableRateLimit
++	for _, r := range s.rls {
++		if r.TenantID == tenantID {
++			out = append(out, *r)
++		}
++	}
++	return out, nil
++}
++
++func (s *stubRateLimitsStore) GetRateLimitForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableRateLimit, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, r := range s.rls {
++		if r.ID == id && r.TenantID == tenantID {
++			cp := *r
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubRateLimitsStore) UpdateRateLimitForTenant(_ context.Context, tenantID string, rl *configstoreTables.TableRateLimit, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, existing := range s.rls {
++		if existing.ID == rl.ID && existing.TenantID == tenantID {
++			cp := *rl
++			cp.TenantID = tenantID
++			s.rls[i] = &cp
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func (s *stubRateLimitsStore) DeleteRateLimitForTenant(_ context.Context, tenantID, id string, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, r := range s.rls {
++		if r.ID == id && r.TenantID == tenantID {
++			s.rls = append(s.rls[:i], s.rls[i+1:]...)
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func newRLCtx(t *testing.T, method, path, body, tid, rlID string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if body != "" {
++		req.SetBodyString(body)
++		req.Header.SetContentType("application/json")
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	if rlID != "" {
++		ctx.SetUserValue("rate_limit_id", rlID)
++	}
++	return ctx
++}
++
++func TestTenantRateLimitsHandler_Create_HappyPath(t *testing.T) {
++	store := &stubRateLimitsStore{}
++	h, err := NewTenantRateLimitsHandler(store)
++	if err != nil {
++		t.Fatalf("NewTenantRateLimitsHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{"token_max_limit": 1000, "token_reset_duration": "1m"})
++	ctx := newRLCtx(t, fasthttp.MethodPost, "/api/tenants/acme/governance/rate-limits", string(body), "acme", "")
++	h.create(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusCreated {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.rls) != 1 || store.rls[0].TenantID != "acme" {
++		t.Fatalf("rate limit should have been created with tenant_id acme; got %+v", store.rls)
++	}
++}
++
++func TestTenantRateLimitsHandler_Create_RejectsEmptyLimits(t *testing.T) {
++	store := &stubRateLimitsStore{}
++	h, _ := NewTenantRateLimitsHandler(store)
++
++	body, _ := sonic.Marshal(map[string]any{}) // neither token nor request limit
++	ctx := newRLCtx(t, fasthttp.MethodPost, "/api/tenants/acme/governance/rate-limits", string(body), "acme", "")
++	h.create(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("empty limits should be 400; got %d", got)
++	}
++}
++
++func TestTenantRateLimitsHandler_Get_CrossTenant_NotFound(t *testing.T) {
++	store := &stubRateLimitsStore{}
++	store.rls = append(store.rls, &configstoreTables.TableRateLimit{ID: "rl-g", TenantID: "globex"})
++	h, _ := NewTenantRateLimitsHandler(store)
++
++	ctx := newRLCtx(t, fasthttp.MethodGet, "/api/tenants/acme/governance/rate-limits/rl-g", "", "acme", "rl-g")
++	h.get(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant GET should be 404; got %d", got)
++	}
++}
++
++func TestTenantRateLimitsHandler_Update_HappyPath(t *testing.T) {
++	store := &stubRateLimitsStore{}
++	tokenLimit := int64(1000)
++	store.rls = append(store.rls, &configstoreTables.TableRateLimit{ID: "rl-1", TenantID: "acme", TokenMaxLimit: &tokenLimit})
++	h, _ := NewTenantRateLimitsHandler(store)
++
++	body, _ := sonic.Marshal(map[string]any{"token_max_limit": 2000})
++	ctx := newRLCtx(t, fasthttp.MethodPut, "/api/tenants/acme/governance/rate-limits/rl-1", string(body), "acme", "rl-1")
++	h.update(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.rls[0].TokenMaxLimit == nil || *store.rls[0].TokenMaxLimit != 2000 {
++		t.Fatalf("token_max_limit should be 2000; got %+v", store.rls[0].TokenMaxLimit)
++	}
++}
++
++func TestTenantRateLimitsHandler_Delete_CrossTenant_NotFound(t *testing.T) {
++	store := &stubRateLimitsStore{}
++	store.rls = append(store.rls, &configstoreTables.TableRateLimit{ID: "rl-g", TenantID: "globex"})
++	h, _ := NewTenantRateLimitsHandler(store)
++
++	ctx := newRLCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/governance/rate-limits/rl-g", "", "acme", "rl-g")
++	h.delete(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant DELETE should be 404; got %d", got)
++	}
++}
++
++func TestTenantRateLimitsHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantRateLimitsHandler(nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index 8bb724b1c..ec42ae8c2 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -760,6 +760,46 @@ func (m *MockConfigStore) DeleteRateLimit(ctx context.Context, id string, tx ...
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) CreateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
++	return m.CreateBudget(ctx, budget, tx...)
++}
++
++func (m *MockConfigStore) UpdateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
++	return m.UpdateBudget(ctx, budget, tx...)
++}
++
++func (m *MockConfigStore) DeleteBudgetForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
++	return m.DeleteBudget(ctx, id, tx...)
++}
++
++func (m *MockConfigStore) GetBudgetsByTenant(ctx context.Context, tenantID string) ([]tables.TableBudget, error) {
++	return m.GetBudgets(ctx)
++}
++
++func (m *MockConfigStore) GetBudgetForTenant(ctx context.Context, tenantID, id string) (*tables.TableBudget, error) {
++	return m.GetBudget(ctx, id)
++}
++
++func (m *MockConfigStore) CreateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
++	return m.CreateRateLimit(ctx, rateLimit, tx...)
++}
++
++func (m *MockConfigStore) UpdateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
++	return m.UpdateRateLimit(ctx, rateLimit, tx...)
++}
++
++func (m *MockConfigStore) DeleteRateLimitForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
++	return m.DeleteRateLimit(ctx, id, tx...)
++}
++
++func (m *MockConfigStore) GetRateLimitsByTenant(ctx context.Context, tenantID string) ([]tables.TableRateLimit, error) {
++	return m.GetRateLimits(ctx)
++}
++
++func (m *MockConfigStore) GetRateLimitForTenant(ctx context.Context, tenantID, id string) (*tables.TableRateLimit, error) {
++	return m.GetRateLimit(ctx, id)
++}
++
+ func (m *MockConfigStore) DeleteBudget(ctx context.Context, id string, tx ...*gorm.DB) error {
+ 	if m.governanceConfig == nil || len(m.governanceConfig.Budgets) == 0 {
+ 		return nil
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 849bef5fc..8ab89c4dc 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1369,6 +1369,18 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 			return fmt.Errorf("failed to initialize tenant customers handler: %v", err)
+ 		}
+ 		tenantCustomersHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++
++		tenantBudgetsHandler, err := handlers.NewTenantBudgetsHandler(s.Config.ConfigStore)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant budgets handler: %v", err)
++		}
++		tenantBudgetsHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++
++		tenantRateLimitsHandler, err := handlers.NewTenantRateLimitsHandler(s.Config.ConfigStore)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant rate limits handler: %v", err)
++		}
++		tenantRateLimitsHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
+ 	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+-- 
+2.51.0
+
