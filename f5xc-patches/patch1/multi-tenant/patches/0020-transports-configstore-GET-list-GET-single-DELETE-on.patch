@@ -1,7 +1,7 @@
-From 96dc060a8a70d86d3ecc984c64aff4ae0cccdd00 Mon Sep 17 00:00:00 2001
+From 01b72cc65106336e0da641870b892cfe7088a2e8 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Sun, 14 Jun 2026 17:46:51 -0600
-Subject: [PATCH] transports+configstore: GET list, GET single, DELETE on
+Subject: [PATCH 20/42] transports+configstore: GET list, GET single, DELETE on
  /api/tenants/{tid}/providers/...
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

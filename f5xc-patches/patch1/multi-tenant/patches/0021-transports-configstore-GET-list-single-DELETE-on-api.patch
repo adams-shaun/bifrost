@@ -1,7 +1,7 @@
-From 98120e9b0cadfba168d800897702e1dd85090cf1 Mon Sep 17 00:00:00 2001
+From 0576ad23ba5d809fcf45a3717f27d35bba88e6cd Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Sun, 14 Jun 2026 18:58:12 -0600
-Subject: [PATCH] transports+configstore: GET list/single + DELETE on
+Subject: [PATCH 21/42] transports+configstore: GET list/single + DELETE on
  /api/tenants/{tid}/{governance/virtual-keys,mcp/clients}
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
-From 255bcf632a7802ad05d0f499ec3ccb54f2cfc8da Mon Sep 17 00:00:00 2001
+From f971a63f4c788b2ae96a2042d88f8be52881ed25 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Thu, 11 Jun 2026 22:37:34 -0600
-Subject: [PATCH 10/14] transports: introduce BifrostRouter interface +
+Subject: [PATCH 10/42] transports: introduce BifrostRouter interface +
  SingleTenantRouter scaffolding
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

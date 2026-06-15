@@ -1,7 +1,7 @@
-From 02109e7c0e9a35ea55f69de7b8d44ec57c559a8c Mon Sep 17 00:00:00 2001
+From b49abe942216196ceff0e8d5899fca7f8b7581ee Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 09:46:29 -0600
-Subject: [PATCH] ui: rename customer label to namespace (display-only)
+Subject: [PATCH 38/42] ui: rename customer label to namespace (display-only)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

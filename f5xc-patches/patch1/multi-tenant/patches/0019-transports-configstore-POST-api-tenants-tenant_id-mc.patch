@@ -1,7 +1,7 @@
-From ad2e16360014efe77f46b135d3cbbd329b3a56ce Mon Sep 17 00:00:00 2001
+From bbd1c96d5998a7db7d30ba985fbbc8cb59b79166 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Fri, 12 Jun 2026 21:39:45 -0600
-Subject: [PATCH] transports+configstore: POST
+Subject: [PATCH 19/42] transports+configstore: POST
  /api/tenants/{tenant_id}/mcp/clients (admin create per-tenant MCP)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

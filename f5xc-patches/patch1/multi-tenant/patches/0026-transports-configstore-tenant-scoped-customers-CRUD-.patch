@@ -1,8 +1,8 @@
-From 4592ba9c8dfde4e7715cd579bbc17381793d7903 Mon Sep 17 00:00:00 2001
+From 473840125edaacc5b2c6e49f6987843d2d062481 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Sun, 14 Jun 2026 22:22:49 -0600
-Subject: [PATCH] transports+configstore: tenant-scoped customers CRUD under
- /api/tenants/{tid}/governance/customers
+Subject: [PATCH 26/42] transports+configstore: tenant-scoped customers CRUD
+ under /api/tenants/{tid}/governance/customers
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

@@ -1,7 +1,7 @@
-From f54e1f703d764db359e7dcd0f4688ab455c91cc1 Mon Sep 17 00:00:00 2001
+From 2176edacf4632d12ae03f7dd8ddda9326d556d41 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 03:14:27 -0600
-Subject: [PATCH 2/3] server: extract ensureMultiTenantInitialized so admin
+Subject: [PATCH 31/42] server: extract ensureMultiTenantInitialized so admin
  routes mount
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

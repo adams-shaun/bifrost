@@ -1,7 +1,7 @@
-From 350816dabb6a50fefe6e4a32c5606a9d1435ef4b Mon Sep 17 00:00:00 2001
+From fe3c6cf6896fc5810cdceeed6dc6e95ed05a70f2 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Sun, 14 Jun 2026 22:07:13 -0600
-Subject: [PATCH] transports+configstore: tenant-scoped teams CRUD under
+Subject: [PATCH 25/42] transports+configstore: tenant-scoped teams CRUD under
  /api/tenants/{tid}/governance/teams
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

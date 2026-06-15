@@ -1,8 +1,8 @@
-From b040e07758fbcff4f0c8d18ade458ec0a1f4e00d Mon Sep 17 00:00:00 2001
+From 0c458d51cb29665529a17e866282e507ad22f1c8 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 11:03:36 -0600
-Subject: [PATCH] =?UTF-8?q?transports:=20accept=20VK=20bearer=20(sk-bf-?=
- =?UTF-8?q?=E2=80=A6)=20as=20inference-auth=20credential?=
+Subject: [PATCH 42/42] =?UTF-8?q?transports:=20accept=20VK=20bearer=20(sk-?=
+ =?UTF-8?q?bf-=E2=80=A6)=20as=20inference-auth=20credential?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

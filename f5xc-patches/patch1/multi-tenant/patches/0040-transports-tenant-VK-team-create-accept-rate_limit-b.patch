@@ -1,7 +1,7 @@
-From 96401c6a24d1aadf7e80a11cd6d0a60e2cec05cc Mon Sep 17 00:00:00 2001
+From f6d443d392151d02171d7a5657b0d6939bdc62fc Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 10:28:37 -0600
-Subject: [PATCH 1/3] transports: tenant VK + team create accept rate_limit /
+Subject: [PATCH 40/42] transports: tenant VK + team create accept rate_limit /
  budgets / provider_configs
 
 The v1 tenant CRUD bodies (CreateTenantVirtualKeyRequest +
@@ -38,11 +38,26 @@ recorders.
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
- .../bifrost-http/handlers/tenant_teams.go     | 107 ++++++++-
- .../handlers/tenant_virtualkeys.go            | 210 +++++++++++++++++-
- .../handlers/tenant_virtualkeys_test.go       | 138 ++++++++++++
- 3 files changed, 436 insertions(+), 19 deletions(-)
+ .../handlers/mt_integration_test.go           |   2 +-
+ .../bifrost-http/handlers/tenant_teams.go     | 107 ++++++-
+ .../handlers/tenant_virtualkeys.go            | 272 +++++++++++++++++-
+ .../handlers/tenant_virtualkeys_test.go       | 166 ++++++++++-
+ transports/bifrost-http/server/server.go      |   2 +-
+ 5 files changed, 511 insertions(+), 38 deletions(-)
 
+diff --git a/transports/bifrost-http/handlers/mt_integration_test.go b/transports/bifrost-http/handlers/mt_integration_test.go
+index 9512c4628..e337de447 100644
+--- a/transports/bifrost-http/handlers/mt_integration_test.go
++++ b/transports/bifrost-http/handlers/mt_integration_test.go
+@@ -129,7 +129,7 @@ func TestMultiTenantAdmin_TenantIsolation(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("provider handler: %v", err)
+ 	}
+-	vkHandler, err := NewTenantVirtualKeyHandler(store, nil, nil)
++	vkHandler, err := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 	if err != nil {
+ 		t.Fatalf("vk handler: %v", err)
+ 	}
 diff --git a/transports/bifrost-http/handlers/tenant_teams.go b/transports/bifrost-http/handlers/tenant_teams.go
 index 6202bcd1b..c65209d17 100644
 --- a/transports/bifrost-http/handlers/tenant_teams.go
@@ -190,11 +205,14 @@ index 6202bcd1b..c65209d17 100644
  		return
  	}
 diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys.go b/transports/bifrost-http/handlers/tenant_virtualkeys.go
-index 51dc61e28..f04dab1be 100644
+index 51dc61e28..1857aeee0 100644
 --- a/transports/bifrost-http/handlers/tenant_virtualkeys.go
 +++ b/transports/bifrost-http/handlers/tenant_virtualkeys.go
-@@ -16,6 +16,8 @@ package handlers
+@@ -14,8 +14,11 @@
+ package handlers
+ 
  import (
++	"context"
  	"errors"
  	"fmt"
 +	"strings"
@@ -202,7 +220,7 @@ index 51dc61e28..f04dab1be 100644
  
  	"github.com/bytedance/sonic"
  	"github.com/fasthttp/router"
-@@ -23,9 +25,11 @@ import (
+@@ -23,9 +26,11 @@ import (
  	"github.com/maximhq/bifrost/core/schemas"
  	"github.com/maximhq/bifrost/framework/configstore"
  	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
@@ -214,7 +232,58 @@ index 51dc61e28..f04dab1be 100644
  )
  
  // VKCacheInvalidator is the narrow contract the VK admin handlers need
-@@ -87,10 +91,24 @@ type UpdateTenantVirtualKeyRequest struct {
+@@ -41,6 +46,19 @@ type VKCacheInvalidator interface {
+ 	Invalidate(vk string)
+ }
+ 
++// VKGovernanceReloader is the slice of the GovernanceManager surface
++// the tenant VK handler needs to reach into the governance plugin's
++// in-memory store on create / delete.  Without this hook, a freshly-
++// created tenant VK lives in the configstore but the governance
++// plugin's request-path validator never sees it until process
++// restart — every /v1 call against the new VK 401s with
++// virtual_key_not_found.  ServerCallbacks (the legacy single-tenant
++// handler's manager) satisfies this interface.
++type VKGovernanceReloader interface {
++	ReloadVirtualKey(ctx context.Context, id string) (*configstoreTables.TableVirtualKey, error)
++	RemoveVirtualKey(ctx context.Context, id string) error
++}
++
+ // TenantVirtualKeyHandler implements the tenant-scoped VK admin routes.
+ type TenantVirtualKeyHandler struct {
+ 	configStore configstore.ConfigStore
+@@ -52,16 +70,27 @@ type TenantVirtualKeyHandler struct {
+ 	// for the affected VK on create/update/delete. Optional — when
+ 	// nil, the resolver TTL alone bounds staleness.
+ 	vkInvalidator VKCacheInvalidator
++	// governanceReloader hooks the governance plugin's in-memory VK
++	// store so a freshly-created tenant VK is request-path-active
++	// immediately, without a process restart. Optional — when nil,
++	// new tenant VKs only become usable after the next governance-
++	// store reload (typically at process restart).
++	governanceReloader VKGovernanceReloader
+ }
+ 
+ // NewTenantVirtualKeyHandler constructs a TenantVirtualKeyHandler.
+-// configStore is required; evictor + vkInvalidator are optional and
++// configStore is required; all other args are optional and
+ // independently testable.
+-func NewTenantVirtualKeyHandler(configStore configstore.ConfigStore, evictor TenantRuntimeEvictor, vkInvalidator VKCacheInvalidator) (*TenantVirtualKeyHandler, error) {
++func NewTenantVirtualKeyHandler(configStore configstore.ConfigStore, evictor TenantRuntimeEvictor, vkInvalidator VKCacheInvalidator, governanceReloader VKGovernanceReloader) (*TenantVirtualKeyHandler, error) {
+ 	if configStore == nil {
+ 		return nil, fmt.Errorf("config store is required")
+ 	}
+-	return &TenantVirtualKeyHandler{configStore: configStore, evictor: evictor, vkInvalidator: vkInvalidator}, nil
++	return &TenantVirtualKeyHandler{
++		configStore:        configStore,
++		evictor:            evictor,
++		vkInvalidator:      vkInvalidator,
++		governanceReloader: governanceReloader,
++	}, nil
+ }
+ 
+ // RegisterRoutes mounts the tenant-scoped VK routes. middlewares MUST
+@@ -87,10 +116,24 @@ type UpdateTenantVirtualKeyRequest struct {
  	IsActive    *bool   `json:"is_active,omitempty"`
  }
  
@@ -243,7 +312,7 @@ index 51dc61e28..f04dab1be 100644
  type CreateTenantVirtualKeyRequest struct {
  	Name string `json:"name"`
  	// Value is optional. When empty, the server mints a fresh
-@@ -100,6 +118,12 @@ type CreateTenantVirtualKeyRequest struct {
+@@ -100,6 +143,12 @@ type CreateTenantVirtualKeyRequest struct {
  	Value string `json:"value,omitempty"`
  	// Description is informational; safe to leave empty.
  	Description string `json:"description,omitempty"`
@@ -256,7 +325,7 @@ index 51dc61e28..f04dab1be 100644
  }
  
  // CreateTenantVirtualKeyResponse is what we return on success — the
-@@ -129,26 +153,160 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
+@@ -129,26 +178,161 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
  		return
  	}
  
@@ -320,9 +389,8 @@ index 51dc61e28..f04dab1be 100644
 +		Description:     req.Description,
 +		IsActive:        &isActive,
 +		CalendarAligned: req.CalendarAligned,
- 	}
- 
--	if err := h.configStore.CreateVirtualKey(ctx, vk); err != nil {
++	}
++
 +	// Minimal POST (no rate_limit / budgets / provider_configs) takes the
 +	// direct CreateVirtualKey path so existing happy-path tests (with
 +	// stub stores that don't implement ExecuteTransaction) keep working.
@@ -336,13 +404,15 @@ index 51dc61e28..f04dab1be 100644
 +			return
 +		}
 +		h.postCreateInvalidate(tid, vk.Value)
++		h.reloadGovernanceVK(ctx, vk.ID)
 +		SendJSONWithStatus(ctx, map[string]any{
 +			"message":     "Virtual key created successfully",
 +			"virtual_key": vk,
 +		}, fasthttp.StatusCreated)
 +		return
-+	}
-+
+ 	}
+ 
+-	if err := h.configStore.CreateVirtualKey(ctx, vk); err != nil {
 +	// Rich POST: VK + owned rate_limit / budgets / provider_configs run
 +	// inside a single transaction so a half-built VK can't leak when a
 +	// later step fails.
@@ -425,10 +495,46 @@ index 51dc61e28..f04dab1be 100644
  		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create virtual key: %v", err))
  		return
  	}
-@@ -182,6 +340,34 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
+@@ -171,6 +355,7 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
+ 		// VK.)
+ 		h.vkInvalidator.Invalidate(vk.Value)
+ 	}
++	h.reloadGovernanceVK(ctx, vk.ID)
+ 
+ 	// Return the legacy {message, virtual_key} envelope so the UI's
+ 	// createVirtualKey mutation (typed as {message: string; virtual_key:
+@@ -182,6 +367,62 @@ func (h *TenantVirtualKeyHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
  	}, fasthttp.StatusCreated)
  }
  
++// reloadGovernanceVK pokes the governance plugin's in-memory store so a
++// freshly-created tenant VK is request-path-active immediately. Best-
++// effort: when the reloader isn't wired (tests, single-tenant deploys)
++// or the reload fails (db lag, etc.) we keep going; the resolver TTL +
++// the next governance restart still close the loop, just slower.
++func (h *TenantVirtualKeyHandler) reloadGovernanceVK(ctx context.Context, vkID string) {
++	if h.governanceReloader == nil {
++		return
++	}
++	if _, err := h.governanceReloader.ReloadVirtualKey(ctx, vkID); err != nil {
++		// Don't fail the request — the VK is persisted; this is a
++		// cache nudge. Log via the configstore-side logger if/when
++		// the handler gets one, but the silent best-effort path
++		// matches the existing evictor / vkInvalidator pattern.
++		_ = err
++	}
++}
++
++// removeGovernanceVK is the delete-path counterpart of reloadGovernanceVK.
++func (h *TenantVirtualKeyHandler) removeGovernanceVK(ctx context.Context, vkID string) {
++	if h.governanceReloader == nil {
++		return
++	}
++	if err := h.governanceReloader.RemoveVirtualKey(ctx, vkID); err != nil {
++		_ = err
++	}
++}
++
 +// postCreateInvalidate centralises the runtime evictor + resolver-
 +// cache invalidator calls that both the minimal and rich VK create
 +// paths need to make.
@@ -460,8 +566,16 @@ index 51dc61e28..f04dab1be 100644
  // listVirtualKeys — GET /api/tenants/{tenant_id}/governance/virtual-keys
  func (h *TenantVirtualKeyHandler) listVirtualKeys(ctx *fasthttp.RequestCtx) {
  	tid, ok := tenantIDFromCtx(ctx)
+@@ -353,6 +594,7 @@ func (h *TenantVirtualKeyHandler) deleteVirtualKey(ctx *fasthttp.RequestCtx) {
+ 	if h.vkInvalidator != nil && deletedValue != "" {
+ 		h.vkInvalidator.Invalidate(deletedValue)
+ 	}
++	h.removeGovernanceVK(ctx, vkID)
+ 	// UI's deleteVirtualKey mutation is typed as {message: string};
+ 	// matches the legacy /api/governance/virtual-keys/{id} DELETE.
+ 	SendJSON(ctx, map[string]any{"message": "Virtual key deleted successfully"})
 diff --git a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
-index ec92eb613..3847e1072 100644
+index ec92eb613..c14667838 100644
 --- a/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
 +++ b/transports/bifrost-http/handlers/tenant_virtualkeys_test.go
 @@ -9,6 +9,7 @@ import (
@@ -472,7 +586,58 @@ index ec92eb613..3847e1072 100644
  	"github.com/maximhq/bifrost/framework/configstore"
  	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
  	"github.com/maximhq/bifrost/multitenant"
-@@ -171,6 +172,143 @@ func TestTenantVirtualKeyHandler_NewWithNilStore(t *testing.T) {
+@@ -52,7 +53,7 @@ func newTenantVKCtx(t *testing.T, body string, tid string) *fasthttp.RequestCtx
+ func TestTenantVirtualKeyHandler_Create_HappyPath_ServerMintsValue(t *testing.T) {
+ 	store := &stubVKStore{}
+ 	evictor := &stubEvictor{}
+-	h, err := NewTenantVirtualKeyHandler(store, evictor, nil)
++	h, err := NewTenantVirtualKeyHandler(store, evictor, nil, nil)
+ 	if err != nil {
+ 		t.Fatalf("NewTenantVirtualKeyHandler: %v", err)
+ 	}
+@@ -104,7 +105,7 @@ func TestTenantVirtualKeyHandler_Create_HappyPath_ServerMintsValue(t *testing.T)
+ 
+ func TestTenantVirtualKeyHandler_Create_RespectsExplicitValue(t *testing.T) {
+ 	store := &stubVKStore{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"name": "ci-vk-2", "value": "sk-bf-fixture-value"})
+ 	ctx := newTenantVKCtx(t, string(body), "acme")
+@@ -123,7 +124,7 @@ func TestTenantVirtualKeyHandler_Create_RespectsExplicitValue(t *testing.T) {
+ 
+ func TestTenantVirtualKeyHandler_Create_MissingName(t *testing.T) {
+ 	store := &stubVKStore{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 
+ 	ctx := newTenantVKCtx(t, `{}`, "acme")
+ 
+@@ -139,7 +140,7 @@ func TestTenantVirtualKeyHandler_Create_MissingName(t *testing.T) {
+ 
+ func TestTenantVirtualKeyHandler_Create_MissingTenantCtx(t *testing.T) {
+ 	store := &stubVKStore{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"name": "x"})
+ 	ctx := newTenantVKCtx(t, string(body), "")
+@@ -153,7 +154,7 @@ func TestTenantVirtualKeyHandler_Create_MissingTenantCtx(t *testing.T) {
+ 
+ func TestTenantVirtualKeyHandler_Create_StoreError_AlreadyExists(t *testing.T) {
+ 	store := &stubVKStore{createErr: configstore.ErrAlreadyExists}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"name": "dup"})
+ 	ctx := newTenantVKCtx(t, string(body), "acme")
+@@ -166,11 +167,148 @@ func TestTenantVirtualKeyHandler_Create_StoreError_AlreadyExists(t *testing.T) {
+ }
+ 
+ func TestTenantVirtualKeyHandler_NewWithNilStore(t *testing.T) {
+-	if _, err := NewTenantVirtualKeyHandler(nil, nil, nil); err == nil {
++	if _, err := NewTenantVirtualKeyHandler(nil, nil, nil, nil); err == nil {
+ 		t.Fatal("nil store should error")
  	}
  }
  
@@ -526,7 +691,7 @@ index ec92eb613..3847e1072 100644
 +			schemas.ModelProvider("qwen"): {},
 +		},
 +	}
-+	h, err := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, err := NewTenantVirtualKeyHandler(store, nil, nil, nil)
 +	if err != nil {
 +		t.Fatalf("NewTenantVirtualKeyHandler: %v", err)
 +	}
@@ -596,7 +761,7 @@ index ec92eb613..3847e1072 100644
 +			schemas.ModelProvider("openai"): {},
 +		},
 +	}
-+	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
 +
 +	body, _ := sonic.Marshal(map[string]any{
 +		"name": "rich-vk-bad-provider",
@@ -616,6 +781,91 @@ index ec92eb613..3847e1072 100644
  // stubVKStore extensions to back GET single + PUT tests.
  
  func (s *stubVKStore) GetVirtualKeyByIDForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableVirtualKey, error) {
+@@ -206,7 +344,7 @@ func TestTenantVirtualKeyHandler_Update_HappyPath_Evicts(t *testing.T) {
+ 		ID: "vk-1", TenantID: "acme", Name: "alpha", Value: "sk-bf-alpha", IsActive: &isActive, Description: "before",
+ 	})
+ 	evictor := &stubEvictor{}
+-	h, _ := NewTenantVirtualKeyHandler(store, evictor, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, evictor, nil, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"description": "after"})
+ 	var req fasthttp.Request
+@@ -241,7 +379,7 @@ func TestTenantVirtualKeyHandler_Update_CrossTenantReturns404(t *testing.T) {
+ 	store.created = append(store.created, &configstoreTables.TableVirtualKey{
+ 		ID: "vk-secret", TenantID: "globex", Name: "secret", Value: "sk-bf-secret", IsActive: &isActive,
+ 	})
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"description": "hijack"})
+ 	var req fasthttp.Request
+@@ -269,7 +407,7 @@ func TestTenantVirtualKeyHandler_Update_CrossTenantReturns404(t *testing.T) {
+ func TestTenantVirtualKeyHandler_Update_RejectsEmptyBody(t *testing.T) {
+ 	store := &stubVKStore{}
+ 	store.created = append(store.created, &configstoreTables.TableVirtualKey{ID: "vk-1", TenantID: "acme"})
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, nil, nil)
+ 
+ 	var req fasthttp.Request
+ 	req.SetRequestURI("/api/tenants/acme/governance/virtual-keys/vk-1")
+@@ -295,7 +433,7 @@ var _ = errors.New
+ func TestTenantVirtualKeyHandler_Create_EvictsTenantRuntime(t *testing.T) {
+ 	store := &stubVKStore{}
+ 	evictor := &stubEvictor{}
+-	h, _ := NewTenantVirtualKeyHandler(store, evictor, nil)
++	h, _ := NewTenantVirtualKeyHandler(store, evictor, nil, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"name": "vk"})
+ 	ctx := newTenantVKCtx(t, string(body), "acme")
+@@ -341,7 +479,7 @@ func (s *stubVKStore) DeleteVirtualKeyForTenant(_ context.Context, tenantID, id
+ func TestTenantVirtualKeyHandler_Create_InvalidatesResolverCache(t *testing.T) {
+ 	store := &stubVKStore{}
+ 	inv := &stubVKInvalidator{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, inv)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, inv, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"name": "vk-new", "value": "sk-bf-explicit"})
+ 	ctx := newTenantVKCtx(t, string(body), "acme")
+@@ -365,7 +503,7 @@ func TestTenantVirtualKeyHandler_Update_InvalidatesResolverCache(t *testing.T) {
+ 		ID: "vk-1", TenantID: "acme", Name: "alpha", Value: "sk-bf-alpha", IsActive: &isActive,
+ 	})
+ 	inv := &stubVKInvalidator{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, inv)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, inv, nil)
+ 
+ 	body, _ := sonic.Marshal(map[string]any{"is_active": false})
+ 	var req fasthttp.Request
+@@ -396,7 +534,7 @@ func TestTenantVirtualKeyHandler_Delete_InvalidatesResolverCacheUsingPreDeleteVa
+ 		ID: "vk-1", TenantID: "acme", Name: "alpha", Value: "sk-bf-alpha", IsActive: &isActive,
+ 	})
+ 	inv := &stubVKInvalidator{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, inv)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, inv, nil)
+ 
+ 	var req fasthttp.Request
+ 	req.SetRequestURI("/api/tenants/acme/governance/virtual-keys/vk-1")
+@@ -431,7 +569,7 @@ func TestTenantVirtualKeyHandler_Delete_InvalidatesResolverCacheUsingPreDeleteVa
+ func TestTenantVirtualKeyHandler_Delete_NoInvalidatorWhenLookupReturnsNotFound(t *testing.T) {
+ 	store := &stubVKStore{} // empty — GetVirtualKeyByIDForTenant returns ErrNotFound
+ 	inv := &stubVKInvalidator{}
+-	h, _ := NewTenantVirtualKeyHandler(store, nil, inv)
++	h, _ := NewTenantVirtualKeyHandler(store, nil, inv, nil)
+ 
+ 	var req fasthttp.Request
+ 	req.SetRequestURI("/api/tenants/acme/governance/virtual-keys/nope")
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index ee5f2bb80..ca5a3c13d 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1369,7 +1369,7 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 		}
+ 		tenantProviderHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
+ 
+-		tenantVKHandler, err := handlers.NewTenantVirtualKeyHandler(s.Config.ConfigStore, s.multitenantManager, s.multitenantVKResolver)
++		tenantVKHandler, err := handlers.NewTenantVirtualKeyHandler(s.Config.ConfigStore, s.multitenantManager, s.multitenantVKResolver, s)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to initialize tenant virtual key handler: %v", err)
+ 		}
 -- 
 2.51.0
 

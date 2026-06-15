@@ -1,7 +1,7 @@
-From 84a67cc7a27c0af8cc72aeb31dce538cde0dea23 Mon Sep 17 00:00:00 2001
+From 3184d99ea9b11aa36ac954fa9b2041d9758113aa Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 08:58:14 -0600
-Subject: [PATCH 3/4] configstore+transports+plugins: logs tenant_id column +
+Subject: [PATCH 35/42] configstore+transports+plugins: logs tenant_id column +
  filter (Stage 4)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -55,13 +55,13 @@ Guard test:
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
  framework/logstore/migrations.go              | 52 +++++++++++++++++++
- framework/logstore/rdb.go                     |  3 ++
+ framework/logstore/rdb.go                     |  7 +++
  framework/logstore/tables.go                  | 14 +++++
  .../logstore/tenant_id_migration_test.go      | 37 +++++++++++++
  plugins/logging/main.go                       |  9 +++-
  plugins/logging/writer.go                     |  9 ++++
  transports/bifrost-http/handlers/logging.go   | 21 ++++++++
- 7 files changed, 144 insertions(+), 1 deletion(-)
+ 7 files changed, 148 insertions(+), 1 deletion(-)
  create mode 100644 framework/logstore/tenant_id_migration_test.go
 
 diff --git a/framework/logstore/migrations.go b/framework/logstore/migrations.go
@@ -135,7 +135,7 @@ index b7e8a8843..e2da105d8 100644
  // columns to the logs table for node usage recovery in clustered deployments.
  func migrationAddClusterGovernanceColumns(ctx context.Context, db *gorm.DB) error {
 diff --git a/framework/logstore/rdb.go b/framework/logstore/rdb.go
-index 9bc8dab89..77a0dfdd8 100644
+index 9bc8dab89..329c178e7 100644
 --- a/framework/logstore/rdb.go
 +++ b/framework/logstore/rdb.go
 @@ -132,6 +132,9 @@ func (s *RDBLogStore) applyFilters(baseQuery *gorm.DB, filters SearchFilters) *g
@@ -148,6 +148,17 @@ index 9bc8dab89..77a0dfdd8 100644
  	if len(filters.RoutingEngineUsed) > 0 {
  		// Query routing engines (comma-separated values) - find logs containing ANY of the specified engines
  		dialect := s.db.Dialector.Name()
+@@ -766,6 +769,10 @@ func (s *RDBLogStore) listSelectColumns() string {
+ 		"routing_engines_used", "routing_rule_id", "routing_rule_name",
+ 		"user_id", "team_id", "team_name", "customer_id", "customer_name",
+ 		"business_unit_id", "business_unit_name",
++		// tenant_id (Stage 4 multi-tenant): without this, the dashboard's
++		// per-tenant filter strips every row even when the column is
++		// populated, because list responses come back with tenant_id=null.
++		"tenant_id",
+ 		"speech_input", "transcription_input", "image_generation_input", "video_generation_input",
+ 		"latency", "token_usage", "cost", "status", "error_details", "stream",
+ 		"content_summary", "metadata", "cache_debug",
 diff --git a/framework/logstore/tables.go b/framework/logstore/tables.go
 index 52a77afae..f48d42387 100644
 --- a/framework/logstore/tables.go

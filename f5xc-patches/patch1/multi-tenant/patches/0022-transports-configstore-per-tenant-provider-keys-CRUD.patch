@@ -1,8 +1,8 @@
-From f679c808cb122d0c4a7f852ce5f3ab4f6364e8f2 Mon Sep 17 00:00:00 2001
+From 2f33faba0d63fba0d7289aebd27f02a88e1f5f91 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Sun, 14 Jun 2026 19:57:24 -0600
-Subject: [PATCH] transports+configstore: per-tenant provider keys CRUD under
- /api/tenants/{tid}/providers/{provider}/keys
+Subject: [PATCH 22/42] transports+configstore: per-tenant provider keys CRUD
+ under /api/tenants/{tid}/providers/{provider}/keys
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

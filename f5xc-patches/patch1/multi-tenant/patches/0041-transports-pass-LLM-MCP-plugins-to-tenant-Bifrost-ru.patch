@@ -1,42 +1,33 @@
-From 4815f118a8891c235039ae1445e52f684b02b80f Mon Sep 17 00:00:00 2001
+From 8712738b5b7466870617a37b8161739421369894 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
-Date: Mon, 15 Jun 2026 16:00:14 -0600
-Subject: [PATCH] multitenant: don't tear down shared plugins when a tenant
- runtime evicts
+Date: Mon, 15 Jun 2026 10:34:00 -0600
+Subject: [PATCH 41/42] transports: pass LLM + MCP plugins to tenant Bifrost
+ runtime
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-bifrost.Bifrost.Shutdown() iterates over its plugins and calls
-plugin.Cleanup() on each.  Patch 0042 (pass LLMPlugins / MCPPlugins
-to the tenant Bifrost) routed the SAME plugin instances the root
-runtime owns into every per-tenant runtime, on the assumption they
-were stateless wrappers.  They're not.  The logging plugin owns the
-logstore writer; the governance plugin owns its in-memory tracker;
-the telemetry plugin owns the metrics pipeline.  The first time a
-tenant runtime got evicted (any admin write that touches the tenant
-configstore — e.g. add-key — calls evictor.Evict(tid)), its
-Shutdown() ran Cleanup() on those shared plugins.  After that point
-NOTHING logged anywhere in the process — root or tenant, success or
-error — because the writer was closed.
+The tenant loader produced a BifrostConfig with only Account + MCPConfig,
+so per-tenant Bifrost runtimes ran with no plugins at all:
 
-Repro on the bm cluster: pre-eviction tenant /v1 success logs to
-/api/logs cleanly; create a key (triggers Evict); every subsequent
-/v1 call returns 200 but no log row is ever written.
+  - logging plugin not attached → /v1 calls routed through a tenant
+    runtime never wrote a row to logs (dashboard's tenant_id-filtered
+    view stayed empty even with Stage 4 stamping wired)
+  - governance plugin not attached → budget / rate-limit enforcement
+    silently skipped for tenant traffic
+  - telemetry plugin not attached → no metrics for tenant traffic
 
-Fix: wrap each plugin in a forwarding shim (sharedLLMPlugin /
-sharedMCPPlugin) before handing them to the tenant bifrost.Init.
-The shim forwards every Pre/Post hook to the underlying instance but
-turns Cleanup into a no-op, so per-tenant Shutdown can't tear down
-the resources the root runtime still depends on.  The root runtime
-still owns the original plugins and runs the real Cleanup at process
-shutdown.
+LLM + MCP plugin slots are stateless wrappers over shared logstore /
+config; the same instances are safe to share with the root Bifrost
+client.  Pass them (plus the shared logger) through the tenant loader
+so every tenant runtime exercises the same plugin chain the root
+runtime does.
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
  multitenant/plugin_share.go              | 82 ++++++++++++++++++++++++
- transports/bifrost-http/server/server.go | 21 +++---
- 2 files changed, 95 insertions(+), 8 deletions(-)
+ transports/bifrost-http/server/server.go | 19 +++++-
+ 2 files changed, 99 insertions(+), 2 deletions(-)
  create mode 100644 multitenant/plugin_share.go
 
 diff --git a/multitenant/plugin_share.go b/multitenant/plugin_share.go
@@ -128,19 +119,14 @@ index 000000000..559db596a
 +	return out
 +}
 diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
-index 74931839b..fd2da2bac 100644
+index ca5a3c13d..286141591 100644
 --- a/transports/bifrost-http/server/server.go
 +++ b/transports/bifrost-http/server/server.go
-@@ -1217,17 +1217,22 @@ func (s *BifrostHTTPServer) ensureMultiTenantInitialized(ctx context.Context) er
+@@ -1216,9 +1216,24 @@ func (s *BifrostHTTPServer) ensureMultiTenantInitialized(ctx context.Context) er
+ 		if err != nil {
  			return schemas.BifrostConfig{}, fmt.Errorf("load MCP config for tenant %q: %w", tid, err)
  		}
- 		// Plugins (logging, governance, telemetry, etc.) are shared with
--		// the root Bifrost instance — they're stateless wrappers around
--		// the shared logstore / config and need to run on every request
--		// regardless of which Bifrost.Client handles it.  Without this,
--		// tenant-routed /v1 calls bypass logging entirely (dashboard
--		// shows zero rows even with tenant_id stamping wired up) and
--		// budget / rate-limit enforcement is silently skipped.
++		// Plugins (logging, governance, telemetry, etc.) are shared with
 +		// the root Bifrost instance — they own the logstore writer, the
 +		// in-memory governance state, the telemetry pipeline, all of which
 +		// need to run on every request regardless of which Bifrost.Client
@@ -153,15 +139,16 @@ index 74931839b..fd2da2bac 100644
 +		// the first tenant eviction tears down the logging writer for
 +		// the WHOLE process and nothing logs anymore.
  		return schemas.BifrostConfig{
- 			Account:    lib.NewTenantScopedAccount(providers),
- 			MCPConfig:  mcpConfig,
--			LLMPlugins: s.Config.GetLoadedLLMPlugins(),
--			MCPPlugins: s.Config.GetLoadedMCPPlugins(),
+-			Account:   lib.NewTenantScopedAccount(providers),
+-			MCPConfig: mcpConfig,
++			Account:    lib.NewTenantScopedAccount(providers),
++			MCPConfig:  mcpConfig,
 +			LLMPlugins: multitenant.ShareLLMPlugins(s.Config.GetLoadedLLMPlugins()),
 +			MCPPlugins: multitenant.ShareMCPPlugins(s.Config.GetLoadedMCPPlugins()),
- 			Logger:     logger,
++			Logger:     logger,
  		}, nil
  	}
+ 
 -- 
 2.51.0
 

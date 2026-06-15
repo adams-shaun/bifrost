@@ -1,7 +1,7 @@
-From 4db393065415fdf410184cc4e0fd0ebba5989964 Mon Sep 17 00:00:00 2001
+From d897237345283e815808c5139e643e297a3f1ddb Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Fri, 12 Jun 2026 14:59:27 -0600
-Subject: [PATCH] transports+configstore: POST
+Subject: [PATCH 16/42] transports+configstore: POST
  /api/tenants/{tenant_id}/providers (admin create per-tenant provider)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

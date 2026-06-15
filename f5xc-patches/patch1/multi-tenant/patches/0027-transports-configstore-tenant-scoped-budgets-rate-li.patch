@@ -1,8 +1,8 @@
-From 62225ca500c77a69962add8d3144efe9881522f1 Mon Sep 17 00:00:00 2001
+From 6b684f146158d4f8d2546eead2908eaa53d9c6f4 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 02:17:13 -0600
-Subject: [PATCH] transports+configstore: tenant-scoped budgets + rate limits
- CRUD (batched)
+Subject: [PATCH 27/42] transports+configstore: tenant-scoped budgets + rate
+ limits CRUD (batched)
 
 Completes the per-tenant admin surface over all governance metadata
 entities. Mirrors the team / customer pattern: delegate-then-verify

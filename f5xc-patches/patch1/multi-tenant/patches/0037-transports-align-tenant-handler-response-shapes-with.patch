@@ -1,8 +1,8 @@
-From 2db24150f87d322fc1947c8ef6f24598cf66c6fa Mon Sep 17 00:00:00 2001
+From 5b6a259017d5c5a500f368850802cab08b7cb221 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Mon, 15 Jun 2026 09:16:55 -0600
-Subject: [PATCH] transports: align tenant handler response shapes with legacy
- + UI contracts
+Subject: [PATCH 37/42] transports: align tenant handler response shapes with
+ legacy + UI contracts
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

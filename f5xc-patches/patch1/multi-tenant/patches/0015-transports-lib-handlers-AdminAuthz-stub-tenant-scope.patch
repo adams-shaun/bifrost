@@ -1,8 +1,8 @@
-From 8d15a1ac2d5f69a05f7b404864e854ee7dc028e9 Mon Sep 17 00:00:00 2001
+From 3707a8a72b846a052a6ac52e70b8aa413dddbc70 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Fri, 12 Jun 2026 14:42:52 -0600
-Subject: [PATCH] transports/lib+handlers: AdminAuthz stub + tenant-scoped
- admin middleware
+Subject: [PATCH 15/42] transports/lib+handlers: AdminAuthz stub +
+ tenant-scoped admin middleware
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

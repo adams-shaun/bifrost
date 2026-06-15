@@ -1,7 +1,7 @@
-From c64547c896eaa5bf4517f3973c264f57c87f24ea Mon Sep 17 00:00:00 2001
+From 050e9f5e01e7b3ce66475b04d9fc7397148ca47b Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Thu, 11 Jun 2026 17:38:38 -0600
-Subject: [PATCH 07/14] configstore: add TenantRepository CRUD on ConfigStore
+Subject: [PATCH 07/42] configstore: add TenantRepository CRUD on ConfigStore
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
