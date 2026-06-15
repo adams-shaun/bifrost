@@ -1,0 +1,706 @@
+From 4592ba9c8dfde4e7715cd579bbc17381793d7903 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Sun, 14 Jun 2026 22:22:49 -0600
+Subject: [PATCH] transports+configstore: tenant-scoped customers CRUD under
+ /api/tenants/{tid}/governance/customers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirror of patch 0025 for the customer entity. Same delegate-then-
+verify pattern with tenant_id re-pinning to defend against migration
+via PUT. Customers are also tagging metadata (not request-path state)
+so the runtime evictor is not wired here — mutations show up on
+subsequent admin reads + on any VK whose customer_id pointer the
+operator updates.
+
+Routes:
+  POST   /api/tenants/{tid}/governance/customers
+  GET    /api/tenants/{tid}/governance/customers
+  GET    /api/tenants/{tid}/governance/customers/{customer_id}
+  PUT    /api/tenants/{tid}/governance/customers/{customer_id}
+  DELETE /api/tenants/{tid}/governance/customers/{customer_id}
+
+configstore additions: CreateCustomerForTenant, GetCustomersByTenant,
+GetCustomerByIDForTenant, UpdateCustomerForTenant,
+DeleteCustomerForTenant + MockConfigStore stubs + 2 configstore tests
+(full CRUD across two tenants + malicious payload defense).
+Transport: TenantCustomersHandler with 7 handler tests.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  72 ++++++
+ framework/configstore/rdb_test.go             |  57 +++++
+ framework/configstore/store.go                |  13 +
+ .../bifrost-http/handlers/tenant_customers.go | 189 +++++++++++++++
+ .../handlers/tenant_customers_test.go         | 228 ++++++++++++++++++
+ transports/bifrost-http/lib/config_test.go    |  20 ++
+ transports/bifrost-http/server/server.go      |   6 +
+ 7 files changed, 585 insertions(+)
+ create mode 100644 transports/bifrost-http/handlers/tenant_customers.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_customers_test.go
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 0680d87df..053fb8ae6 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -3830,6 +3830,67 @@ func (s *RDBConfigStore) CreateCustomer(ctx context.Context, customer *tables.Ta
+ 	return nil
+ }
+ 
++// CreateCustomerForTenant pins tenant_id on the new row before delegating.
++func (s *RDBConfigStore) CreateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if customer == nil {
++		return ErrNotFound
++	}
++	customer.TenantID = tenantID
++	return s.CreateCustomer(ctx, customer, tx...)
++}
++
++// GetCustomersByTenant lists customers scoped to a tenant.
++func (s *RDBConfigStore) GetCustomersByTenant(ctx context.Context, tenantID string) ([]tables.TableCustomer, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	var customers []tables.TableCustomer
++	if err := preloadCustomerRelations(s.ScopedDB(ctx), "").
++		Where("governance_customers.tenant_id = ?", tenantID).
++		Order("created_at ASC").
++		Find(&customers).Error; err != nil {
++		return nil, err
++	}
++	return customers, nil
++}
++
++// GetCustomerByIDForTenant returns the customer only when its
++// tenant_id matches; otherwise ErrNotFound.
++func (s *RDBConfigStore) GetCustomerByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableCustomer, error) {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	c, err := s.GetCustomer(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if c.TenantID != tenantID {
++		return nil, ErrNotFound
++	}
++	return c, nil
++}
++
++// UpdateCustomerForTenant verifies ownership before delegating.
++// tenant_id is re-pinned on the row to prevent migration via PUT.
++func (s *RDBConfigStore) UpdateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if customer == nil || customer.ID == "" {
++		return ErrNotFound
++	}
++	existing, err := s.GetCustomerByIDForTenant(ctx, tenantID, customer.ID)
++	if err != nil {
++		return err
++	}
++	customer.ID = existing.ID
++	customer.TenantID = tenantID
++	return s.UpdateCustomer(ctx, customer, tx...)
++}
++
+ // UpdateCustomer updates an existing customer in the database.
+ func (s *RDBConfigStore) UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error {
+ 	var txDB *gorm.DB
+@@ -3845,6 +3906,17 @@ func (s *RDBConfigStore) UpdateCustomer(ctx context.Context, customer *tables.Ta
+ }
+ 
+ // DeleteCustomer deletes a customer from the database.
++// DeleteCustomerForTenant verifies ownership before delegating.
++func (s *RDBConfigStore) DeleteCustomerForTenant(ctx context.Context, tenantID, id string) error {
++	if tenantID == "" {
++		tenantID = tables.DefaultTenantID
++	}
++	if _, err := s.GetCustomerByIDForTenant(ctx, tenantID, id); err != nil {
++		return err
++	}
++	return s.DeleteCustomer(ctx, id)
++}
++
+ func (s *RDBConfigStore) DeleteCustomer(ctx context.Context, id string) error {
+ 	if err := s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+ 		var customer tables.TableCustomer
+diff --git a/framework/configstore/rdb_test.go b/framework/configstore/rdb_test.go
+index 7331490ad..a5cbf087e 100644
+--- a/framework/configstore/rdb_test.go
++++ b/framework/configstore/rdb_test.go
+@@ -2191,6 +2191,63 @@ func TestDeleteVirtualKeyForTenant_OnlyOwnTenant(t *testing.T) {
+ 	assert.ErrorIs(t, err, ErrNotFound)
+ }
+ 
++// TestCustomersCRUDForTenant covers the full happy path on the
++// tenant-scoped customer CRUD: create + list-by-tenant returns own
++// rows, update flips a field, delete removes from the tenant's view
++// but cross-tenant delete probes are refused with ErrNotFound.
++func TestCustomersCRUDForTenant(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	require.NoError(t, store.CreateCustomerForTenant(ctx, "acme", &tables.TableCustomer{ID: "c-acme", Name: "Acme Inc"}))
++	require.NoError(t, store.CreateCustomerForTenant(ctx, "globex", &tables.TableCustomer{ID: "c-globex", Name: "Globex Inc"}))
++
++	acme, err := store.GetCustomersByTenant(ctx, "acme")
++	require.NoError(t, err)
++	assert.Len(t, acme, 1)
++	assert.Equal(t, "Acme Inc", acme[0].Name)
++
++	globex, err := store.GetCustomersByTenant(ctx, "globex")
++	require.NoError(t, err)
++	assert.Len(t, globex, 1)
++
++	_, err = store.GetCustomerByIDForTenant(ctx, "acme", "c-globex")
++	assert.ErrorIs(t, err, ErrNotFound)
++
++	require.NoError(t, store.UpdateCustomerForTenant(ctx, "acme", &tables.TableCustomer{ID: "c-acme", Name: "Acme LLC"}))
++	after, err := store.GetCustomerByIDForTenant(ctx, "acme", "c-acme")
++	require.NoError(t, err)
++	assert.Equal(t, "Acme LLC", after.Name)
++
++	err = store.DeleteCustomerForTenant(ctx, "acme", "c-globex")
++	assert.ErrorIs(t, err, ErrNotFound)
++	_, err = store.GetCustomerByIDForTenant(ctx, "globex", "c-globex")
++	require.NoError(t, err)
++
++	require.NoError(t, store.DeleteCustomerForTenant(ctx, "acme", "c-acme"))
++	_, err = store.GetCustomerByIDForTenant(ctx, "acme", "c-acme")
++	assert.ErrorIs(t, err, ErrNotFound)
++}
++
++// TestUpdateCustomerForTenant_RepinsTenantOnPayload defends against
++// a malicious payload that tries to migrate a customer into another
++// tenant via PUT.
++func TestUpdateCustomerForTenant_RepinsTenantOnPayload(t *testing.T) {
++	store := setupRDBTestStore(t)
++	ctx := context.Background()
++
++	require.NoError(t, store.CreateCustomerForTenant(ctx, "acme", &tables.TableCustomer{ID: "c-1", Name: "Acme"}))
++
++	bad := &tables.TableCustomer{ID: "c-1", Name: "Acme-Renamed", TenantID: "globex"}
++	require.NoError(t, store.UpdateCustomerForTenant(ctx, "acme", bad))
++
++	_, err := store.GetCustomerByIDForTenant(ctx, "globex", "c-1")
++	assert.ErrorIs(t, err, ErrNotFound)
++	stillAcme, err := store.GetCustomerByIDForTenant(ctx, "acme", "c-1")
++	require.NoError(t, err)
++	assert.Equal(t, "acme", stillAcme.TenantID)
++}
++
+ // TestTeamsCRUDForTenant covers the full happy path on the
+ // tenant-scoped team CRUD: create + list-by-tenant returns own rows,
+ // update flips a field, delete removes from the tenant's view but
+diff --git a/framework/configstore/store.go b/framework/configstore/store.go
+index ae06a2101..5aafd4e7e 100644
+--- a/framework/configstore/store.go
++++ b/framework/configstore/store.go
+@@ -308,8 +308,21 @@ type ConfigStore interface {
+ 	GetCustomersPaginated(ctx context.Context, params CustomersQueryParams) ([]tables.TableCustomer, int64, error)
+ 	GetCustomer(ctx context.Context, id string) (*tables.TableCustomer, error)
+ 	CreateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
++	// CreateCustomerForTenant pins tenant_id on the new TableCustomer row.
++	CreateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error
+ 	UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
++	// UpdateCustomerForTenant verifies tenant ownership, re-pins
++	// tenant_id, delegates to UpdateCustomer.
++	UpdateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error
+ 	DeleteCustomer(ctx context.Context, id string) error
++	// DeleteCustomerForTenant verifies tenant ownership and delegates
++	// to DeleteCustomer. Cross-tenant probes return ErrNotFound.
++	DeleteCustomerForTenant(ctx context.Context, tenantID, id string) error
++	// GetCustomersByTenant lists customers scoped to a tenant.
++	GetCustomersByTenant(ctx context.Context, tenantID string) ([]tables.TableCustomer, error)
++	// GetCustomerByIDForTenant returns the customer only when its
++	// tenant_id matches; otherwise ErrNotFound.
++	GetCustomerByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableCustomer, error)
+ 
+ 	// Tenant CRUD — the platform-level isolation boundary above governance.
+ 	// DeleteTenant refuses with ErrTenantNotEmpty if any governance / config
+diff --git a/transports/bifrost-http/handlers/tenant_customers.go b/transports/bifrost-http/handlers/tenant_customers.go
+new file mode 100644
+index 000000000..f4c46b513
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_customers.go
+@@ -0,0 +1,189 @@
++// Package handlers — tenant-scoped governance customer admin.
++//
++// Mounts CRUD under /api/tenants/{tenant_id}/governance/customers. Like
++// teams, customers are tagging/grouping metadata so the runtime evictor
++// pattern from the inference-plane handlers is intentionally not wired
++// here.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	"github.com/google/uuid"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++type TenantCustomersHandler struct {
++	configStore configstore.ConfigStore
++}
++
++func NewTenantCustomersHandler(configStore configstore.ConfigStore) (*TenantCustomersHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &TenantCustomersHandler{configStore: configStore}, nil
++}
++
++func (h *TenantCustomersHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	if h.configStore == nil {
++		return
++	}
++	r.GET("/api/tenants/{tenant_id}/governance/customers", lib.ChainMiddlewares(h.listCustomers, middlewares...))
++	r.POST("/api/tenants/{tenant_id}/governance/customers", lib.ChainMiddlewares(h.createCustomer, middlewares...))
++	r.GET("/api/tenants/{tenant_id}/governance/customers/{customer_id}", lib.ChainMiddlewares(h.getCustomer, middlewares...))
++	r.PUT("/api/tenants/{tenant_id}/governance/customers/{customer_id}", lib.ChainMiddlewares(h.updateCustomer, middlewares...))
++	r.DELETE("/api/tenants/{tenant_id}/governance/customers/{customer_id}", lib.ChainMiddlewares(h.deleteCustomer, middlewares...))
++}
++
++type CreateTenantCustomerRequest struct {
++	ID   string `json:"id,omitempty"`
++	Name string `json:"name"`
++}
++
++type UpdateTenantCustomerRequest struct {
++	Name *string `json:"name,omitempty"`
++}
++
++func (h *TenantCustomersHandler) listCustomers(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	customers, err := h.configStore.GetCustomersByTenant(ctx, string(tid))
++	if err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to list customers: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{
++		"tenant_id": string(tid),
++		"customers": customers,
++		"total":     len(customers),
++	})
++}
++
++func (h *TenantCustomersHandler) createCustomer(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	var req CreateTenantCustomerRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
++		return
++	}
++	if req.ID == "" {
++		req.ID = uuid.NewString()
++	}
++	customer := &configstoreTables.TableCustomer{
++		ID:   req.ID,
++		Name: req.Name,
++	}
++	if err := h.configStore.CreateCustomerForTenant(ctx, string(tid), customer); err != nil {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Customer %s already exists for tenant %s", req.Name, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create customer: %v", err))
++		return
++	}
++	SendJSONWithStatus(ctx, customer, fasthttp.StatusCreated)
++}
++
++func (h *TenantCustomersHandler) getCustomer(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	customerID, _ := ctx.UserValue("customer_id").(string)
++	if customerID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "customer_id is required")
++		return
++	}
++	customer, err := h.configStore.GetCustomerByIDForTenant(ctx, string(tid), customerID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Customer %s not found for tenant %s", customerID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get customer: %v", err))
++		return
++	}
++	SendJSON(ctx, customer)
++}
++
++func (h *TenantCustomersHandler) updateCustomer(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	customerID, _ := ctx.UserValue("customer_id").(string)
++	if customerID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "customer_id is required")
++		return
++	}
++	var req UpdateTenantCustomerRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
++		return
++	}
++	if req.Name == nil {
++		SendError(ctx, fasthttp.StatusBadRequest, "name is required")
++		return
++	}
++	existing, err := h.configStore.GetCustomerByIDForTenant(ctx, string(tid), customerID)
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Customer %s not found for tenant %s", customerID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to load customer: %v", err))
++		return
++	}
++	existing.Name = *req.Name
++	if err := h.configStore.UpdateCustomerForTenant(ctx, string(tid), existing); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Customer %s not found for tenant %s", customerID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update customer: %v", err))
++		return
++	}
++	SendJSON(ctx, existing)
++}
++
++func (h *TenantCustomersHandler) deleteCustomer(ctx *fasthttp.RequestCtx) {
++	tid, ok := tenantIDFromCtx(ctx)
++	if !ok {
++		SendError(ctx, fasthttp.StatusInternalServerError, "tenant_id missing on ctx — RequireTenantPathMiddleware not mounted?")
++		return
++	}
++	customerID, _ := ctx.UserValue("customer_id").(string)
++	if customerID == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "customer_id is required")
++		return
++	}
++	if err := h.configStore.DeleteCustomerForTenant(ctx, string(tid), customerID); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Customer %s not found for tenant %s", customerID, tid))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete customer: %v", err))
++		return
++	}
++	ctx.SetStatusCode(fasthttp.StatusNoContent)
++}
+diff --git a/transports/bifrost-http/handlers/tenant_customers_test.go b/transports/bifrost-http/handlers/tenant_customers_test.go
+new file mode 100644
+index 000000000..c00515bd4
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_customers_test.go
+@@ -0,0 +1,228 @@
++package handlers
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/bytedance/sonic"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
++)
++
++type stubCustomersStore struct {
++	configstore.ConfigStore
++	mu        sync.Mutex
++	customers []*configstoreTables.TableCustomer
++}
++
++func (s *stubCustomersStore) CreateCustomerForTenant(_ context.Context, tenantID string, c *configstoreTables.TableCustomer, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	cp := *c
++	cp.TenantID = tenantID
++	s.customers = append(s.customers, &cp)
++	return nil
++}
++
++func (s *stubCustomersStore) GetCustomersByTenant(_ context.Context, tenantID string) ([]configstoreTables.TableCustomer, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	var out []configstoreTables.TableCustomer
++	for _, c := range s.customers {
++		if c.TenantID == tenantID {
++			out = append(out, *c)
++		}
++	}
++	return out, nil
++}
++
++func (s *stubCustomersStore) GetCustomerByIDForTenant(_ context.Context, tenantID, id string) (*configstoreTables.TableCustomer, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, c := range s.customers {
++		if c.ID == id && c.TenantID == tenantID {
++			cp := *c
++			return &cp, nil
++		}
++	}
++	return nil, configstore.ErrNotFound
++}
++
++func (s *stubCustomersStore) UpdateCustomerForTenant(_ context.Context, tenantID string, c *configstoreTables.TableCustomer, _ ...*gorm.DB) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, existing := range s.customers {
++		if existing.ID == c.ID && existing.TenantID == tenantID {
++			cp := *c
++			cp.TenantID = tenantID
++			s.customers[i] = &cp
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func (s *stubCustomersStore) DeleteCustomerForTenant(_ context.Context, tenantID, id string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for i, c := range s.customers {
++		if c.ID == id && c.TenantID == tenantID {
++			s.customers = append(s.customers[:i], s.customers[i+1:]...)
++			return nil
++		}
++	}
++	return configstore.ErrNotFound
++}
++
++func newCustomerCtx(t *testing.T, method, path, body, tid, customerID string) *fasthttp.RequestCtx {
++	t.Helper()
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if body != "" {
++		req.SetBodyString(body)
++		req.Header.SetContentType("application/json")
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	if tid != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++	}
++	if customerID != "" {
++		ctx.SetUserValue("customer_id", customerID)
++	}
++	return ctx
++}
++
++func TestTenantCustomersHandler_Create_HappyPath_MintsID(t *testing.T) {
++	store := &stubCustomersStore{}
++	h, err := NewTenantCustomersHandler(store)
++	if err != nil {
++		t.Fatalf("NewTenantCustomersHandler: %v", err)
++	}
++
++	body, _ := sonic.Marshal(map[string]any{"name": "Acme Inc"})
++	ctx := newCustomerCtx(t, fasthttp.MethodPost, "/api/tenants/acme/governance/customers", string(body), "acme", "")
++
++	h.createCustomer(ctx)
++
++	if got, want := ctx.Response.StatusCode(), fasthttp.StatusCreated; got != want {
++		t.Fatalf("status got %d want %d body=%s", got, want, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.customers) != 1 || store.customers[0].Name != "Acme Inc" {
++		t.Fatalf("customer should have been created; got %+v", store.customers)
++	}
++	if store.customers[0].ID == "" {
++		t.Fatal("server should mint id when omitted")
++	}
++	if store.customers[0].TenantID != "acme" {
++		t.Fatalf("tenant_id got %q want acme", store.customers[0].TenantID)
++	}
++}
++
++func TestTenantCustomersHandler_List_FiltersByTenant(t *testing.T) {
++	store := &stubCustomersStore{}
++	store.customers = append(store.customers,
++		&configstoreTables.TableCustomer{ID: "c-1", Name: "Acme", TenantID: "acme"},
++		&configstoreTables.TableCustomer{ID: "c-2", Name: "Globex", TenantID: "globex"},
++	)
++	h, _ := NewTenantCustomersHandler(store)
++
++	ctx := newCustomerCtx(t, fasthttp.MethodGet, "/api/tenants/acme/governance/customers", "", "acme", "")
++
++	h.listCustomers(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	var resp struct {
++		Customers []configstoreTables.TableCustomer `json:"customers"`
++		Total     int                               `json:"total"`
++	}
++	if err := sonic.Unmarshal(ctx.Response.Body(), &resp); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if resp.Total != 1 || resp.Customers[0].Name != "Acme" {
++		t.Fatalf("acme should see one customer (Acme); got %+v", resp.Customers)
++	}
++}
++
++func TestTenantCustomersHandler_Get_CrossTenant_NotFound(t *testing.T) {
++	store := &stubCustomersStore{}
++	store.customers = append(store.customers, &configstoreTables.TableCustomer{ID: "c-g", TenantID: "globex"})
++	h, _ := NewTenantCustomersHandler(store)
++
++	ctx := newCustomerCtx(t, fasthttp.MethodGet, "/api/tenants/acme/governance/customers/c-g", "", "acme", "c-g")
++
++	h.getCustomer(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant GET should be 404; got %d", got)
++	}
++}
++
++func TestTenantCustomersHandler_Update_HappyPath(t *testing.T) {
++	store := &stubCustomersStore{}
++	store.customers = append(store.customers, &configstoreTables.TableCustomer{ID: "c-1", Name: "before", TenantID: "acme"})
++	h, _ := NewTenantCustomersHandler(store)
++
++	body, _ := sonic.Marshal(map[string]any{"name": "after"})
++	ctx := newCustomerCtx(t, fasthttp.MethodPut, "/api/tenants/acme/governance/customers/c-1", string(body), "acme", "c-1")
++
++	h.updateCustomer(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusOK {
++		t.Fatalf("status got %d body=%s", got, string(ctx.Response.Body()))
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.customers[0].Name != "after" {
++		t.Fatalf("name should have flipped; got %q", store.customers[0].Name)
++	}
++}
++
++func TestTenantCustomersHandler_Delete_HappyPath(t *testing.T) {
++	store := &stubCustomersStore{}
++	store.customers = append(store.customers, &configstoreTables.TableCustomer{ID: "c-1", TenantID: "acme"})
++	h, _ := NewTenantCustomersHandler(store)
++
++	ctx := newCustomerCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/governance/customers/c-1", "", "acme", "c-1")
++
++	h.deleteCustomer(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNoContent {
++		t.Fatalf("status got %d", got)
++	}
++}
++
++func TestTenantCustomersHandler_Delete_CrossTenant_NotFound(t *testing.T) {
++	store := &stubCustomersStore{}
++	store.customers = append(store.customers, &configstoreTables.TableCustomer{ID: "c-g", TenantID: "globex"})
++	h, _ := NewTenantCustomersHandler(store)
++
++	ctx := newCustomerCtx(t, fasthttp.MethodDelete, "/api/tenants/acme/governance/customers/c-g", "", "acme", "c-g")
++
++	h.deleteCustomer(ctx)
++
++	if got := ctx.Response.StatusCode(); got != fasthttp.StatusNotFound {
++		t.Fatalf("cross-tenant DELETE should be 404; got %d", got)
++	}
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if len(store.customers) != 1 {
++		t.Fatal("globex's customer should survive cross-tenant delete attempt")
++	}
++}
++
++func TestTenantCustomersHandler_NewWithNilStore(t *testing.T) {
++	if _, err := NewTenantCustomersHandler(nil); err == nil {
++		t.Fatal("nil store should error")
++	}
++}
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index db255a695..8bb724b1c 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -787,6 +787,26 @@ func (m *MockConfigStore) CreateCustomer(ctx context.Context, customer *tables.T
+ 	return nil
+ }
+ 
++func (m *MockConfigStore) CreateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
++	return m.CreateCustomer(ctx, customer, tx...)
++}
++
++func (m *MockConfigStore) UpdateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
++	return m.UpdateCustomer(ctx, customer, tx...)
++}
++
++func (m *MockConfigStore) DeleteCustomerForTenant(ctx context.Context, tenantID, id string) error {
++	return m.DeleteCustomer(ctx, id)
++}
++
++func (m *MockConfigStore) GetCustomersByTenant(ctx context.Context, tenantID string) ([]tables.TableCustomer, error) {
++	return m.GetCustomers(ctx)
++}
++
++func (m *MockConfigStore) GetCustomerByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableCustomer, error) {
++	return m.GetCustomer(ctx, id)
++}
++
+ func (m *MockConfigStore) UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error {
+ 	return nil
+ }
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 64543044e..849bef5fc 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -1363,6 +1363,12 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 			return fmt.Errorf("failed to initialize tenant teams handler: %v", err)
+ 		}
+ 		tenantTeamsHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
++
++		tenantCustomersHandler, err := handlers.NewTenantCustomersHandler(s.Config.ConfigStore)
++		if err != nil {
++			return fmt.Errorf("failed to initialize tenant customers handler: %v", err)
++		}
++		tenantCustomersHandler.RegisterRoutes(s.Router, tenantAdminMiddlewares...)
+ 	}
+ 	if loggingHandler != nil {
+ 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
+-- 
+2.51.0
+
