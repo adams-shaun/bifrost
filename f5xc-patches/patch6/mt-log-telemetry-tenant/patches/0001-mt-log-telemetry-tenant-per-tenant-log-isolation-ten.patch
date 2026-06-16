@@ -1,0 +1,673 @@
+From 23d313db97e5d8426af0c7dcee3f5488bd344963 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 15:36:00 -0600
+Subject: [PATCH] mt-log-telemetry-tenant: per-tenant log isolation + tenant_id
+ Prometheus label
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the cross-tenant data leak in /api/logs* and Prometheus
+metrics. Field-reported symptom: every tenant in the UI saw every
+other tenant's request history because:
+
+  - logstore.Log had no `tenant_id` column.
+  - logstore *gorm.DB had no GORM scope callback registered (patch2's
+    callback was wired into configstore only).
+  - logging plugin's PreLLMHook had the resolver-stamped ctx in hand
+    but had nowhere to put the tenant id.
+  - telemetry plugin's defaultBifrostLabels listed every governance
+    dimension (team, customer, virtual_key, business_unit) EXCEPT
+    tenant — so `bifrost_requests_total` aggregated across tenants.
+
+Storage side
+* framework/logstore/tables.go — `TenantID` field on Log with
+  `default:default` schema default + indexed.
+* framework/logstore/migrations.go — `migrationAddLogsTenantIDColumn`
+  adds the column and backfills 'default' for existing rows.
+  Idempotent (HasColumn guard); rollback drops the column.
+* framework/logstore/tenant_scope.go (new) — mirror of configstore's
+  scope callback. The two packages cycle on direct imports
+  (configstore -> logstore for log writes; logstore ->
+  configstore/tables for VK joins), so the ~80 lines of callback are
+  duplicated here rather than shared via a third package — that
+  refactor is a separate cleanup, this patch is the minimum-viable
+  isolation fix.
+* framework/logstore/sqlite.go + postgres.go — call
+  RegisterTenantScopes on the runtime *gorm.DB immediately after open
+  (after migrations have run on the throwaway / background-ctx pool
+  so the scope predicate doesn't fire on migration paths).
+
+Plugin side
+* plugins/logging/operations.go — insertInitialLogEntry reads the
+  tenant id off BifrostContext and stamps it on the Log struct
+  before CreateIfNotExists. Belt-and-braces with the INSERT scope
+  callback: explicit stamp at construction time is clearer for
+  background paths (async-job completion) than relying on the gorm
+  hook.
+* plugins/logging/go.mod — add multitenant module dep.
+* plugins/telemetry/main.go — add `tenant_id` to defaultBifrostLabels
+  and populate labelValues from BifrostContext. Prometheus treats ""
+  as a valid label value, so single-tenant deployments get an
+  unlabelled "tenant_id=\"\"" bucket without any code changes.
+* plugins/telemetry/go.mod — add multitenant module dep.
+
+Read side
+* No /api/logs handler changes needed. The handlers already go
+  through RDBLogStore.ScopedDB(ctx), so the GORM scope callback fires
+  automatically on every SearchLogs / GetLogStats / etc. query and
+  appends `WHERE logs.tenant_id = '<header>'`.
+
+Regression test
+* framework/logstore/tenant_scope_test.go (new) —
+  TestLogTenantIsolation writes a row as tenant A and asserts tenant
+  B cannot read it via ScopedDB; the INSERT callback also auto-
+  stamps tenant_id from ctx even when the caller leaves the struct
+  field empty. TestLogTenantIsolation_NoCtxTenant covers the single-
+  tenant fallback (no header → scope short-circuits → both rows
+  visible) so we don't regress OSS behaviour.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/logstore/migrations.go        |  52 +++++++
+ framework/logstore/postgres.go          |  12 ++
+ framework/logstore/sqlite.go            |   9 ++
+ framework/logstore/tables.go            |   6 +
+ framework/logstore/tenant_scope.go      | 178 ++++++++++++++++++++++++
+ framework/logstore/tenant_scope_test.go | 134 ++++++++++++++++++
+ plugins/logging/go.mod                  |   4 +
+ plugins/logging/operations.go           |  31 +++++
+ plugins/telemetry/go.mod                |   4 +
+ plugins/telemetry/main.go               |  28 ++++
+ 10 files changed, 458 insertions(+)
+ create mode 100644 framework/logstore/tenant_scope.go
+ create mode 100644 framework/logstore/tenant_scope_test.go
+
+diff --git a/framework/logstore/migrations.go b/framework/logstore/migrations.go
+index b7e8a8843..f8f7c1366 100644
+--- a/framework/logstore/migrations.go
++++ b/framework/logstore/migrations.go
+@@ -333,6 +333,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
+ 	if err := migrationAddClusterGovernanceColumns(ctx, db); err != nil {
+ 		return err
+ 	}
++	if err := migrationAddLogsTenantIDColumn(ctx, db); err != nil {
++		return err
++	}
+ 	// migrationSplitFilterDataMatView is intentionally NOT invoked in this
+ 	// release. Dropping mv_logs_filterdata while old replicas are still
+ 	// serving /api/logs/filterdata from it would surface "relation does not
+@@ -3239,3 +3242,52 @@ func migrationAddClusterGovernanceColumns(ctx context.Context, db *gorm.DB) erro
+ 	}
+ 	return nil
+ }
++
++// migrationAddLogsTenantIDColumn adds the tenant_id column to the logs
++// table and backfills 'default' on every pre-existing row. Idempotent
++// (HasColumn guard). The column carries `default:default` so any row
++// inserted by a process that doesn't carry the tenant header (cron
++// jobs, single-tenant deployments) gets the default tenant
++// automatically; the logstore tenant-scope callback enforces row
++// visibility against `WHERE tenant_id = '<ctx>'`. Without this column,
++// the multi-tenant /api/logs endpoint returns every tenant's data to
++// every tenant — see f5xc-patches/patch6 commit message.
++func migrationAddLogsTenantIDColumn(ctx context.Context, db *gorm.DB) error {
++	opts := *migrator.DefaultOptions
++	opts.UseTransaction = true
++	m := migrator.New(db, &opts, []*migrator.Migration{{
++		ID: "logs_add_tenant_id_column",
++		Migrate: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++			if !mig.HasColumn(&Log{}, "tenant_id") {
++				if err := mig.AddColumn(&Log{}, "TenantID"); err != nil {
++					return err
++				}
++			}
++			// Idempotent backfill — only touches rows the AddColumn
++			// default missed (e.g. dialects that don't honor a NOT
++			// NULL column default on an existing table).
++			if err := tx.Exec(
++				`UPDATE logs SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''`,
++			).Error; err != nil {
++				return fmt.Errorf("backfill logs.tenant_id: %w", err)
++			}
++			return nil
++		},
++		Rollback: func(tx *gorm.DB) error {
++			tx = tx.WithContext(ctx)
++			mig := tx.Migrator()
++			if mig.HasColumn(&Log{}, "tenant_id") {
++				if err := mig.DropColumn(&Log{}, "tenant_id"); err != nil {
++					return err
++				}
++			}
++			return nil
++		},
++	}})
++	if err := m.Migrate(); err != nil {
++		return fmt.Errorf("error while adding logs.tenant_id column: %s", err.Error())
++	}
++	return nil
++}
+diff --git a/framework/logstore/postgres.go b/framework/logstore/postgres.go
+index 2ad7da9e7..b0ca583a3 100644
+--- a/framework/logstore/postgres.go
++++ b/framework/logstore/postgres.go
+@@ -175,6 +175,18 @@ func newPostgresLogStore(ctx context.Context, config *PostgresConfig, logger sch
+ 	}
+ 	sqlDB.SetMaxOpenConns(maxOpenConns)
+ 	d := &RDBLogStore{db: db, logger: logger}
++	// Header-model multi-tenancy: register the GORM callbacks that
++	// turn every existing SELECT/UPDATE/DELETE on a tenant-scoped log
++	// model into `WHERE tenant_id = ?` (from request context) and
++	// stamp tenant_id on every INSERT. Registered on the RUNTIME pool
++	// only — migrations already ran on the throwaway pool above with
++	// context.Background, which would have short-circuited the scope
++	// anyway, but registering on the runtime pool here keeps the
++	// callback off the migration path entirely. See tenant_scope.go.
++	if err := RegisterTenantScopes(db); err != nil {
++		_ = closePool(db)
++		return nil, fmt.Errorf("failed to register tenant-scope callbacks: %w", err)
++	}
+ 
+ 	// Run all index builds sequentially in a single goroutine to prevent
+ 	// deadlocks from concurrent CREATE INDEX CONCURRENTLY on the same table.
+diff --git a/framework/logstore/sqlite.go b/framework/logstore/sqlite.go
+index f413c12aa..d3d75ae89 100644
+--- a/framework/logstore/sqlite.go
++++ b/framework/logstore/sqlite.go
+@@ -42,6 +42,15 @@ func newSqliteLogStore(ctx context.Context, config *SQLiteConfig, logger schemas
+ 	if err := triggerMigrations(ctx, db); err != nil {
+ 		return nil, err
+ 	}
++	// Header-model multi-tenancy: register the GORM callbacks that
++	// turn every existing SELECT/UPDATE/DELETE on a tenant-scoped log
++	// model into `WHERE tenant_id = ?` (from request context) and
++	// stamp tenant_id on every INSERT. Must run AFTER migrations so
++	// the migration path (which uses context.Background) isn't itself
++	// subjected to the scope predicate. See tenant_scope.go.
++	if err := RegisterTenantScopes(db); err != nil {
++		return nil, fmt.Errorf("failed to register tenant-scope callbacks: %w", err)
++	}
+ 
+ 	return s, nil
+ }
+diff --git a/framework/logstore/tables.go b/framework/logstore/tables.go
+index 52a77afae..928e958c3 100644
+--- a/framework/logstore/tables.go
++++ b/framework/logstore/tables.go
+@@ -127,6 +127,12 @@ type SearchStats struct {
+ type Log struct {
+ 	ID                      string    `gorm:"primaryKey;type:varchar(255)" json:"id"`
+ 	ParentRequestID         *string   `gorm:"type:varchar(255);index" json:"parent_request_id"`
++	// TenantID scopes this log row to a tenant for multi-tenant
++	// deployments. Set by the logging plugin from BifrostContext when
++	// the HTTP transport's tenant-resolver middleware stamped one.
++	// Defaults to "default" via the schema default so single-tenant
++	// deployments (and any pre-existing log row) keep working.
++	TenantID                string    `gorm:"type:varchar(255);not null;default:default;index:idx_logs_tenant_id" json:"tenant_id"`
+ 	Timestamp               time.Time `gorm:"index;index:idx_logs_ts_provider_status,priority:1;not null" json:"timestamp"`
+ 	Object                  string    `gorm:"type:varchar(255);index;not null;column:object_type" json:"object"` // text.completion, chat.completion, or embedding
+ 	Provider                string    `gorm:"type:varchar(255);index;index:idx_logs_ts_provider_status,priority:2;not null" json:"provider"`
+diff --git a/framework/logstore/tenant_scope.go b/framework/logstore/tenant_scope.go
+new file mode 100644
+index 000000000..ebac20535
+--- /dev/null
++++ b/framework/logstore/tenant_scope.go
+@@ -0,0 +1,178 @@
++// Package logstore — tenant_scope.go.
++//
++// Mirror of framework/configstore/tenant_scope.go, scoped to this
++// package. The logstore and configstore live in the same go module
++// (framework/) but import each other in both directions, so we cannot
++// import configstore.RegisterTenantScopes here without a cycle.
++// Duplicating the ~80 lines of callback logic is cheaper than the
++// shared-package refactor.
++//
++// Contract is identical to configstore's:
++//
++//   - SELECT against a model with a TenantID column gets an implicit
++//     `WHERE <table>.tenant_id = ?` (read from ctx).
++//   - UPDATE / DELETE against such a model gets the same predicate.
++//   - INSERT against such a model gets tenant_id populated from ctx
++//     when the row hasn't already supplied one.
++//
++// Models without a TenantID column (MCPToolLog, AsyncJob, etc.) flow
++// through untouched. Single-tenant fallback (no header on the request,
++// background jobs with context.Background()) reads everything as if no
++// multi-tenant logic existed — the scope callback short-circuits and
++// the column's `default:default` carries the INSERT.
++
++package logstore
++
++import (
++	"context"
++	"reflect"
++
++	"github.com/maximhq/bifrost/multitenant"
++	"gorm.io/gorm"
++)
++
++// tenantColumn is the canonical column name on every tenant-scoped
++// logstore model. Kept as a constant so the callback registration
++// can't drift from the gorm tags on the Log struct.
++const tenantColumn = "tenant_id"
++
++// RegisterTenantScopes installs the four callbacks on the supplied
++// *gorm.DB. Must be called exactly once per handle, immediately after
++// opening and before business code uses it. Safe to call from both
++// sqlite and postgres openers.
++func RegisterTenantScopes(db *gorm.DB) error {
++	if err := db.Callback().Query().Before("gorm:query").
++		Register("multitenant:scope_query", scopeQueryByTenant); err != nil {
++		return err
++	}
++	if err := db.Callback().Update().Before("gorm:update").
++		Register("multitenant:scope_update", scopeQueryByTenant); err != nil {
++		return err
++	}
++	if err := db.Callback().Delete().Before("gorm:delete").
++		Register("multitenant:scope_delete", scopeQueryByTenant); err != nil {
++		return err
++	}
++	if err := db.Callback().Create().Before("gorm:create").
++		Register("multitenant:scope_create", populateTenantIDOnCreate); err != nil {
++		return err
++	}
++	return nil
++}
++
++// hasTenantColumn returns true when the model bound to this statement
++// carries a `TenantID` column we should scope on. Defensive against
++// statements with no Schema parsed (raw SQL, ad-hoc Table queries).
++func hasTenantColumn(tx *gorm.DB) bool {
++	if tx == nil || tx.Statement == nil || tx.Statement.Schema == nil {
++		return false
++	}
++	return tx.Statement.Schema.LookUpField(tenantColumn) != nil
++}
++
++// tenantFromContext returns the tenant id stashed on the request
++// context by the tenant-resolver middleware, or empty when no header
++// was present. Tries the typed BifrostContextKey first, then the
++// string form (fasthttp.RequestCtx.SetUserValue stores by interface{}
++// equality so the two key forms don't collide — the resolver writes
++// both).
++func tenantFromContext(ctx context.Context) (string, bool) {
++	if ctx == nil {
++		return "", false
++	}
++	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
++		if s, ok := v.(string); ok && s != "" {
++			return s, true
++		}
++	}
++	if v := ctx.Value(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		if s, ok := v.(string); ok && s != "" {
++			return s, true
++		}
++	}
++	return "", false
++}
++
++// scopeQueryByTenant is the SELECT / UPDATE / DELETE callback. It
++// appends `<table>.tenant_id = ?` to the statement when the model has
++// a TenantID column AND the ctx has a tenant id. The column is
++// qualified with the primary table name so any future JOIN across
++// tenant-scoped tables doesn't throw "ambiguous column name".
++func scopeQueryByTenant(tx *gorm.DB) {
++	if tx.Error != nil || !hasTenantColumn(tx) {
++		return
++	}
++	tid, ok := tenantFromContext(tx.Statement.Context)
++	if !ok {
++		return
++	}
++	tx.Statement.Where(qualifyTenantColumn(tx)+" = ?", tid)
++}
++
++// qualifyTenantColumn returns "<primary_table>.tenant_id" when the
++// statement's table can be resolved, falling back to bare "tenant_id"
++// otherwise.
++func qualifyTenantColumn(tx *gorm.DB) string {
++	if tx.Statement == nil {
++		return tenantColumn
++	}
++	table := tx.Statement.Table
++	if table == "" && tx.Statement.Schema != nil {
++		table = tx.Statement.Schema.Table
++	}
++	if table == "" {
++		return tenantColumn
++	}
++	return table + "." + tenantColumn
++}
++
++// populateTenantIDOnCreate is the INSERT callback. Sets TenantID from
++// ctx on each row in the statement BEFORE the INSERT runs, when the
++// row didn't already carry an explicit value. Bulk inserts (a slice
++// of rows) are handled by iterating the reflect value — the logging
++// plugin batches with BatchCreateIfNotExists, so this is the hot path.
++func populateTenantIDOnCreate(tx *gorm.DB) {
++	if tx.Error != nil || !hasTenantColumn(tx) {
++		return
++	}
++	tid, ok := tenantFromContext(tx.Statement.Context)
++	if !ok {
++		return
++	}
++	rv := tx.Statement.ReflectValue
++	switch rv.Kind() {
++	case reflect.Slice, reflect.Array:
++		for i := 0; i < rv.Len(); i++ {
++			setTenantIfEmpty(rv.Index(i), tid)
++		}
++	case reflect.Struct:
++		setTenantIfEmpty(rv, tid)
++	}
++}
++
++// setTenantIfEmpty sets the TenantID field on rv to tid only when the
++// field's current value is the zero string. Honors caller-supplied
++// tenant ids (e.g. async jobs that mint logs for a tenant other than
++// the one in their own request).
++func setTenantIfEmpty(rv reflect.Value, tid string) {
++	if rv.Kind() == reflect.Ptr {
++		if rv.IsNil() {
++			return
++		}
++		rv = rv.Elem()
++	}
++	if rv.Kind() != reflect.Struct {
++		return
++	}
++	field := rv.FieldByName("TenantID")
++	if !field.IsValid() || field.Kind() != reflect.String {
++		return
++	}
++	if field.String() != "" {
++		return
++	}
++	if !field.CanSet() {
++		return
++	}
++	field.SetString(tid)
++}
+diff --git a/framework/logstore/tenant_scope_test.go b/framework/logstore/tenant_scope_test.go
+new file mode 100644
+index 000000000..54323b5a7
+--- /dev/null
++++ b/framework/logstore/tenant_scope_test.go
+@@ -0,0 +1,134 @@
++// Tests for the logstore-local GORM tenant-scope callback. Mirrors
++// the configstore equivalent (framework/configstore/tenant_scope_test.go);
++// the duplication is intentional — see tenant_scope.go's package
++// comment for the cycle-breaking rationale.
++//
++// Coverage:
++//   - SELECT against a Log row from tenant A under tenant B's ctx
++//     must return ErrNotFound (no cross-tenant log leak).
++//   - INSERT under tenant ctx must auto-stamp tenant_id even when the
++//     caller forgot to populate the struct field.
++//
++// This is the regression for the symptom that drove patch6: the UI's
++// /api/logs returned every tenant's request history to every tenant
++// because the logstore *gorm.DB had no scope callback and the Log
++// table had no tenant_id column to filter on.
++
++package logstore
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/driver/sqlite"
++	"gorm.io/gorm"
++	"gorm.io/gorm/logger"
++)
++
++// setupRDBLogStoreWithTenantScope creates an in-memory sqlite logstore
++// with RegisterTenantScopes wired in. Bypasses triggerMigrations
++// (which runs every legacy migration too) because for this test we
++// just need the Log table at its current shape.
++func setupRDBLogStoreWithTenantScope(t *testing.T) *RDBLogStore {
++	t.Helper()
++	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
++		Logger: logger.Default.LogMode(logger.Silent),
++	})
++	require.NoError(t, err, "open in-memory sqlite")
++	require.NoError(t, db.AutoMigrate(&Log{}), "auto-migrate Log")
++	require.NoError(t, RegisterTenantScopes(db), "register tenant-scope callbacks")
++	return &RDBLogStore{db: db, logger: nil}
++}
++
++// withTenant returns a ctx carrying the supplied tenant id under
++// multitenant.BifrostContextKeyTenantID — the form the scope callback
++// reads. Mirrors the form the HTTP transport's tenant-resolver
++// middleware uses.
++func withTenant(parent context.Context, tid string) context.Context {
++	return context.WithValue(parent, multitenant.BifrostContextKeyTenantID, tid)
++}
++
++// TestLogTenantIsolation is the regression for the cross-tenant log
++// leak. Tenant A writes a row; tenant B's read under its own ctx must
++// not see it; tenant A's read must see only its own row.
++func TestLogTenantIsolation(t *testing.T) {
++	store := setupRDBLogStoreWithTenantScope(t)
++	ctxA := withTenant(context.Background(), "tenantA")
++	ctxB := withTenant(context.Background(), "tenantB")
++
++	// Tenant A inserts a log row WITHOUT setting TenantID — the scope
++	// callback's INSERT hook must populate it from ctx.
++	rowA := &Log{
++		ID:        "req-a",
++		Timestamp: time.Now(),
++		Object:    "chat_completion",
++		Provider:  "openai",
++		Model:     "gpt-4",
++		Status:    "success",
++	}
++	require.NoError(t, store.Create(ctxA, rowA), "tenant A create")
++
++	// Tenant B inserts under its own ctx.
++	rowB := &Log{
++		ID:        "req-b",
++		Timestamp: time.Now(),
++		Object:    "chat_completion",
++		Provider:  "anthropic",
++		Model:     "claude-3",
++		Status:    "success",
++	}
++	require.NoError(t, store.Create(ctxB, rowB), "tenant B create")
++
++	// Assert tenant_id was populated from ctx on each row (write-side
++	// scope works).
++	var rawA, rawB Log
++	require.NoError(t, store.db.WithContext(context.Background()).
++		Where("id = ?", "req-a").First(&rawA).Error)
++	require.NoError(t, store.db.WithContext(context.Background()).
++		Where("id = ?", "req-b").First(&rawB).Error)
++	assert.Equal(t, "tenantA", rawA.TenantID, "row A must carry tenant A's id")
++	assert.Equal(t, "tenantB", rawB.TenantID, "row B must carry tenant B's id")
++
++	// Read-side: tenant B reading req-a (tenant A's row) must 404
++	// because the scope callback adds `WHERE tenant_id = 'tenantB'`.
++	var found Log
++	err := store.ScopedDB(ctxB).Where("id = ?", "req-a").First(&found).Error
++	assert.ErrorIs(t, err, gorm.ErrRecordNotFound,
++		"tenant B must NOT see tenant A's row — this assertion failing means "+
++			"the cross-tenant log leak from the bug report is still present.")
++
++	// Tenant A reading its own row succeeds.
++	var ownRow Log
++	require.NoError(t, store.ScopedDB(ctxA).Where("id = ?", "req-a").First(&ownRow).Error,
++		"tenant A must see its own row")
++	assert.Equal(t, "openai", ownRow.Provider)
++}
++
++// TestLogTenantIsolation_NoCtxTenant covers the single-tenant fallback:
++// when no header is on the request, the scope callback must short-
++// circuit and the read returns everything. Mirrors the OSS single-
++// tenant behaviour patch1 was careful to preserve.
++func TestLogTenantIsolation_NoCtxTenant(t *testing.T) {
++	store := setupRDBLogStoreWithTenantScope(t)
++
++	// Seed via tenant ctx.
++	require.NoError(t, store.Create(withTenant(context.Background(), "tenantA"),
++		&Log{ID: "req-a", Timestamp: time.Now(), Provider: "openai", Model: "gpt-4", Status: "success", Object: "chat_completion"}))
++	require.NoError(t, store.Create(withTenant(context.Background(), "tenantB"),
++		&Log{ID: "req-b", Timestamp: time.Now(), Provider: "anthropic", Model: "claude-3", Status: "success", Object: "chat_completion"}))
++
++	// Read without tenant ctx — scope short-circuits, both rows visible.
++	var rows []Log
++	require.NoError(t, store.ScopedDB(context.Background()).Find(&rows).Error)
++	assert.Len(t, rows, 2, "no-tenant ctx must read every row (single-tenant fallback)")
++}
++
++// tableImport keeps the configstore/tables import live — pulled in to
++// confirm the same DefaultTenantID literal is reachable from this
++// package (the migration backfills logs.tenant_id with this value).
++var _ = tables.DefaultTenantID
+diff --git a/plugins/logging/go.mod b/plugins/logging/go.mod
+index 0d1d94e02..d100ecae1 100644
+--- a/plugins/logging/go.mod
++++ b/plugins/logging/go.mod
+@@ -157,3 +157,7 @@ require (
+ 	gorm.io/driver/sqlite v1.6.0 // indirect
+ 	gorm.io/gorm v1.31.1 // indirect
+ )
++
++require github.com/maximhq/bifrost/multitenant v0.0.0
++
++replace github.com/maximhq/bifrost/multitenant => ../../multitenant
+diff --git a/plugins/logging/operations.go b/plugins/logging/operations.go
+index 47d470ffe..abf723ef6 100644
+--- a/plugins/logging/operations.go
++++ b/plugins/logging/operations.go
+@@ -12,10 +12,34 @@ import (
+ 	"github.com/maximhq/bifrost/framework/logstore"
+ 	"github.com/maximhq/bifrost/framework/modelcatalog"
+ 	"github.com/maximhq/bifrost/framework/streaming"
++	"github.com/maximhq/bifrost/multitenant"
+ )
+ 
+ const realtimeMissingTranscriptText = "[Audio transcription unavailable]"
+ 
++// tenantIDFromContext extracts the tenant id stamped onto ctx by the
++// HTTP transport's tenant-resolver middleware. Returns "" when the
++// request didn't carry the `x-f5xc-tenant` header — single-tenant
++// fallback. Tries both the typed BifrostContextKey and the
++// stringified form because fasthttp.RequestCtx.SetUserValue stores
++// by interface{} equality so the two key shapes don't collide.
++func tenantIDFromContext(ctx context.Context) string {
++	if ctx == nil {
++		return ""
++	}
++	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
++		if s, ok := v.(string); ok {
++			return s
++		}
++	}
++	if v := ctx.Value(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		if s, ok := v.(string); ok {
++			return s
++		}
++	}
++	return ""
++}
++
+ // insertInitialLogEntry creates a new log entry in the database using GORM
+ func (p *LoggerPlugin) insertInitialLogEntry(
+ 	ctx context.Context,
+@@ -36,6 +60,13 @@ func (p *LoggerPlugin) insertInitialLogEntry(
+ 		Status:        "processing",
+ 		Stream:        false,
+ 		CreatedAt:     timestamp,
++		// Stamp the tenant from BifrostContext so /api/logs filters
++		// correctly. The logstore tenant-scope callback's INSERT hook
++		// would also fill this from ctx (and the column's `default`
++		// schema default handles the no-ctx-tenant case), but stamping
++		// here keeps the source of truth one layer up — explicit when
++		// the row is constructed, not implicit in the DB write path.
++		TenantID: tenantIDFromContext(ctx),
+ 		// Set parsed fields for serialization
+ 		InputHistoryParsed:          data.InputHistory,
+ 		ResponsesInputHistoryParsed: data.ResponsesInputHistory,
+diff --git a/plugins/telemetry/go.mod b/plugins/telemetry/go.mod
+index f4ef46402..c9db3af5a 100644
+--- a/plugins/telemetry/go.mod
++++ b/plugins/telemetry/go.mod
+@@ -164,3 +164,7 @@ require (
+ 	gorm.io/driver/sqlite v1.6.0 // indirect
+ 	gorm.io/gorm v1.31.1 // indirect
+ )
++
++require github.com/maximhq/bifrost/multitenant v0.0.0
++
++replace github.com/maximhq/bifrost/multitenant => ../../multitenant
+diff --git a/plugins/telemetry/main.go b/plugins/telemetry/main.go
+index 5ed599cf3..b9a528f60 100644
+--- a/plugins/telemetry/main.go
++++ b/plugins/telemetry/main.go
+@@ -16,6 +16,7 @@ import (
+ 	bifrost "github.com/maximhq/bifrost/core"
+ 	schemas "github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/framework/modelcatalog"
++	"github.com/maximhq/bifrost/multitenant"
+ 	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/prometheus/client_golang/prometheus/collectors"
+ 	"github.com/prometheus/client_golang/prometheus/promauto"
+@@ -179,6 +180,7 @@ func Init(config *Config, pricingManager *modelcatalog.ModelCatalog, logger sche
+ 		"model",
+ 		"alias",
+ 		"method",
++		"tenant_id",
+ 		"virtual_key_id",
+ 		"virtual_key_name",
+ 		"routing_engine_used",
+@@ -509,6 +511,7 @@ func (p *PrometheusPlugin) PostLLMHook(ctx *schemas.BifrostContext, result *sche
+ 		"model":               model,
+ 		"alias":               alias,
+ 		"method":              string(requestType),
++		"tenant_id":           tenantIDFromTelemetryCtx(ctx),
+ 		"virtual_key_id":      virtualKeyID,
+ 		"virtual_key_name":    virtualKeyName,
+ 		"routing_engine_used": routingEngineUsed,
+@@ -880,3 +883,28 @@ func (p *PrometheusPlugin) Cleanup() error {
+ 	p.DisablePushGateway()
+ 	return nil
+ }
++
++// tenantIDFromTelemetryCtx pulls the tenant id stamped onto ctx by the
++// HTTP transport's tenant-resolver middleware so Prometheus labels can
++// distinguish per-tenant traffic. Returns "" when the request didn't
++// carry the `x-f5xc-tenant` header — Prometheus treats empty as a
++// distinct label value (the "single-tenant" or "absent" bucket).
++// Tries both the typed BifrostContextKey and the stringified form
++// because fasthttp.RequestCtx.SetUserValue stores by interface{}
++// equality so the two key shapes don't collide.
++func tenantIDFromTelemetryCtx(ctx context.Context) string {
++	if ctx == nil {
++		return ""
++	}
++	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
++		if s, ok := v.(string); ok {
++			return s
++		}
++	}
++	if v := ctx.Value(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		if s, ok := v.(string); ok {
++			return s
++		}
++	}
++	return ""
++}
+-- 
+2.51.0
+
