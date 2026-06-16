@@ -155,7 +155,7 @@ export class GovernancePage extends BasePage {
       await budgetInput.fill(String(config.budget.maxLimit))
     }
 
-    const saveBtn = this.customerDialog.getByRole('button', { name: /Create Customer/i })
+    const saveBtn = this.customerDialog.getByRole('button', { name: /Create Namespace/i })
     await expect(saveBtn).toBeEnabled()
     await saveBtn.click()
     await this.waitForSuccessToast()

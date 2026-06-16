@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/multitenant"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/maxim"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
@@ -203,6 +204,17 @@ func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*sch
 	ctx.VisitUserValuesAll(func(key, value any) {
 		bifrostCtx.SetValue(key, value)
 	})
+
+	// Lift the resolved tenant id onto the BifrostContext under its typed
+	// key so MultiTenantRouter and any downstream plugin can read it via
+	// the canonical bifrostCtx.Value(multitenant.BifrostContextKeyTenantID)
+	// path. The TenantResolverMiddleware stores it on the fasthttp
+	// RequestCtx as a UserValue keyed by the *string* form of the key (so
+	// fasthttp's UserValue lookup is happy); without this re-lift the
+	// typed-key reader would miss it on the BifrostContext.
+	if tid, ok := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)).(string); ok && tid != "" {
+		bifrostCtx.SetValue(multitenant.BifrostContextKeyTenantID, tid)
+	}
 
 	// When a prepare*Request function resolved a provider via the model catalog,
 	// it stores the resolution info on the fasthttp context. Emit the routing

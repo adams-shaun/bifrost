@@ -1256,7 +1256,7 @@ export function LogDetailView({
               {log.customer_id && (
                 <LogEntryDetailsView
                   className="w-full"
-                  label="Customer"
+                  label="Namespace"
                   value={
                     <Link
                       to="/workspace/logs"

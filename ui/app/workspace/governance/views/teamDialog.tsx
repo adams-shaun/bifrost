@@ -413,7 +413,7 @@ export default function TeamDialog({
               {/* Customer Assignment */}
               {customers?.length > 0 && (
                 <div className="space-y-2">
-                  <Label htmlFor="customer">Customer (optional)</Label>
+                  <Label htmlFor="customer">Namespace (optional)</Label>
                   <Select
                     value={formData.customerId || "__none__"}
                     onValueChange={(value) =>
@@ -428,7 +428,7 @@ export default function TeamDialog({
                       className="w-full"
                       data-testid="team-customer-select-trigger"
                     >
-                      <SelectValue placeholder="Select a customer" />
+                      <SelectValue placeholder="Select a namespace" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem

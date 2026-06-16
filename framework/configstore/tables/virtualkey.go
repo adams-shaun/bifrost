@@ -198,12 +198,19 @@ func (mc *TableVirtualKeyMCPConfig) UnmarshalJSON(data []byte) error {
 // TableVirtualKey represents a virtual key with budget, rate limits, and team/customer association
 type TableVirtualKey struct {
 	ID              string                          `gorm:"primaryKey;type:varchar(255)" json:"id"`
-	Name            string                          `gorm:"uniqueIndex:idx_virtual_key_name;type:varchar(255);not null" json:"name"`
+	Name            string                          `gorm:"uniqueIndex:idx_virtual_keys_tenant_name;type:varchar(255);not null" json:"name"`
 	Description     string                          `gorm:"type:text" json:"description,omitempty"`
 	Value           string                          `gorm:"uniqueIndex:idx_virtual_key_value;type:text;not null" json:"value"`           // The virtual key value
 	IsActive        *bool                           `gorm:"default:true" json:"is_active,omitempty"`                                     // Nil means true (DB default); false means inactive
 	ProviderConfigs []TableVirtualKeyProviderConfig `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"provider_configs"` // Empty means no providers allowed (deny-by-default)
 	MCPConfigs      []TableVirtualKeyMCPConfig      `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"mcp_configs"`
+
+	// TenantID scopes this virtual key to a tenant for multi-tenant deployments.
+	// The HTTP tenant-resolver middleware reads this via the VK lookup before
+	// dispatching to the per-tenant Bifrost runtime. See TableCustomer.TenantID.
+	// idx_virtual_keys_tenant_name is composite with Name above so two tenants
+	// can both register a VK named e.g. "primary".
+	TenantID string `gorm:"type:varchar(255);not null;uniqueIndex:idx_virtual_keys_tenant_name;default:default" json:"tenant_id"`
 
 	// Foreign key relationships (mutually exclusive: TeamID, CustomerID, or AccessProfileID)
 	TeamID          *string `gorm:"type:varchar(255);index" json:"team_id,omitempty"`

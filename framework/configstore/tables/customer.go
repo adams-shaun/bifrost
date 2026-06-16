@@ -9,6 +9,11 @@ type TableCustomer struct {
 	BudgetID    *string `gorm:"type:varchar(255);index" json:"budget_id,omitempty"`
 	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
 
+	// TenantID scopes this customer to a tenant for multi-tenant deployments.
+	// Single-tenant OSS uses the DefaultTenantID; the initial tenant migration
+	// backfills existing rows to that value before making the column NOT NULL.
+	TenantID string `gorm:"type:varchar(255);not null;index;default:default" json:"tenant_id"`
+
 	// Relationships
 	Budget      *TableBudget      `gorm:"foreignKey:BudgetID" json:"budget,omitempty"`
 	RateLimit   *TableRateLimit   `gorm:"foreignKey:RateLimitID" json:"rate_limit,omitempty"`

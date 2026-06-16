@@ -16,7 +16,8 @@ import (
 
 // AsyncHandler handles async job HTTP endpoints.
 type AsyncHandler struct {
-	client       *bifrost.Bifrost
+	router       lib.BifrostRouter // per-request runtime resolver (single-tenant by default)
+	client       *bifrost.Bifrost  // legacy back-pointer for hot-reload / shutdown coordination
 	executor     *logstore.AsyncJobExecutor
 	handlerStore lib.HandlerStore
 	config       *lib.Config
@@ -54,6 +55,21 @@ func RegisterAsyncRequestTypeMiddleware(next fasthttp.RequestHandler) fasthttp.R
 // the handler is created with a nil executor and RegisterRoutes will skip async route registration.
 func NewAsyncHandler(client *bifrost.Bifrost, config *lib.Config) *AsyncHandler {
 	return &AsyncHandler{
+		router:       lib.NewSingleTenantRouter(client),
+		client:       client,
+		executor:     config.GetAsyncJobExecutor(),
+		handlerStore: config,
+		config:       config,
+	}
+}
+
+// NewAsyncHandlerWithRouter is the router-aware constructor for callers
+// that want to inject a multi-tenant BifrostRouter. client is still
+// passed for hot-reload back-compat; it should be the same Bifrost the
+// router hands out by default.
+func NewAsyncHandlerWithRouter(router lib.BifrostRouter, client *bifrost.Bifrost, config *lib.Config) *AsyncHandler {
+	return &AsyncHandler{
+		router:       router,
 		client:       client,
 		executor:     config.GetAsyncJobExecutor(),
 		handlerStore: config,
@@ -124,7 +140,12 @@ func (h *AsyncHandler) asyncTextCompletion(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.TextCompletionRequest(bgCtx, bifrostTextReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.TextCompletionRequest(bgCtx, bifrostTextReq)
 		},
 		schemas.TextCompletionRequest,
 	)
@@ -161,7 +182,12 @@ func (h *AsyncHandler) asyncChatCompletion(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ChatCompletionRequest(bgCtx, bifrostChatReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.ChatCompletionRequest(bgCtx, bifrostChatReq)
 		},
 		schemas.ChatCompletionRequest,
 	)
@@ -198,7 +224,12 @@ func (h *AsyncHandler) asyncResponses(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ResponsesRequest(bgCtx, bifrostResponsesReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.ResponsesRequest(bgCtx, bifrostResponsesReq)
 		},
 		schemas.ResponsesRequest,
 	)
@@ -231,7 +262,12 @@ func (h *AsyncHandler) asyncEmbeddings(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.EmbeddingRequest(bgCtx, bifrostEmbeddingReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.EmbeddingRequest(bgCtx, bifrostEmbeddingReq)
 		},
 		schemas.EmbeddingRequest,
 	)
@@ -268,7 +304,12 @@ func (h *AsyncHandler) asyncSpeech(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.SpeechRequest(bgCtx, bifrostSpeechReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.SpeechRequest(bgCtx, bifrostSpeechReq)
 		},
 		schemas.SpeechRequest,
 	)
@@ -305,7 +346,12 @@ func (h *AsyncHandler) asyncTranscription(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.TranscriptionRequest(bgCtx, bifrostTranscriptionReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.TranscriptionRequest(bgCtx, bifrostTranscriptionReq)
 		},
 		schemas.TranscriptionRequest,
 	)
@@ -342,7 +388,12 @@ func (h *AsyncHandler) asyncImageGeneration(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ImageGenerationRequest(bgCtx, bifrostReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.ImageGenerationRequest(bgCtx, bifrostReq)
 		},
 		schemas.ImageGenerationRequest,
 	)
@@ -379,7 +430,12 @@ func (h *AsyncHandler) asyncImageEdit(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ImageEditRequest(bgCtx, bifrostReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.ImageEditRequest(bgCtx, bifrostReq)
 		},
 		schemas.ImageEditRequest,
 	)
@@ -411,7 +467,12 @@ func (h *AsyncHandler) asyncImageVariation(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ImageVariationRequest(bgCtx, bifrostReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.ImageVariationRequest(bgCtx, bifrostReq)
 		},
 		schemas.ImageVariationRequest,
 	)
@@ -443,7 +504,12 @@ func (h *AsyncHandler) asyncRerank(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.RerankRequest(bgCtx, bifrostReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.RerankRequest(bgCtx, bifrostReq)
 		},
 		schemas.RerankRequest,
 	)
@@ -475,7 +541,12 @@ func (h *AsyncHandler) asyncOCR(ctx *fasthttp.RequestCtx) {
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.OCRRequest(bgCtx, bifrostReq)
+			client, release, acqErr := h.router.Acquire(bgCtx)
+			if acqErr != nil {
+				return nil, asyncAcquireError(acqErr)
+			}
+			defer release()
+			return client.OCRRequest(bgCtx, bifrostReq)
 		},
 		schemas.OCRRequest,
 	)
@@ -524,6 +595,18 @@ func (h *AsyncHandler) getJob(operationType schemas.RequestType) fasthttp.Reques
 }
 
 // --- Helper functions ---
+
+// asyncAcquireError wraps a multi-tenant router Acquire failure as a
+// schemas.BifrostError so the executor can surface it on the job result.
+func asyncAcquireError(err error) *schemas.BifrostError {
+	return &schemas.BifrostError{
+		IsBifrostError: true,
+		Error: &schemas.ErrorField{
+			Message: "failed to acquire bifrost runtime: " + err.Error(),
+			Error:   err,
+		},
+	}
+}
 
 // getVirtualKeyFromContext extracts the virtual key value from context.
 // Returns nil if no VK is present (e.g., direct key mode or no governance).

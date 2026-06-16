@@ -21,6 +21,7 @@ import (
 	"github.com/maximhq/bifrost/framework/mcpcatalog"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
 	"github.com/maximhq/bifrost/framework/streaming"
+	"github.com/maximhq/bifrost/multitenant"
 )
 
 const (
@@ -755,6 +756,12 @@ func (p *LoggerPlugin) PostLLMHook(ctx *schemas.BifrostContext, result *schemas.
 	userName := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyUserName)
 	businessUnitID := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyGovernanceBusinessUnitID)
 	businessUnitName := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyGovernanceBusinessUnitName)
+	// tenantID — multi-tenant scope resolved upstream by the tenant
+	// resolver middleware. Empty when MT is off (single-tenant
+	// deployments) or the request didn't carry a VK. Persisted to the
+	// logs.tenant_id column so the dashboard can filter charts per
+	// tenant.
+	tenantID := bifrost.GetStringFromContext(ctx, multitenant.BifrostContextKeyTenantID)
 	numberOfRetries := bifrost.GetIntFromContext(ctx, schemas.BifrostContextKeyNumberOfRetries)
 	attemptTrail, _ := ctx.Value(schemas.BifrostContextKeyAttemptTrail).([]schemas.KeyAttemptRecord)
 
@@ -865,7 +872,7 @@ func (p *LoggerPlugin) PostLLMHook(ctx *schemas.BifrostContext, result *schemas.
 			latency = *ef.CacheDebug.CacheHitLatency
 		}
 	}
-	applyOutputFieldsToEntry(entry, selectedKeyID, selectedKeyName, virtualKeyID, virtualKeyName, routingRuleID, routingRuleName, selectedPromptID, selectedPromptName, selectedPromptVersion, teamID, teamName, customerID, customerName, userID, userName, businessUnitID, businessUnitName, numberOfRetries, latency, attemptTrail)
+	applyOutputFieldsToEntry(entry, selectedKeyID, selectedKeyName, virtualKeyID, virtualKeyName, routingRuleID, routingRuleName, selectedPromptID, selectedPromptName, selectedPromptVersion, teamID, teamName, customerID, customerName, userID, userName, businessUnitID, businessUnitName, tenantID, numberOfRetries, latency, attemptTrail)
 	// Attach cluster governance metadata for disconnected node usage recovery
 	if nodeID, _ := p.clusterNodeID.Load().(string); nodeID != "" {
 		entry.ClusterNodeID = &nodeID

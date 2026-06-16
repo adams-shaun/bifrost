@@ -132,6 +132,9 @@ func (s *RDBLogStore) applyFilters(baseQuery *gorm.DB, filters SearchFilters) *g
 	if len(filters.BusinessUnitIDs) > 0 {
 		baseQuery = baseQuery.Where("business_unit_id IN ?", filters.BusinessUnitIDs)
 	}
+	if len(filters.TenantIDs) > 0 {
+		baseQuery = baseQuery.Where("tenant_id IN ?", filters.TenantIDs)
+	}
 	if len(filters.RoutingEngineUsed) > 0 {
 		// Query routing engines (comma-separated values) - find logs containing ANY of the specified engines
 		dialect := s.db.Dialector.Name()
@@ -766,6 +769,10 @@ func (s *RDBLogStore) listSelectColumns() string {
 		"routing_engines_used", "routing_rule_id", "routing_rule_name",
 		"user_id", "team_id", "team_name", "customer_id", "customer_name",
 		"business_unit_id", "business_unit_name",
+		// tenant_id (Stage 4 multi-tenant): without this, the dashboard's
+		// per-tenant filter strips every row even when the column is
+		// populated, because list responses come back with tenant_id=null.
+		"tenant_id",
 		"speech_input", "transcription_input", "image_generation_input", "video_generation_input",
 		"latency", "token_usage", "cost", "status", "error_details", "stream",
 		"content_summary", "metadata", "cache_debug",

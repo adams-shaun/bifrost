@@ -102,7 +102,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 		() =>
 			new Validator([
 				// Basic validation
-				Validator.required(formData.name.trim(), "Customer name is required"),
+				Validator.required(formData.name.trim(), "Namespace name is required"),
 
 				// Check if anything is dirty
 				Validator.custom(formData.isDirty, "No changes to save"),
@@ -183,7 +183,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 				}
 
 				await updateCustomer({ customerId: customer.id, data: updateData }).unwrap();
-				toast.success("Customer updated successfully");
+				toast.success("Namespace updated successfully");
 			} else {
 				// Create new customer
 				const createData: CreateCustomerRequest = {
@@ -213,7 +213,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 				}
 
 				await createCustomer(createData).unwrap();
-				toast.success("Customer created successfully");
+				toast.success("Namespace created successfully");
 			}
 
 			onSave();
@@ -226,11 +226,11 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 		<Dialog open onOpenChange={onCancel}>
 			<DialogContent className="max-w-2xl" data-testid="customer-dialog-content">
 				<DialogHeader>
-					<DialogTitle className="flex items-center gap-2">{isEditing ? "Edit Customer" : "Create Customer"}</DialogTitle>
+					<DialogTitle className="flex items-center gap-2">{isEditing ? "Edit Namespace" : "Create Namespace"}</DialogTitle>
 					<DialogDescription>
 						{isEditing
-							? "Update the customer information and settings."
-							: "Create a new customer account to organize teams and manage resources."}
+							? "Update the namespace information and settings."
+							: "Create a new namespace to organize teams and manage resources."}
 					</DialogDescription>
 				</DialogHeader>
 
@@ -239,7 +239,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 						{/* Basic Information */}
 						<div className="space-y-4">
 							<div className="space-y-2">
-								<Label htmlFor="name">Customer Name *</Label>
+								<Label htmlFor="name">Namespace Name *</Label>
 								<Input
 									id="name"
 									data-testid="customer-name-input"
@@ -248,7 +248,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 									maxLength={50}
 									onChange={(e) => updateField("name", e.target.value)}
 								/>
-								<p className="text-muted-foreground text-sm">This name will be used to identify the customer account.</p>
+								<p className="text-muted-foreground text-sm">This name will be used to identify the namespace.</p>
 							</div>
 						</div>
 
@@ -361,7 +361,7 @@ export default function CustomerDialog({ customer, onSave, onCancel }: CustomerD
 
 					<FormFooter
 						validator={validator}
-						label="Customer"
+						label="Namespace"
 						onCancel={onCancel}
 						isLoading={loading}
 						isEditing={isEditing}

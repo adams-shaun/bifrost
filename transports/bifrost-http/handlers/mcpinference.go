@@ -13,13 +13,25 @@ import (
 )
 
 type MCPInferenceHandler struct {
-	client *bifrost.Bifrost
+	router lib.BifrostRouter // per-request runtime resolver (single-tenant by default)
+	client *bifrost.Bifrost  // legacy back-pointer for hot-reload / shutdown coordination
 	config *lib.Config
 }
 
 // NewMCPInferenceHandler creates a new MCP inference handler instance
 func NewMCPInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *MCPInferenceHandler {
 	return &MCPInferenceHandler{
+		router: lib.NewSingleTenantRouter(client),
+		client: client,
+		config: config,
+	}
+}
+
+// NewMCPInferenceHandlerWithRouter is the router-aware constructor for
+// callers that want to inject a multi-tenant BifrostRouter.
+func NewMCPInferenceHandlerWithRouter(router lib.BifrostRouter, client *bifrost.Bifrost, config *lib.Config) *MCPInferenceHandler {
+	return &MCPInferenceHandler{
+		router: router,
 		client: client,
 		config: config,
 	}
@@ -28,6 +40,17 @@ func NewMCPInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *MCPInf
 // RegisterRoutes registers the MCP inference routes
 func (h *MCPInferenceHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
 	r.POST("/v1/mcp/tool/execute", lib.ChainMiddlewares(h.executeTool, middlewares...))
+}
+
+// clientOrFail resolves the per-request Bifrost runtime via the router and
+// writes a 500 on acquire failure. Mirrors CompletionHandler.clientOrFail.
+func (h *MCPInferenceHandler) clientOrFail(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext) (*bifrost.Bifrost, func(), bool) {
+	client, release, err := h.router.Acquire(bifrostCtx)
+	if err != nil {
+		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to acquire bifrost runtime: %v", err))
+		return nil, nil, false
+	}
+	return client, release, true
 }
 
 // executeTool handles POST /v1/mcp/tool/execute - Execute MCP tool
@@ -67,8 +90,14 @@ func (h *MCPInferenceHandler) executeChatMCPTool(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+
 	// Execute MCP tool
-	toolMessage, bifrostErr := h.client.ExecuteChatMCPTool(bifrostCtx, &req)
+	toolMessage, bifrostErr := client.ExecuteChatMCPTool(bifrostCtx, &req)
 	if bifrostErr != nil {
 		SendBifrostError(ctx, bifrostErr)
 		return
@@ -100,8 +129,14 @@ func (h *MCPInferenceHandler) executeResponsesMCPTool(ctx *fasthttp.RequestCtx) 
 		return
 	}
 
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+
 	// Execute MCP tool
-	toolMessage, bifrostErr := h.client.ExecuteResponsesMCPTool(bifrostCtx, &req)
+	toolMessage, bifrostErr := client.ExecuteResponsesMCPTool(bifrostCtx, &req)
 	if bifrostErr != nil {
 		SendBifrostError(ctx, bifrostErr)
 		return

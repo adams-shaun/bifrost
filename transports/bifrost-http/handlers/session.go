@@ -37,6 +37,53 @@ func (h *SessionHandler) RegisterRoutes(r *router.Router, middlewares ...schemas
 	r.POST("/api/session/logout", lib.ChainMiddlewares(h.logout, middlewares...))
 	r.GET("/api/session/is-auth-enabled", lib.ChainMiddlewares(h.isAuthEnabled, middlewares...))
 	r.POST("/api/session/ws-ticket", lib.ChainMiddlewares(h.issueWSTicket, middlewares...))
+	// listTenantsPublic is the minimal-info tenant directory used by the
+	// login page's tenant picker. Returns only {id, name} so an
+	// unauthenticated caller learns nothing more than what they'd need
+	// to log in. The full per-tenant metadata (description, timestamps,
+	// admin actions) stays on /api/platform/tenants behind auth.
+	r.GET("/api/session/tenants", lib.ChainMiddlewares(h.listTenantsPublic, middlewares...))
+}
+
+// listTenantsPublic — GET /api/session/tenants
+//
+// Public, unauthenticated tenant directory for the login picker. Mirrors
+// the auth-bypass already in place for /api/session/is-auth-enabled and
+// /api/session/login: the login form needs to know what's pickable
+// BEFORE the user has any credentials.
+//
+// Response is intentionally narrow: only id + name. status is included
+// so the picker can hide suspended tenants. Description, timestamps,
+// and counts are admin metadata and stay behind auth.
+//
+// When multi-tenant is OFF, the configstore still returns a single
+// "default" tenant (seeded by the initial migration), so this endpoint
+// works in single-tenant mode too without special-casing.
+func (h *SessionHandler) listTenantsPublic(ctx *fasthttp.RequestCtx) {
+	if h.configStore == nil {
+		SendJSON(ctx, map[string]any{"tenants": []any{}})
+		return
+	}
+	tenants, _, err := h.configStore.GetTenantsPaginated(ctx, configstore.TenantsQueryParams{
+		// Cap large enough to cover any realistic deployment; the picker
+		// can't be paginated meaningfully because the user doesn't know
+		// the tenant id to filter by yet.
+		Limit: 1000,
+	})
+	if err != nil {
+		SendError(ctx, fasthttp.StatusInternalServerError, "failed to list tenants")
+		return
+	}
+	type minimal struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Status string `json:"status,omitempty"`
+	}
+	out := make([]minimal, 0, len(tenants))
+	for _, t := range tenants {
+		out = append(out, minimal{ID: t.ID, Name: t.Name, Status: t.Status})
+	}
+	SendJSON(ctx, map[string]any{"tenants": out})
 }
 
 // isAuthEnabled handles GET /api/session/is-auth-enabled - Check if auth is enabled

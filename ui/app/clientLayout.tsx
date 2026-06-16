@@ -2,6 +2,7 @@ import FullPageLoader from "@/components/fullPageLoader";
 import NotAvailableBanner from "@/components/notAvailableBanner";
 import ProgressProvider from "@/components/progressBar";
 import Sidebar from "@/components/sidebar";
+import TenantBadge from "@/components/tenantBadge";
 import { ThemeProvider } from "@/components/themeProvider";
 import TrialExpiryBanner from "@/components/trialExpiryBanner";
 import { SidebarProvider } from "@/components/ui/sidebar";
@@ -120,6 +121,12 @@ function AppContent({ children }: { children: React.ReactNode }) {
           <Sidebar />
           <div className="dark:bg-card custom-scrollbar content-container my-[0.5rem] mr-[0.5rem] h-[calc(100dvh-1rem)] w-full min-w-xl overflow-auto rounded-md border border-gray-200 bg-white px-10 dark:border-zinc-800">
             <TrialExpiryBanner />
+            {/* Tenant indicator + switcher pinned to the top-right of the
+                workspace shell, above the route content. Stays mounted
+                across navigation so the active tenant is always visible. */}
+            <div className="flex justify-end pt-2">
+              <TenantBadge />
+            </div>
             <main className="custom-scrollbar content-container-inner relative mx-auto flex flex-col overflow-y-hidden p-4">
               {isLoading ? (
                 <FullPageLoader />

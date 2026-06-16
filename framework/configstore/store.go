@@ -63,6 +63,16 @@ type CustomersQueryParams struct {
 	Search string
 }
 
+// TenantsQueryParams holds pagination, filtering, and search parameters for
+// tenant queries. Status filters to only tenants with that status (active /
+// suspended); empty matches all.
+type TenantsQueryParams struct {
+	Limit  int
+	Offset int
+	Search string
+	Status string
+}
+
 // PricingOverrideFilters holds the filters for pricing overrides.
 type PricingOverrideFilters struct {
 	ScopeKind     *string
@@ -111,28 +121,98 @@ type ConfigStore interface {
 	// Provider config CRUD
 	UpdateProvidersConfig(ctx context.Context, providers map[schemas.ModelProvider]ProviderConfig, tx ...*gorm.DB) error
 	AddProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+	// AddProviderForTenant is the tenant-scoped form of AddProvider used by
+	// the /api/tenants/{tenant_id}/providers admin route. tenant_id is
+	// written onto the new TableProvider row (and its keys) so it is
+	// visible only to GetProvidersConfigByTenant(tenantID). An empty
+	// tenantID is normalized to tables.DefaultTenantID so callers that
+	// haven't been routed through the resolver yet land on the seeded
+	// default tenant.
+	AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
 	UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
+	// UpdateProviderForTenant is the tenant-scoped form of UpdateProvider.
+	// The provider lookup, VKPC lookup, and new TableKey rows are all
+	// scoped by tenant_id so a multi-tenant deployment with the same
+	// provider name across tenants cannot have an update on tenant A
+	// touch tenant B's row. Empty tenantID normalizes to DefaultTenantID.
+	UpdateProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error
 	DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error
+	// DeleteProviderForTenant is the tenant-scoped form of DeleteProvider:
+	// only removes the row whose (tenant_id, name) matches. Empty
+	// tenantID normalizes to DefaultTenantID. Returns ErrNotFound when
+	// the provider exists in another tenant but not in this one — this
+	// is the contract callers rely on to surface a 404.
+	DeleteProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error
 	GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error)
+	// GetProvidersConfigByTenant returns the provider config map scoped to
+	// a single tenant — only rows whose tenant_id matches are returned.
+	// The MultiTenantRouter calls this to build the per-tenant
+	// schemas.Account each runtime is initialized from. Empty tenant id
+	// is treated as the DefaultTenantID for single-tenant call sites
+	// that haven't been migrated yet.
+	GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error)
 	GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*ProviderConfig, error)
+	// GetProviderConfigByTenant is the tenant-scoped form of
+	// GetProviderConfig: matches on (tenant_id, name) so two tenants can
+	// both have a provider called "openai" without colliding. Returns
+	// ErrNotFound when the tenant has no provider by that name. Empty
+	// tenantID normalizes to DefaultTenantID.
+	GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error)
 	GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error)
+	// GetProviderKeysForTenant is the tenant-scoped form of GetProviderKeys.
+	// Filters both the providers and the keys by tenant_id so a tenant
+	// never sees another tenant's keys even when the two have a provider
+	// with the same name. Empty tenantID normalizes to DefaultTenantID.
+	GetProviderKeysForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error)
 	GetProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string) (*schemas.Key, error)
+	// GetProviderKeyForTenant is the tenant-scoped form. Cross-tenant
+	// probes return ErrNotFound.
+	GetProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error)
 	CreateProviderKey(ctx context.Context, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error
+	// CreateProviderKeyForTenant adds a key to a tenant-scoped provider.
+	// Verifies the parent provider exists in tenantID's scope (returning
+	// ErrNotFound if not), then pins tenantID on the new TableKey row
+	// so it stays visible only to that tenant.
+	CreateProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error
 	UpdateProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, key schemas.Key, tx ...*gorm.DB) error
 	DeleteProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error
+	// DeleteProviderKeyForTenant only removes the key whose tenant_id
+	// matches. Returns ErrNotFound on cross-tenant probes.
+	DeleteProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error
 	GetProviders(ctx context.Context) ([]tables.TableProvider, error)
 	GetProvider(ctx context.Context, provider schemas.ModelProvider) (*tables.TableProvider, error)
 	UpdateStatus(ctx context.Context, provider schemas.ModelProvider, keyID string, status, errorMsg string) error
 
 	// MCP config CRUD
 	GetMCPConfig(ctx context.Context) (*schemas.MCPConfig, error)
+	// GetMCPConfigByTenant is the tenant-scoped form of GetMCPConfig.
+	// Only MCP clients with TenantID == tenantID are returned (empty
+	// tenantID normalizes to DefaultTenantID). The MultiTenantRouter
+	// calls this to assemble each tenant's BifrostConfig.MCP.
+	GetMCPConfigByTenant(ctx context.Context, tenantID string) (*schemas.MCPConfig, error)
 	GetMCPClientByID(ctx context.Context, id string) (*tables.TableMCPClient, error)
+	// GetMCPClientByIDForTenant returns the client only when it belongs
+	// to tenantID; otherwise ErrNotFound.
+	GetMCPClientByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableMCPClient, error)
 	GetMCPClientConfigByID(ctx context.Context, id string) (*schemas.MCPClientConfig, error)
 	GetMCPClientByName(ctx context.Context, name string) (*tables.TableMCPClient, error)
 	GetMCPClientsPaginated(ctx context.Context, params MCPClientsQueryParams) ([]tables.TableMCPClient, int64, error)
 	CreateMCPClientConfig(ctx context.Context, clientConfig *schemas.MCPClientConfig) error
+	// CreateMCPClientConfigForTenant is the tenant-scoped form of
+	// CreateMCPClientConfig: pins tenantID onto the new TableMCPClient
+	// row so it is only visible to GetMCPConfigByTenant(tenantID).
+	// Empty tenantID is normalized to DefaultTenantID.
+	CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error
 	UpdateMCPClientConfig(ctx context.Context, id string, clientConfig *tables.TableMCPClient) error
 	DeleteMCPClientConfig(ctx context.Context, id string) error
+	// DeleteMCPClientConfigForTenant only removes the MCP client whose
+	// tenant_id matches the supplied tenantID. Returns ErrNotFound on
+	// cross-tenant probes.
+	DeleteMCPClientConfigForTenant(ctx context.Context, tenantID, id string) error
+	// UpdateMCPClientConfigForTenant verifies the target client belongs
+	// to the supplied tenantID before delegating to UpdateMCPClientConfig.
+	// tenant_id is re-pinned on the row.
+	UpdateMCPClientConfigForTenant(ctx context.Context, tenantID, id string, clientConfig *tables.TableMCPClient) error
 
 	// Vector store config CRUD
 	UpdateVectorStoreConfig(ctx context.Context, config *vectorstore.Config) error
@@ -156,14 +236,31 @@ type ConfigStore interface {
 
 	// Governance config CRUD
 	GetVirtualKeys(ctx context.Context) ([]tables.TableVirtualKey, error)
+	// GetVirtualKeysByTenant is the tenant-scoped form: only returns VKs
+	// whose tenant_id matches. Empty tenantID normalizes to
+	// DefaultTenantID.
+	GetVirtualKeysByTenant(ctx context.Context, tenantID string) ([]tables.TableVirtualKey, error)
 	GetVirtualKeysPaginated(ctx context.Context, params VirtualKeyQueryParams) ([]tables.TableVirtualKey, int64, error)
 	GetRedactedVirtualKeys(ctx context.Context, ids []string) ([]tables.TableVirtualKey, error) // leave ids empty to get all
 	GetVirtualKey(ctx context.Context, id string) (*tables.TableVirtualKey, error)
+	// GetVirtualKeyByIDForTenant returns the VK only when it belongs to
+	// tenantID; cross-tenant probes return ErrNotFound so URL guessing
+	// cannot reveal whether a VK exists under another tenant.
+	GetVirtualKeyByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableVirtualKey, error)
 	GetVirtualKeyByValue(ctx context.Context, value string) (*tables.TableVirtualKey, error)
 	GetVirtualKeyQuotaByValue(ctx context.Context, value string) (*tables.TableVirtualKey, error)
 	CreateVirtualKey(ctx context.Context, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error
 	UpdateVirtualKey(ctx context.Context, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error
 	DeleteVirtualKey(ctx context.Context, id string, tx ...*gorm.DB) error
+	// DeleteVirtualKeyForTenant only removes the VK whose tenant_id
+	// matches the supplied tenantID. Returns ErrNotFound if the VK
+	// lives in another tenant's scope.
+	DeleteVirtualKeyForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error
+	// UpdateVirtualKeyForTenant verifies the target VK belongs to the
+	// supplied tenantID before delegating to UpdateVirtualKey. tenant_id
+	// is re-pinned on the row so a malicious payload cannot move a VK
+	// into another tenant's scope through the update path.
+	UpdateVirtualKeyForTenant(ctx context.Context, tenantID string, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error
 
 	// Virtual key provider config CRUD
 	GetVirtualKeyProviderConfigs(ctx context.Context, virtualKeyID string) ([]tables.TableVirtualKeyProviderConfig, error)
@@ -187,32 +284,93 @@ type ConfigStore interface {
 	GetTeamByName(ctx context.Context, name string, customerID string) (*tables.TableTeam, error)
 	GetTeamBySourceID(ctx context.Context, sourceID string) (*tables.TableTeam, error)
 	CreateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error
+	// CreateTeamForTenant pins tenant_id on the new TableTeam row.
+	// Empty tenantID normalizes to DefaultTenantID.
+	CreateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error
 	UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error
+	// UpdateTeamForTenant verifies tenant ownership before delegating
+	// to UpdateTeam. tenant_id is re-pinned on the row.
+	UpdateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error
 	DeleteTeam(ctx context.Context, id string) error
+	// DeleteTeamForTenant verifies tenant ownership before delegating
+	// to DeleteTeam. Cross-tenant probes return ErrNotFound.
+	DeleteTeamForTenant(ctx context.Context, tenantID, id string) error
+	// GetTeamsByTenant lists teams scoped to a tenant, optionally
+	// filtered by customer_id. Empty tenantID normalizes to
+	// DefaultTenantID.
+	GetTeamsByTenant(ctx context.Context, tenantID, customerID string) ([]tables.TableTeam, error)
+	// GetTeamByIDForTenant returns the team only when its tenant_id
+	// matches; otherwise ErrNotFound.
+	GetTeamByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableTeam, error)
 
 	// Customer CRUD
 	GetCustomers(ctx context.Context) ([]tables.TableCustomer, error)
 	GetCustomersPaginated(ctx context.Context, params CustomersQueryParams) ([]tables.TableCustomer, int64, error)
 	GetCustomer(ctx context.Context, id string) (*tables.TableCustomer, error)
 	CreateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
+	// CreateCustomerForTenant pins tenant_id on the new TableCustomer row.
+	CreateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error
 	UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error
+	// UpdateCustomerForTenant verifies tenant ownership, re-pins
+	// tenant_id, delegates to UpdateCustomer.
+	UpdateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error
 	DeleteCustomer(ctx context.Context, id string) error
+	// DeleteCustomerForTenant verifies tenant ownership and delegates
+	// to DeleteCustomer. Cross-tenant probes return ErrNotFound.
+	DeleteCustomerForTenant(ctx context.Context, tenantID, id string) error
+	// GetCustomersByTenant lists customers scoped to a tenant.
+	GetCustomersByTenant(ctx context.Context, tenantID string) ([]tables.TableCustomer, error)
+	// GetCustomerByIDForTenant returns the customer only when its
+	// tenant_id matches; otherwise ErrNotFound.
+	GetCustomerByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableCustomer, error)
+
+	// Tenant CRUD — the platform-level isolation boundary above governance.
+	// DeleteTenant refuses with ErrTenantNotEmpty if any governance / config
+	// rows still carry the tenant_id, and with ErrReservedTenant for the
+	// DefaultTenantID (which single-tenant OSS deployments depend on).
+	GetTenants(ctx context.Context) ([]tables.TableTenant, error)
+	GetTenantsPaginated(ctx context.Context, params TenantsQueryParams) ([]tables.TableTenant, int64, error)
+	GetTenant(ctx context.Context, id string) (*tables.TableTenant, error)
+	CreateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error
+	UpdateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error
+	DeleteTenant(ctx context.Context, id string) error
 
 	// Rate limit CRUD
 	GetRateLimits(ctx context.Context) ([]tables.TableRateLimit, error)
+	// GetRateLimitsByTenant lists rate limits scoped to a tenant.
+	GetRateLimitsByTenant(ctx context.Context, tenantID string) ([]tables.TableRateLimit, error)
 	GetRateLimit(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableRateLimit, error)
+	// GetRateLimitForTenant returns the rate limit only when its
+	// tenant_id matches.
+	GetRateLimitForTenant(ctx context.Context, tenantID, id string) (*tables.TableRateLimit, error)
 	CreateRateLimit(ctx context.Context, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
+	// CreateRateLimitForTenant pins tenant_id on the new row.
+	CreateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
 	UpdateRateLimit(ctx context.Context, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
+	// UpdateRateLimitForTenant verifies ownership and re-pins tenant_id.
+	UpdateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error
 	UpdateRateLimits(ctx context.Context, rateLimits []*tables.TableRateLimit, tx ...*gorm.DB) error
 	DeleteRateLimit(ctx context.Context, id string, tx ...*gorm.DB) error
+	// DeleteRateLimitForTenant verifies ownership and delegates.
+	DeleteRateLimitForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error
 
 	// Budget CRUD
 	GetBudgets(ctx context.Context) ([]tables.TableBudget, error)
+	// GetBudgetsByTenant lists budgets scoped to a tenant.
+	GetBudgetsByTenant(ctx context.Context, tenantID string) ([]tables.TableBudget, error)
 	GetBudget(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableBudget, error)
+	// GetBudgetForTenant returns the budget only when its tenant_id matches.
+	GetBudgetForTenant(ctx context.Context, tenantID, id string) (*tables.TableBudget, error)
 	CreateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
+	// CreateBudgetForTenant pins tenant_id on the new row.
+	CreateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error
 	UpdateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
+	// UpdateBudgetForTenant verifies ownership and re-pins tenant_id.
+	UpdateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error
 	UpdateBudgets(ctx context.Context, budgets []*tables.TableBudget, tx ...*gorm.DB) error
 	DeleteBudget(ctx context.Context, id string, tx ...*gorm.DB) error
+	// DeleteBudgetForTenant verifies ownership and delegates.
+	DeleteBudgetForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error
 	UpdateBudgetUsage(ctx context.Context, id string, currentUsage float64) error
 	UpdateRateLimitUsage(ctx context.Context, id string, tokenCurrentUsage int64, requestCurrentUsage int64) error
 

@@ -415,6 +415,13 @@ func (h *LoggingHandler) getLogs(ctx *fasthttp.RequestCtx) {
 	if businessUnitIDs := string(ctx.QueryArgs().Peek("business_unit_ids")); businessUnitIDs != "" {
 		filters.BusinessUnitIDs = parseCommaSeparated(businessUnitIDs)
 	}
+	// tenant_id supports comma-separated values so an admin-wide
+	// dashboard can compare tenants side-by-side. The usual call site
+	// (the workspace dashboard with a single tenant in scope) sends a
+	// single id; SQL applyFilters() uses IN() either way.
+	if tenantIDs := string(ctx.QueryArgs().Peek("tenant_id")); tenantIDs != "" {
+		filters.TenantIDs = parseCommaSeparated(tenantIDs)
+	}
 	if routingEngines := string(ctx.QueryArgs().Peek("routing_engine_used")); routingEngines != "" {
 		filters.RoutingEngineUsed = parseCommaSeparated(routingEngines)
 	}
@@ -656,6 +663,13 @@ func (h *LoggingHandler) getLogsStats(ctx *fasthttp.RequestCtx) {
 	if businessUnitIDs := string(ctx.QueryArgs().Peek("business_unit_ids")); businessUnitIDs != "" {
 		filters.BusinessUnitIDs = parseCommaSeparated(businessUnitIDs)
 	}
+	// tenant_id supports comma-separated values so an admin-wide
+	// dashboard can compare tenants side-by-side. The usual call site
+	// (the workspace dashboard with a single tenant in scope) sends a
+	// single id; SQL applyFilters() uses IN() either way.
+	if tenantIDs := string(ctx.QueryArgs().Peek("tenant_id")); tenantIDs != "" {
+		filters.TenantIDs = parseCommaSeparated(tenantIDs)
+	}
 	if routingEngines := string(ctx.QueryArgs().Peek("routing_engine_used")); routingEngines != "" {
 		filters.RoutingEngineUsed = parseCommaSeparated(routingEngines)
 	}
@@ -814,6 +828,13 @@ func parseHistogramFilters(ctx *fasthttp.RequestCtx) *logstore.SearchFilters {
 	}
 	if businessUnitIDs := string(ctx.QueryArgs().Peek("business_unit_ids")); businessUnitIDs != "" {
 		filters.BusinessUnitIDs = parseCommaSeparated(businessUnitIDs)
+	}
+	// tenant_id supports comma-separated values so an admin-wide
+	// dashboard can compare tenants side-by-side. The usual call site
+	// (the workspace dashboard with a single tenant in scope) sends a
+	// single id; SQL applyFilters() uses IN() either way.
+	if tenantIDs := string(ctx.QueryArgs().Peek("tenant_id")); tenantIDs != "" {
+		filters.TenantIDs = parseCommaSeparated(tenantIDs)
 	}
 	if routingEngines := string(ctx.QueryArgs().Peek("routing_engine_used")); routingEngines != "" {
 		filters.RoutingEngineUsed = parseCommaSeparated(routingEngines)

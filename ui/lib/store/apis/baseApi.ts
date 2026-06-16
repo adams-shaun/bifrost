@@ -63,8 +63,91 @@ const baseQuery = fetchBaseQuery({
 	},
 });
 
+// TENANT_SCOPED_PREFIXES enumerates the per-tenant admin surfaces the
+// F5XC patches added to bifrost-http. Endpoint definitions across the
+// UI keep their legacy single-tenant paths (e.g. "/providers",
+// "/governance/virtual-keys"); the wrapper below rewrites those to
+// "/tenants/{tid}/..." at request time when an active tenant id is set
+// in Redux. That way the existing 30+ endpoint files don't need to
+// thread tenantID through every call site.
+//
+// Order matters: longer-prefix matches must come first so e.g. an
+// inference path "/v1/..." (no prefix) doesn't get confused with an
+// admin "/v1/..." were we to add one later. Today every entry here is
+// a /api-relative admin path, distinct from /v1 inference.
+const TENANT_SCOPED_PREFIXES = [
+	"/providers",
+	"/governance/virtual-keys",
+	"/governance/teams",
+	"/governance/customers",
+	"/governance/budgets",
+	"/governance/rate-limits",
+	"/mcp/clients",
+];
+
+// TENANT_QUERY_PARAM_PREFIXES enumerates URL prefixes whose endpoints
+// take a `tenant_id` QUERY PARAM (not a path segment). The dashboard
+// logs / analytics endpoints live under /api/logs — they're shared
+// admin endpoints whose results we want per-tenant filtered when a
+// tenant is active. The backend's parseHistogramFilters reads
+// `tenant_id` and applies a WHERE clause on logs.tenant_id. Multi-
+// value support comes for free via comma-separated values.
+const TENANT_QUERY_PARAM_PREFIXES = ["/logs"];
+
+// applyTenantPrefix rewrites a URL string (path + optional query) into
+// the tenant-scoped form when (a) a tenant is currently selected in
+// Redux and (b) the path matches one of the tenant-scoped prefixes.
+// Returns the input unchanged otherwise.
+function applyTenantPrefix(rawURL: string, tenantID: string | null): string {
+	if (!tenantID) return rawURL;
+	// fetchBaseQuery passes the endpoint path WITHOUT the baseUrl. It can
+	// be either with or without a leading slash. Normalize so the prefix
+	// match works either way.
+	const leadingSlash = rawURL.startsWith("/");
+	const path = leadingSlash ? rawURL : `/${rawURL}`;
+	for (const prefix of TENANT_SCOPED_PREFIXES) {
+		if (path === prefix || path.startsWith(`${prefix}/`) || path.startsWith(`${prefix}?`)) {
+			const rewritten = `/tenants/${encodeURIComponent(tenantID)}${path}`;
+			return leadingSlash ? rewritten : rewritten.slice(1);
+		}
+	}
+	// Query-param tenant scoping (logs / dashboard analytics). Append
+	// `tenant_id=<id>` to the existing query string when the caller
+	// didn't already supply one — explicit caller-provided tenant_id
+	// (e.g. an admin-wide multi-tenant view) wins.
+	for (const prefix of TENANT_QUERY_PARAM_PREFIXES) {
+		if (path === prefix || path.startsWith(`${prefix}/`) || path.startsWith(`${prefix}?`)) {
+			const qIndex = path.indexOf("?");
+			const hasQuery = qIndex >= 0;
+			const queryStr = hasQuery ? path.slice(qIndex + 1) : "";
+			if (/(?:^|&)tenant_id=/.test(queryStr)) {
+				return rawURL;
+			}
+			const sep = hasQuery && queryStr.length > 0 ? "&" : "?";
+			const appended = `${path}${sep}tenant_id=${encodeURIComponent(tenantID)}`;
+			return leadingSlash ? appended : appended.slice(1);
+		}
+	}
+	return rawURL;
+}
+
+// baseQueryWithTenantPrefix wraps fetchBaseQuery so every outgoing
+// admin request automatically picks up /tenants/{tid}/... when a
+// tenant is active. Endpoint definitions stay agnostic.
+const baseQueryWithTenantPrefix: typeof baseQuery = (args, api, extraOptions) => {
+	const state = api.getState() as { tenant?: { currentTenantID: string | null } };
+	const tenantID = state.tenant?.currentTenantID ?? null;
+	if (typeof args === "string") {
+		return baseQuery(applyTenantPrefix(args, tenantID), api, extraOptions);
+	}
+	if (args && typeof args === "object" && "url" in args && typeof args.url === "string") {
+		return baseQuery({ ...args, url: applyTenantPrefix(args.url, tenantID) }, api, extraOptions);
+	}
+	return baseQuery(args, api, extraOptions);
+};
+
 // Wrap base query with enterprise refresh logic (or passthrough for non-enterprise)
-const baseQueryWithRefresh = createBaseQueryWithRefresh(baseQuery);
+const baseQueryWithRefresh = createBaseQueryWithRefresh(baseQueryWithTenantPrefix);
 
 // Enhanced base query with error handling
 const baseQueryWithErrorHandling: typeof baseQueryWithRefresh = async (
@@ -190,6 +273,7 @@ export const baseApi = createApi({
     "AuthType",
     "MCPSessions",
     "FeatureFlags",
+    "Tenants",
   ],
   endpoints: () => ({}),
 });

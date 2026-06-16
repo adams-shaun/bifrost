@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -46,9 +48,61 @@ type BifrostInstall struct {
 	// MockLLM points at the in-cluster mock LLM (deployed by the deps chart).
 	MockLLM *MockLLM
 
+	// MultiTenantEnabled reflects whether the install was deployed with
+	// BIFROST_MULTI_TENANT_ENABLED=true (i.e. WithMultiTenant was passed).
+	// Scenarios use this to decide whether to drive the per-tenant admin
+	// surface or the legacy single-tenant one.
+	MultiTenantEnabled bool
+
 	cluster      *KindCluster
 	t            *testing.T
 	stopForwards []func()
+
+	extraEnv []corev1EnvVar
+}
+
+// corev1EnvVar is a minimal mirror of corev1.EnvVar — we don't take a k8s
+// client dependency just to splice env vars into the rendered Deployment.
+type corev1EnvVar struct {
+	Name  string `yaml:"name"`
+	Value string `yaml:"value"`
+}
+
+// BifrostOption customizes the install before kubectl apply.
+type BifrostOption func(*bifrostOptions)
+
+type bifrostOptions struct {
+	multiTenant         bool
+	adminDefaultTenant  string
+	additionalEnvByName map[string]string // future-proof escape hatch
+}
+
+// WithMultiTenant turns multi-tenancy on for the deployed bifrost by
+// injecting BIFROST_MULTI_TENANT_ENABLED=true and (when adminDefaultTenant
+// is non-empty) BIFROST_ADMIN_DEFAULT_TENANT into the Deployment's env
+// before the rendered manifest is applied.
+//
+// adminDefaultTenant tells the AdminAuthz stub which tenant ID legacy
+// /api/<entity> calls (and platform-admin endpoints whose path doesn't
+// embed a tenant) bind to. Pass "" if the scenario only drives
+// /api/platform/* and /api/tenants/{tid}/* and never the legacy surface.
+func WithMultiTenant(adminDefaultTenant string) BifrostOption {
+	return func(o *bifrostOptions) {
+		o.multiTenant = true
+		o.adminDefaultTenant = adminDefaultTenant
+	}
+}
+
+// WithExtraEnv injects an arbitrary env var into the bifrost container at
+// deploy time. Repeated calls accumulate; a later call overwrites an
+// earlier one for the same name.
+func WithExtraEnv(name, value string) BifrostOption {
+	return func(o *bifrostOptions) {
+		if o.additionalEnvByName == nil {
+			o.additionalEnvByName = map[string]string{}
+		}
+		o.additionalEnvByName[name] = value
+	}
 }
 
 // KeepInfra reports whether teardown should be skipped (BIFROST_K8S_KEEP=1),
@@ -62,7 +116,10 @@ func KeepInfra() bool { return os.Getenv("BIFROST_K8S_KEEP") == "1" }
 //  4. wait for readiness and open a port-forward to the bifrost Service.
 //
 // Returns the install handle and a teardown func.
-func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
+//
+// opts customize the deploy (e.g. WithMultiTenant). Backward-compatible:
+// existing callers passing no opts get the legacy single-tenant deploy.
+func NewBifrostInstall(t *testing.T, c *KindCluster, opts ...BifrostOption) (*BifrostInstall, func()) {
 	t.Helper()
 
 	if _, err := exec.LookPath("helm"); err != nil {
@@ -72,8 +129,27 @@ func NewBifrostInstall(t *testing.T, c *KindCluster) (*BifrostInstall, func()) {
 		t.Skipf("docker not installed: %v", err)
 	}
 
+	o := &bifrostOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+
 	ns, nsCallerManaged := namespace()
-	bf := &BifrostInstall{Namespace: ns, cluster: c, t: t}
+	bf := &BifrostInstall{
+		Namespace:          ns,
+		cluster:            c,
+		t:                  t,
+		MultiTenantEnabled: o.multiTenant,
+	}
+	if o.multiTenant {
+		bf.extraEnv = append(bf.extraEnv, corev1EnvVar{Name: "BIFROST_MULTI_TENANT_ENABLED", Value: "true"})
+		if o.adminDefaultTenant != "" {
+			bf.extraEnv = append(bf.extraEnv, corev1EnvVar{Name: "BIFROST_ADMIN_DEFAULT_TENANT", Value: o.adminDefaultTenant})
+		}
+	}
+	for name, value := range o.additionalEnvByName {
+		bf.extraEnv = append(bf.extraEnv, corev1EnvVar{Name: name, Value: value})
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -234,11 +310,118 @@ func (bf *BifrostInstall) renderAndApplyBifrost(ctx context.Context) {
 		t.Fatalf("serelib docker cp out: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
+	// Splice extra env vars (e.g. WithMultiTenant) into the rendered
+	// Deployment before kubectl apply, so the very first pod that comes
+	// up already carries the right config. Doing this BEFORE apply
+	// (rather than `kubectl set env` after) avoids the race where
+	// WaitReady picks up an old-spec pod that briefly became Ready.
+	if len(bf.extraEnv) > 0 {
+		path := filepath.Join(work, "k8s", "deployment.yml")
+		if err := spliceExtraEnvIntoDeployment(path, bf.extraEnv); err != nil {
+			t.Fatalf("splice extra env into rendered deployment: %v", err)
+		}
+		names := make([]string, 0, len(bf.extraEnv))
+		for _, e := range bf.extraEnv {
+			names = append(names, e.Name)
+		}
+		t.Logf("spliced extra env into Deployment: %s", strings.Join(names, ","))
+	}
+
 	apply := bf.cluster.Kubectl(ctx, "apply", "-n", bf.Namespace, "-f", filepath.Join(work, "k8s"))
 	if out, err := apply.CombinedOutput(); err != nil {
 		t.Fatalf("kubectl apply bifrost: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	t.Logf("applied serelib-rendered bifrost manifests to namespace %s", bf.Namespace)
+}
+
+// spliceExtraEnvIntoDeployment edits the rendered Deployment YAML in place,
+// appending env entries to the FIRST container of the FIRST PodSpec it
+// finds. The rendered file has exactly one container ("bifrost"), so
+// "first" is unambiguous in practice. Uses yaml.v3 (already an indirect
+// dep) rather than sed/regex so reformatting/comments don't trip a
+// brittle string match.
+func spliceExtraEnvIntoDeployment(path string, extra []corev1EnvVar) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return fmt.Errorf("unexpected YAML shape in %s", path)
+	}
+	// spec.template.spec.containers[0].env
+	specEnv, err := navigate(root.Content[0],
+		"spec", "template", "spec", "containers")
+	if err != nil {
+		return err
+	}
+	if specEnv.Kind != yaml.SequenceNode || len(specEnv.Content) == 0 {
+		return fmt.Errorf("containers not a non-empty sequence in %s", path)
+	}
+	container := specEnv.Content[0]
+	envNode := mappingValue(container, "env")
+	if envNode == nil {
+		// No env block at all — add one.
+		envNode = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		container.Content = append(container.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "env"},
+			envNode)
+	}
+	if envNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("container env not a sequence in %s", path)
+	}
+	for _, e := range extra {
+		entry := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		entry.Content = []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.Name},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "value"},
+			// Quote-style "" -> yaml.v3 picks a sane default ("|" for multiline,
+			// plain otherwise). Force DoubleQuotedStyle so e.g. "true" stays a
+			// string (Kubernetes EnvVar.value is a string).
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.Value, Style: yaml.DoubleQuotedStyle},
+		}
+		envNode.Content = append(envNode.Content, entry)
+	}
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", path, err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// navigate walks down a sequence of mapping keys to reach a nested node.
+// Returns an error mentioning the missing key for diagnostics.
+func navigate(n *yaml.Node, keys ...string) (*yaml.Node, error) {
+	cur := n
+	for _, k := range keys {
+		child := mappingValue(cur, k)
+		if child == nil {
+			return nil, fmt.Errorf("yaml key %q not found at path %v", k, keys)
+		}
+		cur = child
+	}
+	return cur, nil
+}
+
+// mappingValue returns the value node for the given key in a mapping, or
+// nil if not present / not a mapping.
+func mappingValue(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return n.Content[i+1]
+		}
+	}
+	return nil
 }
 
 func (bf *BifrostInstall) ensureNamespace(ctx context.Context) error {

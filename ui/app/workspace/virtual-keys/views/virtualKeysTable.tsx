@@ -616,7 +616,7 @@ export default function VirtualKeysTable({
 						{hasActiveFilters && (
 							<p className="text-muted-foreground text-xs">
 								Filters applied:{" "}
-								{[debouncedSearch && `search "${debouncedSearch}"`, customerFilter && "customer filter", teamFilter && "team filter"]
+								{[debouncedSearch && `search "${debouncedSearch}"`, customerFilter && "namespace filter", teamFilter && "team filter"]
 									.filter(Boolean)
 									.join(", ")}
 							</p>
@@ -718,7 +718,7 @@ export default function VirtualKeysTable({
 						options={customers.map((c) => ({ label: c.name, value: c.id }))}
 						value={customerFilter || null}
 						onValueChange={(val) => onCustomerFilterChange(val ?? "")}
-						placeholder="All Customers"
+						placeholder="All Namespaces"
 						className="h-9 w-[180px]"
 					/>
 					{customerFilter && teamFilter && <span className="text-muted-foreground text-xs font-medium">or</span>}

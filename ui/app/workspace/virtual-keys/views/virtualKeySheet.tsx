@@ -152,7 +152,7 @@ const formSchema = z
 			return true;
 		},
 		{
-			message: "Please select a valid team, customer, or access profile when assignment type is chosen",
+			message: "Please select a valid team, namespace, or access profile when assignment type is chosen",
 			path: ["entityType"],
 		},
 	);
@@ -1792,7 +1792,7 @@ export default function VirtualKeySheet({
 																options={[
 																	{ value: "none", label: "No Assignment" },
 																	...(teams?.length > 0 ? [{ value: "team", label: "Assign to Team" }] : []),
-																	...(customers?.length > 0 ? [{ value: "customer", label: "Assign to Customer" }] : []),
+																	...(customers?.length > 0 ? [{ value: "customer", label: "Assign to Namespace" }] : []),
 																	...(accessProfiles?.length > 0 || virtualKey?.access_profile_id || defaultAccessProfileId
 																		? [{ value: "access_profile", label: "Assign to Access Profile" }]
 																		: []),
@@ -1889,7 +1889,7 @@ export default function VirtualKeySheet({
 														name="customerId"
 														render={({ field }) => (
 															<FormItem>
-																<FormLabel className="font-normal">Select Customer</FormLabel>
+																<FormLabel className="font-normal">Select Namespace</FormLabel>
 																<ComboboxSelect
 																	options={customers.map((customer) => ({
 																		value: customer.id,
@@ -1897,8 +1897,8 @@ export default function VirtualKeySheet({
 																	}))}
 																	value={field.value || null}
 																	onValueChange={(val) => field.onChange(val ?? "")}
-																	placeholder="Select a customer"
-																	emptyMessage="No customers found."
+																	placeholder="Select a namespace"
+																	emptyMessage="No namespaces found."
 																	className="h-9"
 																/>
 																<FormMessage />

@@ -247,7 +247,7 @@ export default function TeamsTable({
 							<TableHeader>
 								<TableRow>
 									<TableHead>Name</TableHead>
-									<TableHead>Customer</TableHead>
+									<TableHead>Namespace</TableHead>
 									<TableHead>Budget</TableHead>
 									<TableHead>Rate Limit</TableHead>
 									<TableHead>Virtual Keys</TableHead>

@@ -856,7 +856,7 @@ export default function AppSidebar() {
         title: "Governance",
         url: "/workspace/governance",
         icon: Landmark,
-        description: "Virtual keys, users, teams, customers & roles",
+        description: "Virtual keys, users, teams, namespaces & roles",
         hasAccess: hasAnyGovernanceAccess,
         subItems: [
           {
@@ -888,10 +888,10 @@ export default function AppSidebar() {
             hasAccess: hasBusinessUnitsAccess,
           },
           {
-            title: "Customers",
+            title: "Namespaces",
             url: "/workspace/governance/customers",
             icon: WalletCards,
-            description: "Manage customers",
+            description: "Manage namespaces",
             hasAccess: hasCustomersAccess,
           },
           {

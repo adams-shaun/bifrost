@@ -457,6 +457,11 @@ func applyModelAlias(entry *logstore.Log, requestedModel, resolvedModel string) 
 }
 
 // applyOutputFieldsToEntry sets common output fields on a log entry.
+// tenantID is the multi-tenant scope resolved from the inference
+// request's ctx (set by the tenant resolver middleware that runs
+// when BIFROST_MULTI_TENANT_ENABLED is on). Empty string leaves the
+// column NULL — single-tenant deployments + requests that never went
+// through the resolver land in the "no tenant" bucket.
 func applyOutputFieldsToEntry(
 	entry *logstore.Log,
 	selectedKeyID, selectedKeyName string,
@@ -467,6 +472,7 @@ func applyOutputFieldsToEntry(
 	customerID, customerName string,
 	userID, userName string,
 	businessUnitID, businessUnitName string,
+	tenantID string,
 	numberOfRetries int,
 	latency int64,
 	attemptTrail []schemas.KeyAttemptRecord,
@@ -517,6 +523,9 @@ func applyOutputFieldsToEntry(
 	}
 	if businessUnitName != "" {
 		entry.BusinessUnitName = &businessUnitName
+	}
+	if tenantID != "" {
+		entry.TenantID = &tenantID
 	}
 	if numberOfRetries != 0 {
 		entry.NumberOfRetries = numberOfRetries

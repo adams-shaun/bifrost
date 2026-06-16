@@ -173,7 +173,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
 	const onSubmit = (data: RoutingRuleFormData) => {
 		// Validate scope_id is required when scope is not global
 		if (data.scope !== "global" && !data.scope_id?.trim()) {
-			toast.error(`${data.scope === "team" ? "Team" : data.scope === "customer" ? "Customer" : "Virtual Key"} is required`);
+			toast.error(`${data.scope === "team" ? "Team" : data.scope === "customer" ? "Namespace" : "Virtual Key"} is required`);
 			return;
 		}
 
@@ -369,7 +369,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
 						{scope !== "global" && (
 							<div className="space-y-2">
 								<Label htmlFor="scope_id">
-									{scope === "team" ? "Team" : scope === "customer" ? "Customer" : "Virtual Key"} <span className="text-red-500">*</span>
+									{scope === "team" ? "Team" : scope === "customer" ? "Namespace" : "Virtual Key"} <span className="text-red-500">*</span>
 								</Label>
 								{scope === "team" && teamsData.teams.length > 0 && (
 									<ComboboxSelect
@@ -385,7 +385,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
 										options={customersData.customers.map((customer) => ({ label: customer.name, value: customer.id }))}
 										value={scopeId || null}
 										onValueChange={(value) => setValue("scope_id", value ?? "")}
-										placeholder="Select a customer..."
+										placeholder="Select a namespace..."
 										noPortal
 									/>
 								)}
@@ -402,7 +402,7 @@ export function RoutingRuleSheet({ open, onOpenChange, editingRule, onSuccess }:
 									(scope === "customer" && customersData.customers.length === 0) ||
 									(scope === "virtual_key" && vksData.virtual_keys.length === 0)) && (
 									<p className="text-muted-foreground text-sm">
-										No {scope === "team" ? "teams" : scope === "customer" ? "customers" : "virtual keys"} available
+										No {scope === "team" ? "teams" : scope === "customer" ? "namespaces" : "virtual keys"} available
 									</p>
 								)}
 								{errors.scope_id && <p className="text-destructive text-sm">{errors.scope_id.message}</p>}

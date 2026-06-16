@@ -333,6 +333,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddClusterGovernanceColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddTenantIDColumn(ctx, db); err != nil {
+		return err
+	}
 	// migrationSplitFilterDataMatView is intentionally NOT invoked in this
 	// release. Dropping mv_logs_filterdata while old replicas are still
 	// serving /api/logs/filterdata from it would surface "relation does not
@@ -3181,6 +3184,55 @@ func migrationAddDACColumnsToMCPToolLogs(ctx context.Context, db *gorm.DB) error
 	}})
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error while adding DAC columns to mcp_tool_logs: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddTenantIDColumn adds the tenant_id column + index to the
+// logs table for the multi-tenant dashboard filter. NULL is the
+// "no tenant resolved" state — single-tenant deployments and legacy
+// /api/* inference calls that don't carry a VK leave it NULL. The
+// dashboard's tenant filter applies `WHERE tenant_id IN (?)` so NULL
+// rows are hidden whenever a tenant is selected; admin-wide views
+// (no filter) include them.
+func migrationAddTenantIDColumn(ctx context.Context, db *gorm.DB) error {
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: "logs_add_tenant_id_column",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+			if !mg.HasColumn(&Log{}, "tenant_id") {
+				if err := mg.AddColumn(&Log{}, "tenant_id"); err != nil {
+					return err
+				}
+			}
+			if !mg.HasIndex(&Log{}, "idx_logs_tenant_id") {
+				if err := mg.CreateIndex(&Log{}, "idx_logs_tenant_id"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+			if mg.HasIndex(&Log{}, "idx_logs_tenant_id") {
+				if err := mg.DropIndex(&Log{}, "idx_logs_tenant_id"); err != nil {
+					return err
+				}
+			}
+			if mg.HasColumn(&Log{}, "tenant_id") {
+				if err := mg.DropColumn(&Log{}, "tenant_id"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error while adding tenant_id column to logs: %s", err.Error())
 	}
 	return nil
 }

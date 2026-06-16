@@ -1157,6 +1157,7 @@ func TestTriggerMigrations_FreshDB(t *testing.T) {
 		&tables.TableClientConfig{},
 		&tables.TableVirtualKeyProviderConfig{},
 		&tables.TableVirtualKeyMCPConfig{},
+		&tables.TableTenant{},
 	}
 
 	migrator := db.Migrator()
@@ -2381,3 +2382,261 @@ func assertNoCorruptedFKReferences(t *testing.T, db *gorm.DB) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// TestMigrationAddTenants_CreatesTableAndSeedsDefault verifies that the
+// initial multi-tenant migration:
+//   - creates the bf_tenants table
+//   - seeds the "default" tenant
+//   - adds tenant_id to governance_customers
+//   - backfills existing customer rows to the default tenant
+//
+// Plus an idempotency check (second run must not duplicate the default tenant).
+func TestMigrationAddTenants_CreatesTableAndSeedsDefault(t *testing.T) {
+	_, db := setupFullMigrationDB(t)
+	ctx := context.Background()
+
+	// The table should exist and hold the default tenant.
+	require.True(t, db.Migrator().HasTable(&tables.TableTenant{}))
+	var got tables.TableTenant
+	err := db.First(&got, "id = ?", tables.DefaultTenantID).Error
+	require.NoError(t, err)
+	assert.Equal(t, tables.DefaultTenantID, got.ID)
+	assert.Equal(t, tables.TenantStatusActive, got.Status)
+
+	// governance_customers should have tenant_id.
+	assert.True(t, db.Migrator().HasColumn(&tables.TableCustomer{}, "tenant_id"))
+
+	// A customer inserted without an explicit TenantID gets the default via
+	// the column default (NOT via the migration backfill, which only touches
+	// rows inserted *before* the column existed).
+	now := time.Now()
+	cust := tables.TableCustomer{
+		ID:        "cust-1",
+		Name:      "Acme",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	require.NoError(t, db.Create(&cust).Error)
+	var roundtripped tables.TableCustomer
+	require.NoError(t, db.First(&roundtripped, "id = ?", "cust-1").Error)
+	assert.Equal(t, tables.DefaultTenantID, roundtripped.TenantID,
+		"customer.tenant_id should default to %q when omitted on insert", tables.DefaultTenantID)
+
+	// Idempotency: running the migration a second time must not duplicate
+	// the default tenant row or fail.
+	require.NoError(t, migrationAddTenantsTableAndCustomerTenantID(ctx, db))
+	var count int64
+	require.NoError(t, db.Model(&tables.TableTenant{}).Where("id = ?", tables.DefaultTenantID).Count(&count).Error)
+	assert.Equal(t, int64(1), count, "default tenant must not be duplicated on re-run")
+}
+
+// TestMigrationAddTenantIDToGovernanceTables_AppliesToAllFour verifies that
+// the second multi-tenant migration lands tenant_id on teams, virtual_keys,
+// budgets, and rate_limits, and that the "default" column default kicks in
+// for new inserts that omit TenantID.
+func TestMigrationAddTenantIDToGovernanceTables_AppliesToAllFour(t *testing.T) {
+	_, db := setupFullMigrationDB(t)
+	ctx := context.Background()
+
+	for _, m := range []any{
+		&tables.TableTeam{},
+		&tables.TableVirtualKey{},
+		&tables.TableBudget{},
+		&tables.TableRateLimit{},
+	} {
+		assert.True(t, db.Migrator().HasColumn(m, "tenant_id"),
+			"tenant_id column should exist on %T", m)
+	}
+
+	now := time.Now()
+
+	// Team: insert without TenantID; should pick up the "default".
+	team := tables.TableTeam{ID: "team-1", Name: "Engineering", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&team).Error)
+	var teamRT tables.TableTeam
+	require.NoError(t, db.First(&teamRT, "id = ?", "team-1").Error)
+	assert.Equal(t, tables.DefaultTenantID, teamRT.TenantID,
+		"team tenant_id should default to %q", tables.DefaultTenantID)
+
+	// Budget.
+	budget := tables.TableBudget{
+		ID:            "budget-1",
+		MaxLimit:      100.0,
+		ResetDuration: "1h",
+		LastReset:     now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	require.NoError(t, db.Create(&budget).Error)
+	var budgetRT tables.TableBudget
+	require.NoError(t, db.First(&budgetRT, "id = ?", "budget-1").Error)
+	assert.Equal(t, tables.DefaultTenantID, budgetRT.TenantID)
+
+	// RateLimit.
+	rl := tables.TableRateLimit{ID: "rl-1", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&rl).Error)
+	var rlRT tables.TableRateLimit
+	require.NoError(t, db.First(&rlRT, "id = ?", "rl-1").Error)
+	assert.Equal(t, tables.DefaultTenantID, rlRT.TenantID)
+
+	// VirtualKey: needs unique Name + Value. BeforeSave hook handles hashing
+	// and encryption; we just supply valid fields.
+	vk := tables.TableVirtualKey{
+		ID:        "vk-1",
+		Name:      "test-vk-tenant-default",
+		Value:     "sk-test-tenant-default",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	require.NoError(t, db.Create(&vk).Error)
+	var vkRT tables.TableVirtualKey
+	require.NoError(t, db.First(&vkRT, "id = ?", "vk-1").Error)
+	assert.Equal(t, tables.DefaultTenantID, vkRT.TenantID)
+
+	// Idempotency: re-running the migration must not error and must not
+	// change any of the seeded tenant_ids.
+	require.NoError(t, migrationAddTenantIDToGovernanceTables(ctx, db))
+	for tableName, rowID := range map[string]string{
+		"governance_teams":        "team-1",
+		"governance_virtual_keys": "vk-1",
+		"governance_budgets":      "budget-1",
+		"governance_rate_limits":  "rl-1",
+	} {
+		var tid string
+		require.NoError(t, db.Raw(
+			fmt.Sprintf("SELECT tenant_id FROM %s WHERE id = ?", tableName), rowID,
+		).Scan(&tid).Error)
+		assert.Equal(t, tables.DefaultTenantID, tid,
+			"%s row should still carry default tenant_id after re-run", tableName)
+	}
+}
+
+// TestMigrationAddTenantIDToProviderConfigTables_ColumnAddedAndDefaulted
+// verifies the third multi-tenant migration:
+//   - lands tenant_id on config_providers, config_keys, config_mcp_clients
+//   - the column default "default" kicks in for inserts that omit it
+//
+// Per-tenant Name uniqueness is intentionally not asserted here — it's
+// deferred to the follow-up patch that updates the rdb upsert callers
+// (see migration's doc comment).
+func TestMigrationAddTenantIDToProviderConfigTables_ColumnAddedAndDefaulted(t *testing.T) {
+	_, db := setupFullMigrationDB(t)
+	ctx := context.Background()
+
+	for _, m := range []any{
+		&tables.TableProvider{},
+		&tables.TableKey{},
+		&tables.TableMCPClient{},
+	} {
+		assert.True(t, db.Migrator().HasColumn(m, "tenant_id"),
+			"tenant_id column should exist on %T", m)
+	}
+
+	now := time.Now()
+
+	// Provider: insert without TenantID → default kicks in.
+	prov := tables.TableProvider{
+		Name:      "openai",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	require.NoError(t, db.Create(&prov).Error)
+	var provRT tables.TableProvider
+	require.NoError(t, db.First(&provRT, "id = ?", prov.ID).Error)
+	assert.Equal(t, tables.DefaultTenantID, provRT.TenantID,
+		"provider tenant_id should default to %q", tables.DefaultTenantID)
+
+	// Key: requires a ProviderID; reuse the provider above.
+	key := tables.TableKey{
+		Name:       "production",
+		ProviderID: prov.ID,
+		Provider:   "openai",
+		KeyID:      "uuid-1",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	require.NoError(t, db.Create(&key).Error)
+	var keyRT tables.TableKey
+	require.NoError(t, db.First(&keyRT, "id = ?", key.ID).Error)
+	assert.Equal(t, tables.DefaultTenantID, keyRT.TenantID)
+
+	// MCP client.
+	mcp := tables.TableMCPClient{
+		ClientID:       "mcp-1",
+		Name:           "tools",
+		ConnectionType: "stdio",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	require.NoError(t, db.Create(&mcp).Error)
+	var mcpRT tables.TableMCPClient
+	require.NoError(t, db.First(&mcpRT, "id = ?", mcp.ID).Error)
+	assert.Equal(t, tables.DefaultTenantID, mcpRT.TenantID)
+
+	// Idempotency: re-running must succeed and leave tenant_ids untouched.
+	require.NoError(t, migrationAddTenantIDToProviderConfigTables(ctx, db))
+}
+
+// TestMigrationTenantScopedNameUniques_PerTenantUniqueness verifies the
+// fourth multi-tenant migration:
+//   - drops legacy single-column unique indexes on Name for providers /
+//     keys / MCP clients
+//   - replaces them with composite (tenant_id, name) unique indexes
+//   - two distinct tenants can therefore register a provider/MCP/key
+//     sharing a Name
+//   - intra-tenant uniqueness is still enforced (one tenant can't
+//     register two providers called "openai")
+//   - ClientID on config_mcp_clients stays globally unique (FK target)
+//   - KeyID on config_keys stays globally unique (UUID)
+func TestMigrationTenantScopedNameUniques_PerTenantUniqueness(t *testing.T) {
+	_, db := setupFullMigrationDB(t)
+	ctx := context.Background()
+
+	// Legacy indexes should be gone, composites in place.
+	mig := db.Migrator()
+	assert.False(t, mig.HasIndex(&tables.TableProvider{}, "idx_config_providers_name"))
+	assert.False(t, mig.HasIndex(&tables.TableMCPClient{}, "idx_config_mcp_clients_name"))
+	assert.False(t, mig.HasIndex(&tables.TableKey{}, "idx_key_name"))
+	assert.True(t, mig.HasIndex(&tables.TableProvider{}, "idx_providers_tenant_name"))
+	assert.True(t, mig.HasIndex(&tables.TableMCPClient{}, "idx_mcp_tenant_name"))
+	assert.True(t, mig.HasIndex(&tables.TableKey{}, "idx_key_tenant_name"))
+
+	now := time.Now()
+
+	// --- Providers ---
+	provA := tables.TableProvider{Name: "openai", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&provA).Error)
+	provB := tables.TableProvider{Name: "openai", TenantID: "tenant-b", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&provB).Error,
+		"two tenants must be able to register the same provider name")
+	// Intra-tenant duplicate must still fail.
+	dupA := tables.TableProvider{Name: "openai", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
+	require.Error(t, db.Create(&dupA).Error,
+		"intra-tenant provider name uniqueness must still be enforced")
+
+	// --- MCP clients ---
+	mcpA := tables.TableMCPClient{ClientID: "mcp-a", Name: "tools", TenantID: "tenant-a", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&mcpA).Error)
+	mcpB := tables.TableMCPClient{ClientID: "mcp-b", Name: "tools", TenantID: "tenant-b", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&mcpB).Error,
+		"two tenants must be able to register MCP clients with the same name")
+	dupMCPSameTenant := tables.TableMCPClient{ClientID: "mcp-a2", Name: "tools", TenantID: "tenant-a", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
+	require.Error(t, db.Create(&dupMCPSameTenant).Error,
+		"intra-tenant MCP name uniqueness must still be enforced")
+	dupMCPClientID := tables.TableMCPClient{ClientID: "mcp-a", Name: "tools-other", TenantID: "tenant-b", ConnectionType: "stdio", CreatedAt: now, UpdatedAt: now}
+	require.Error(t, db.Create(&dupMCPClientID).Error,
+		"ClientID stays globally unique (FK target)")
+
+	// --- Keys --- (need providers to satisfy FK)
+	keyA := tables.TableKey{Name: "production", ProviderID: provA.ID, Provider: "openai", KeyID: "kid-a", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&keyA).Error)
+	keyB := tables.TableKey{Name: "production", ProviderID: provB.ID, Provider: "openai", KeyID: "kid-b", TenantID: "tenant-b", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&keyB).Error,
+		"two tenants must be able to register the same key name")
+	dupKeyName := tables.TableKey{Name: "production", ProviderID: provA.ID, Provider: "openai", KeyID: "kid-a2", TenantID: "tenant-a", CreatedAt: now, UpdatedAt: now}
+	require.Error(t, db.Create(&dupKeyName).Error,
+		"intra-tenant key name uniqueness must still be enforced")
+
+	// Idempotency.
+	require.NoError(t, migrationTenantScopedNameUniques(ctx, db))
+}

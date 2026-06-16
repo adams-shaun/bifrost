@@ -114,7 +114,7 @@ export default function GovernanceVirtualKeysPage() {
         toast.error(`Failed to load teams: ${getErrorMessage(teamsError)}`);
       if (customersError)
         toast.error(
-          `Failed to load customers: ${getErrorMessage(customersError)}`,
+          `Failed to load namespaces: ${getErrorMessage(customersError)}`,
         );
     }
   }, [vkError, teamsError, customersError]);

@@ -58,7 +58,7 @@ export default function VirtualKeyDetailSheet({ virtualKey, onClose }: VirtualKe
 			return { type: "Team", name: virtualKey.team.name };
 		}
 		if (virtualKey.customer) {
-			return { type: "Customer", name: virtualKey.customer.name };
+			return { type: "Namespace", name: virtualKey.customer.name };
 		}
 		return { type: "None", name: "" };
 	};

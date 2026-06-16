@@ -109,6 +109,23 @@ replica's in-memory state matches what was written.
 | `TestScaleMatrix` | Propagation across a sweep of replica counts | — |
 | `TestStressConfigSyncConservation` | 3 replicas, hundreds of objects/table, multi-VK load via per-pod fan-out, live config churn, propagation report, **convergence audit + exact token conservation** | `BIFROST_STRESS_OBJECTS` (200), `BIFROST_STRESS_CLIENTS` (50), `BIFROST_STRESS_RPS` (2500), `BIFROST_STRESS_DURATION` (2m) |
 | `TestBenchmark` | The reusable benchmark suite: sized deploy, seed, **in-cluster k6** vs the Service ClusterIP, optional obs/profiling, churn, then conservation + audit gates | `BIFROST_BENCH_OBJECTS` (100), `BIFROST_BENCH_REPLICAS` (3), `BIFROST_BENCH_RPS` (500), `BIFROST_BENCH_DURATION` (2m), `BIFROST_BENCH_TLS` (off) |
+| `TestMultiTenantSanity` | Boots Bifrost with `BIFROST_MULTI_TENANT_ENABLED=true`, provisions two independent tenants, drives one inference per tenant, deletes tenant A's VK and verifies same-replica resolver-cache invalidation (patch 0028) | — |
+
+## Multi-tenant scenarios
+
+`TestMultiTenantSanity` is the first scenario in the F5XC multi-tenant E2E
+series (XC-25496). It opts into the new admin surface by passing
+`fixtures.WithMultiTenant("")` to `NewBifrostInstall`; the option splices
+`BIFROST_MULTI_TENANT_ENABLED=true` into the rendered Deployment before
+`kubectl apply` (so the first pod already carries the right config — no
+post-apply rollout race). The new `fixtures.MTAdmin` raw-HTTP client
+drives `/api/platform/tenants` + `/api/tenants/{tid}/{providers,
+governance/virtual-keys}` since the go-bifrost-ai SDK does not yet expose
+tenant-scoped methods.
+
+Follow-on scenarios (streaming, async, MCP, multi-replica VK
+invalidation, Anthropic-shape isolation) layer onto the same `MTAdmin`
+helper.
 
 ## Cross-cutting capabilities (apply to EVERY test here)
 

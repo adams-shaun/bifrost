@@ -16,6 +16,7 @@ import (
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
+	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/framework/encrypt"
 	"github.com/maximhq/bifrost/framework/temptoken"
 	"github.com/maximhq/bifrost/framework/tracing"
@@ -790,6 +791,11 @@ func (m *AuthMiddleware) APIMiddleware() schemas.BifrostHTTPMiddleware {
 	systemWhitelistedRoutes := []string{
 		"/api/session/is-auth-enabled",
 		"/api/session/login",
+		// /api/session/tenants is the minimal-info tenant directory the
+		// login picker reads BEFORE the user has any credentials. Returns
+		// only {id, name, status}; full tenant metadata + write ops stay
+		// on /api/platform/tenants behind auth.
+		"/api/session/tenants",
 		"/api/oauth/callback",
 		"/health",
 		"/login",
@@ -970,6 +976,19 @@ func (m *AuthMiddleware) middleware(shouldSkip func(*configstore.AuthConfig, str
 			}
 			// Checking bearer auth for dashboard calls
 			if scheme == "Bearer" {
+				// A Bifrost virtual key (sk-bf-…) is also a valid bearer
+				// credential for the inference surface — the governance
+				// plugin downstream is the authoritative validator
+				// (active/inactive, scope, allowed_models, budget). The
+				// auth middleware just needs to recognise the credential
+				// FORMAT so a VK-only client (opencode, curl, an SDK)
+				// can talk to /v1 when DisableAuthOnInference is false.
+				// Falling through to validateSession would 401 here
+				// because a VK is not a session token.
+				if strings.HasPrefix(token, governance.VirtualKeyPrefix) {
+					next(ctx)
+					return
+				}
 				// We are checking for API keys first; it it seems like a valid Bifrost API key
 
 				// Verify the session

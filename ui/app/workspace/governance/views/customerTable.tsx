@@ -53,7 +53,7 @@ function CustomerActionsMenu({ customer, canUpdate, canDelete, onEdit, onDelete 
 					variant="ghost"
 					size="icon"
 					className="h-8 w-8"
-					aria-label={`Customer actions ${customer.name}`}
+					aria-label={`Namespace actions ${customer.name}`}
 					data-testid={`customer-actions-btn-${customer.id}`}
 					onClick={(e) => e.stopPropagation()}
 					onPointerDown={(e) => e.stopPropagation()}
@@ -130,7 +130,7 @@ export default function CustomersTable({
 	const handleDelete = async (customerId: string) => {
 		try {
 			await deleteCustomer(customerId).unwrap();
-			toast.success("Customer deleted successfully");
+			toast.success("Namespace deleted successfully");
 		} catch (error) {
 			toast.error(getErrorMessage(error));
 		} finally {
@@ -187,12 +187,12 @@ export default function CustomersTable({
 				<div className="space-y-4">
 					<div className="flex items-center justify-between">
 						<div>
-							<h2 className="text-lg font-semibold">Customers</h2>
-							<p className="text-muted-foreground text-sm">Manage customer accounts with their own teams, budgets, and access controls.</p>
+							<h2 className="text-lg font-semibold">Namespaces</h2>
+							<p className="text-muted-foreground text-sm">Manage namespaces with their own teams, budgets, and access controls.</p>
 						</div>
 						<Button data-testid="customer-button-create" onClick={handleAddCustomer} disabled={!hasCreateAccess}>
 							<Plus className="h-4 w-4" />
-							Add Customer
+							Add Namespace
 						</Button>
 					</div>
 
@@ -200,7 +200,7 @@ export default function CustomersTable({
 						<div className="relative max-w-sm flex-1">
 							<Search className="text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2" />
 							<Input
-								aria-label="Search customers by name"
+								aria-label="Search namespaces by name"
 								placeholder="Search by name..."
 								value={search}
 								onChange={(e) => onSearchChange(e.target.value)}
@@ -226,7 +226,7 @@ export default function CustomersTable({
 								{customers.length === 0 ? (
 									<TableRow>
 										<TableCell colSpan={6} className="h-24 text-center">
-											<span className="text-muted-foreground text-sm">No matching customers found.</span>
+											<span className="text-muted-foreground text-sm">No matching namespaces found.</span>
 										</TableCell>
 									</TableRow>
 								) : (
@@ -482,7 +482,7 @@ export default function CustomersTable({
 				<AlertDialog open={!!confirmDeleteCustomer} onOpenChange={(open) => !open && setConfirmDeleteCustomer(null)}>
 					<AlertDialogContent>
 						<AlertDialogHeader>
-							<AlertDialogTitle>Delete Customer</AlertDialogTitle>
+							<AlertDialogTitle>Delete Namespace</AlertDialogTitle>
 							<AlertDialogDescription>
 								Are you sure you want to delete &quot;{confirmDeleteCustomer?.name}&quot;? This will also delete all associated teams and
 								unassign any virtual keys. This action cannot be undone.

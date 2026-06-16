@@ -647,10 +647,12 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 			dbProvider.RateLimitID = existing.RateLimitID
 		}
 
-		// Upsert provider (create or update if exists).
+		// Upsert provider (create or update if exists). Conflict target is
+		// the composite (tenant_id, name) unique index so two tenants can
+		// independently register a provider with the same Name.
 		if err := txDB.WithContext(ctx).Clauses(
 			clause.OnConflict{
-				Columns:   []clause.Column{{Name: "name"}},
+				Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "name"}},
 				UpdateAll: true,
 			},
 			clause.Returning{Columns: []clause.Column{{Name: "id"}}},
@@ -827,19 +829,43 @@ func (s *RDBConfigStore) cleanupVirtualKeyProviderConfigsForDeletedProvider(ctx 
 	return nil
 }
 
-// UpdateProvider updates a single provider configuration in the database without deleting/recreating.
+// UpdateProvider updates a single provider configuration in the database
+// without deleting/recreating. Legacy single-tenant call shape — scoped
+// to DefaultTenantID through updateProviderInternal so a multi-tenant
+// deployment can't accidentally touch another tenant's row via the
+// non-tenant-aware path.
 func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
+	return s.updateProviderInternal(ctx, tables.DefaultTenantID, provider, config, tx...)
+}
+
+// UpdateProviderForTenant is the tenant-scoped form. tenantID is used
+// throughout: the provider lookup, the VKPC lookup (joined through
+// governance_virtual_keys.tenant_id), and the tenant_id pinned on every
+// newly created or updated TableKey row.
+func (s *RDBConfigStore) UpdateProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.updateProviderInternal(ctx, tenantID, provider, config, tx...)
+}
+
+func (s *RDBConfigStore) updateProviderInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
 	if len(tx) == 0 {
 		return s.DB().WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
-			return s.UpdateProvider(ctx, provider, config, transaction)
+			return s.updateProviderInternal(ctx, tenantID, provider, config, transaction)
 		})
 	}
 
 	var txDB *gorm.DB
 	txDB = tx[0]
-	// Find the existing provider
+	// Find the existing provider, scoped by tenant_id so two tenants
+	// with same-named providers can't trample each other's rows.
+	providerQ := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider))
+	if tenantID != "" {
+		providerQ = providerQ.Where("tenant_id = ?", tenantID)
+	}
 	var dbProvider tables.TableProvider
-	if err := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
+	if err := providerQ.First(&dbProvider).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrNotFound
 		}
@@ -873,10 +899,20 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
 	// resource order matches DeleteProvider and concurrent UpdateVirtualKeyProviderConfig
 	// (which holds a VKPC row and then needs FK locks on config_keys via the join table).
 	// Without this pre-lock the two paths invert on config_keys vs. VKPC and deadlock (40P01).
+	//
+	// VKPC has no tenant_id of its own — scoping is via the FK to
+	// governance_virtual_keys whose tenant_id matches. Join through to
+	// keep this tenant's VKPCs locked and leave other tenants' alone.
+	vkpcQ := dbForUpdate(txDB.WithContext(ctx)).
+		Table("governance_virtual_key_provider_configs").
+		Where("governance_virtual_key_provider_configs.provider = ?", dbProvider.Name)
+	if tenantID != "" {
+		vkpcQ = vkpcQ.
+			Joins("JOIN governance_virtual_keys ON governance_virtual_keys.id = governance_virtual_key_provider_configs.virtual_key_id").
+			Where("governance_virtual_keys.tenant_id = ?", tenantID)
+	}
 	var providerVKPCs []tables.TableVirtualKeyProviderConfig
-	if err := dbForUpdate(txDB.WithContext(ctx)).
-		Where("provider = ?", dbProvider.Name).
-		Order("id ASC").
+	if err := vkpcQ.Order("governance_virtual_key_provider_configs.id ASC").
 		Find(&providerVKPCs).Error; err != nil {
 		return err
 	}
@@ -903,6 +939,7 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
 		dbKey := tables.TableKey{
 			Provider:           dbProvider.Name,
 			ProviderID:         dbProvider.ID,
+			TenantID:           tenantID,
 			KeyID:              key.ID,
 			Name:               key.Name,
 			Value:              key.Value,
@@ -1007,7 +1044,31 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
 }
 
 // AddProvider creates a new provider configuration in the database.
+// AddProviderForTenant is the tenant-scoped form of AddProvider. It writes
+// tenantID onto the new TableProvider row and onto every TableKey row
+// created with it, so the resulting provider is only visible to
+// GetProvidersConfigByTenant(tenantID).
+//
+// Empty tenantID is normalized to tables.DefaultTenantID so single-tenant
+// call sites that don't yet thread a tenant through fall onto the seeded
+// default tenant. This mirrors GetProvidersConfigByTenant's policy.
+func (s *RDBConfigStore) AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.addProviderInternal(ctx, tenantID, provider, config, tx...)
+}
+
+// AddProvider preserves the pre-multi-tenant single-tenant call shape.
+// The created TableProvider row gets tenant_id=DefaultTenantID via the
+// column default + addProviderInternal pinning it for consistency, so
+// callers that haven't migrated to AddProviderForTenant still land in
+// the seeded default tenant's scope.
 func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
+	return s.addProviderInternal(ctx, tables.DefaultTenantID, provider, config, tx...)
+}
+
+func (s *RDBConfigStore) addProviderInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, config ProviderConfig, tx ...*gorm.DB) error {
 	var txDB *gorm.DB
 	if len(tx) > 0 {
 		txDB = tx[0]
@@ -1024,6 +1085,7 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
 	// Create new provider
 	dbProvider := tables.TableProvider{
 		Name:                     string(provider),
+		TenantID:                 tenantID,
 		NetworkConfig:            configCopy.NetworkConfig,
 		ConcurrencyAndBufferSize: configCopy.ConcurrencyAndBufferSize,
 		ProxyConfig:              configCopy.ProxyConfig,
@@ -1043,6 +1105,7 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
 		dbKey := tables.TableKey{
 			Provider:           dbProvider.Name,
 			ProviderID:         dbProvider.ID,
+			TenantID:           tenantID,
 			KeyID:              key.ID,
 			Name:               key.Name,
 			Value:              key.Value,
@@ -1106,19 +1169,43 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
 	return nil
 }
 
-// DeleteProvider deletes a single provider and all its associated keys from the database.
+// DeleteProvider deletes a single provider and all its associated keys
+// from the database. Single-tenant call sites land on
+// tables.DefaultTenantID so they don't accidentally delete another
+// tenant's provider with the same name.
 func (s *RDBConfigStore) DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error {
+	return s.deleteProviderInternal(ctx, tables.DefaultTenantID, provider, tx...)
+}
+
+// DeleteProviderForTenant is the tenant-scoped form: only removes the
+// provider whose (tenant_id, name) matches. Empty tenantID normalizes
+// to DefaultTenantID. Returns ErrNotFound when the provider exists in
+// another tenant's scope but not in this one.
+func (s *RDBConfigStore) DeleteProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.deleteProviderInternal(ctx, tenantID, provider, tx...)
+}
+
+func (s *RDBConfigStore) deleteProviderInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
 	if len(tx) == 0 {
 		return s.DB().WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
-			return s.DeleteProvider(ctx, provider, transaction)
+			return s.deleteProviderInternal(ctx, tenantID, provider, transaction)
 		})
 	}
 
 	var txDB *gorm.DB
 	txDB = tx[0]
-	// Find the existing provider
+	// Find the existing provider scoped to the tenant. dbForUpdate
+	// locks the row for the rest of the transaction so cascading
+	// deletes can't race with a concurrent UpdateProvider.
+	q := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider))
+	if tenantID != "" {
+		q = q.Where("tenant_id = ?", tenantID)
+	}
 	var dbProvider tables.TableProvider
-	if err := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
+	if err := q.First(&dbProvider).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrNotFound
 		}
@@ -1159,12 +1246,43 @@ func (s *RDBConfigStore) DeleteProvider(ctx context.Context, provider schemas.Mo
 
 // GetProvidersConfig retrieves the provider configuration from the database.
 func (s *RDBConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error) {
+	return s.getProvidersConfigInternal(ctx, "")
+}
+
+// GetProvidersConfigByTenant retrieves provider configs scoped to a single
+// tenant. Empty tenant id is normalized to tables.DefaultTenantID so the
+// single-tenant call sites that haven't been routed through the resolver
+// yet still see the seeded default tenant's providers.
+func (s *RDBConfigStore) GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.getProvidersConfigInternal(ctx, tenantID)
+}
+
+// getProvidersConfigInternal is the shared implementation. An empty
+// tenantID returns all rows (the legacy global-Get semantics); a
+// non-empty value adds WHERE tenant_id = ? to both the provider query
+// and the preloaded keys query so a tenant never sees another tenant's
+// keys via the relationship.
+func (s *RDBConfigStore) getProvidersConfigInternal(ctx context.Context, tenantID string) (map[schemas.ModelProvider]ProviderConfig, error) {
+	q := s.DB().WithContext(ctx).Preload("Keys", func(db *gorm.DB) *gorm.DB {
+		if tenantID == "" {
+			return db
+		}
+		return db.Where("tenant_id = ?", tenantID)
+	})
+	if tenantID != "" {
+		q = q.Where("tenant_id = ?", tenantID)
+	}
+
 	var dbProviders []tables.TableProvider
-	if err := s.DB().WithContext(ctx).Preload("Keys").Find(&dbProviders).Error; err != nil {
+	if err := q.Find(&dbProviders).Error; err != nil {
 		return nil, err
 	}
 	if len(dbProviders) == 0 {
-		// No providers in database, auto-detect from environment
+		// No providers for this scope; let callers fall back to env-var
+		// auto-detection (matches legacy GetProvidersConfig behaviour).
 		return nil, nil
 	}
 	processedProviders := make(map[schemas.ModelProvider]ProviderConfig)
@@ -1196,8 +1314,32 @@ func (s *RDBConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.Mo
 
 // GetProviderConfig retrieves the provider configuration from the database.
 func (s *RDBConfigStore) GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*ProviderConfig, error) {
+	return s.getProviderConfigInternal(ctx, "", provider)
+}
+
+// GetProviderConfigByTenant is the tenant-scoped form: matches on
+// (tenant_id, name). The composite uniqueness from patch 0006 makes
+// the lookup deterministic across tenants. Empty tenantID normalizes
+// to DefaultTenantID.
+func (s *RDBConfigStore) GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.getProviderConfigInternal(ctx, tenantID, provider)
+}
+
+func (s *RDBConfigStore) getProviderConfigInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*ProviderConfig, error) {
+	q := s.DB().WithContext(ctx).Preload("Keys", func(db *gorm.DB) *gorm.DB {
+		if tenantID == "" {
+			return db
+		}
+		return db.Where("tenant_id = ?", tenantID)
+	}).Where("name = ?", string(provider))
+	if tenantID != "" {
+		q = q.Where("tenant_id = ?", tenantID)
+	}
 	var dbProvider tables.TableProvider
-	if err := s.DB().WithContext(ctx).Preload("Keys").Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
+	if err := q.First(&dbProvider).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrNotFound
 		}
@@ -1258,6 +1400,44 @@ func (s *RDBConfigStore) GetProviderKeys(ctx context.Context, provider schemas.M
 	return keys, nil
 }
 
+// GetProviderKeysForTenant lists keys for a tenant-scoped provider.
+// Filters both the provider join AND the key rows by tenant_id so a
+// tenant cannot see another tenant's keys even when both have a
+// provider with the same name.
+func (s *RDBConfigStore) GetProviderKeysForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	var dbKeys []tables.TableKey
+	result := s.DB().WithContext(ctx).
+		Table("config_providers").
+		Select("config_keys.*").
+		Joins("LEFT JOIN config_keys ON config_keys.provider_id = config_providers.id AND config_keys.tenant_id = ?", tenantID).
+		Where("config_providers.name = ? AND config_providers.tenant_id = ?", string(provider), tenantID).
+		Order("config_keys.created_at ASC").
+		Scan(&dbKeys)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, ErrNotFound
+	}
+	if len(dbKeys) == 1 && dbKeys[0].ID == 0 && dbKeys[0].KeyID == "" {
+		return []schemas.Key{}, nil
+	}
+	keys := make([]schemas.Key, 0, len(dbKeys))
+	for _, dbKey := range dbKeys {
+		if dbKey.ID == 0 && dbKey.KeyID == "" {
+			continue
+		}
+		if err := dbKey.AfterFind(nil); err != nil {
+			return nil, err
+		}
+		keys = append(keys, schemaKeyFromTableKey(dbKey))
+	}
+	return keys, nil
+}
+
 func (s *RDBConfigStore) getProviderKeyByName(ctx context.Context, txDB *gorm.DB, provider schemas.ModelProvider, keyID string) (*tables.TableKey, error) {
 	var dbKey tables.TableKey
 	if err := dbForUpdate(txDB.WithContext(ctx)).
@@ -1285,18 +1465,56 @@ func (s *RDBConfigStore) GetProviderKey(ctx context.Context, provider schemas.Mo
 	return &key, nil
 }
 
-// CreateProviderKey creates a new key for an existing provider.
+// GetProviderKeyForTenant is the tenant-scoped form. Returns ErrNotFound
+// when the key exists under a different tenant.
+func (s *RDBConfigStore) GetProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	dbKey, err := s.getProviderKeyByName(ctx, s.DB(), provider, keyID)
+	if err != nil {
+		return nil, err
+	}
+	if dbKey.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	key := schemaKeyFromTableKey(*dbKey)
+	return &key, nil
+}
+
+// CreateProviderKey creates a new key for an existing provider. Single-
+// tenant call shape — DefaultTenantID is pinned on both the provider
+// lookup and the new key row to avoid cross-tenant footguns from the
+// legacy code path.
 func (s *RDBConfigStore) CreateProviderKey(ctx context.Context, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
+	return s.createProviderKeyInternal(ctx, tables.DefaultTenantID, provider, key, tx...)
+}
+
+// CreateProviderKeyForTenant is the tenant-scoped form: verifies the
+// parent provider exists in tenantID's scope, then pins tenantID on
+// the new TableKey row so it stays visible only to that tenant.
+func (s *RDBConfigStore) CreateProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.createProviderKeyInternal(ctx, tenantID, provider, key, tx...)
+}
+
+func (s *RDBConfigStore) createProviderKeyInternal(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
 	if len(tx) == 0 {
 		return s.DB().WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
-			return s.CreateProviderKey(ctx, provider, key, transaction)
+			return s.createProviderKeyInternal(ctx, tenantID, provider, key, transaction)
 		})
 	}
 
 	var txDB *gorm.DB
 	txDB = tx[0]
+	q := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider))
+	if tenantID != "" {
+		q = q.Where("tenant_id = ?", tenantID)
+	}
 	var dbProvider tables.TableProvider
-	if err := dbForUpdate(txDB.WithContext(ctx)).Where("name = ?", string(provider)).First(&dbProvider).Error; err != nil {
+	if err := q.First(&dbProvider).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrNotFound
 		}
@@ -1306,6 +1524,7 @@ func (s *RDBConfigStore) CreateProviderKey(ctx context.Context, provider schemas
 	if err != nil {
 		return err
 	}
+	dbKey.TenantID = tenantID
 	if err := txDB.WithContext(ctx).Create(&dbKey).Error; err != nil {
 		return s.parseGormError(err)
 	}
@@ -1348,6 +1567,18 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
 	}
 
 	return nil
+}
+
+// DeleteProviderKeyForTenant verifies tenant ownership before
+// delegating to DeleteProviderKey. Cross-tenant probes ErrNotFound.
+func (s *RDBConfigStore) DeleteProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetProviderKeyForTenant(ctx, tenantID, provider, keyID); err != nil {
+		return err
+	}
+	return s.DeleteProviderKey(ctx, provider, keyID, tx...)
 }
 
 // DeleteProviderKey deletes a single key for an existing provider.
@@ -1473,9 +1704,32 @@ func (s *RDBConfigStore) UpdateStatus(ctx context.Context, provider schemas.Mode
 
 // GetMCPConfig retrieves the MCP configuration from the database.
 func (s *RDBConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig, error) {
+	return s.getMCPConfigInternal(ctx, "")
+}
+
+// GetMCPConfigByTenant returns the MCP client list scoped to a single
+// tenant. The per-tenant Bifrost runtime loader calls this to populate
+// its MCPConfig so each tenant only sees the MCP servers admin-provisioned
+// for them. Empty tenantID is normalized to DefaultTenantID, matching the
+// providers-by-tenant policy.
+func (s *RDBConfigStore) GetMCPConfigByTenant(ctx context.Context, tenantID string) (*schemas.MCPConfig, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.getMCPConfigInternal(ctx, tenantID)
+}
+
+// getMCPConfigInternal is the shared implementation. An empty tenantID
+// returns all rows (legacy global behavior); a non-empty value adds
+// WHERE tenant_id = ? to the MCP client query so cross-tenant leakage
+// is impossible.
+func (s *RDBConfigStore) getMCPConfigInternal(ctx context.Context, tenantID string) (*schemas.MCPConfig, error) {
 	var dbMCPClients []tables.TableMCPClient
-	// Get all MCP clients
-	if err := s.DB().WithContext(ctx).Find(&dbMCPClients).Error; err != nil {
+	q := s.DB().WithContext(ctx)
+	if tenantID != "" {
+		q = q.Where("tenant_id = ?", tenantID)
+	}
+	if err := q.Find(&dbMCPClients).Error; err != nil {
 		return nil, err
 	}
 	var clientConfig tables.TableClientConfig
@@ -1603,6 +1857,22 @@ func (s *RDBConfigStore) GetMCPClientByID(ctx context.Context, id string) (*tabl
 	return &mcpClient, nil
 }
 
+// GetMCPClientByIDForTenant returns the MCP client only when its
+// tenant_id matches. Cross-tenant probes collapse to ErrNotFound.
+func (s *RDBConfigStore) GetMCPClientByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableMCPClient, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	c, err := s.GetMCPClientByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if c.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	return c, nil
+}
+
 // GetMCPClientConfigByID retrieves an MCP client by ID and converts it to a schemas.MCPClientConfig.
 // Unlike GetMCPClientByID, this includes DiscoveredTools and DiscoveredToolNameMapping.
 func (s *RDBConfigStore) GetMCPClientConfigByID(ctx context.Context, id string) (*schemas.MCPClientConfig, error) {
@@ -1647,10 +1917,32 @@ func (s *RDBConfigStore) GetMCPClientByName(ctx context.Context, name string) (*
 
 // CreateMCPClientConfig creates a new MCP client configuration in the database.
 func (s *RDBConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfig *schemas.MCPClientConfig) error {
+	return s.createMCPClientConfigInternal(ctx, tables.DefaultTenantID, clientConfig)
+}
+
+// CreateMCPClientConfigForTenant is the tenant-scoped form: pins
+// tenantID onto the created row so it is only visible to
+// GetMCPConfigByTenant(tenantID). Empty tenantID normalizes to the
+// seeded default tenant.
+func (s *RDBConfigStore) CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	return s.createMCPClientConfigInternal(ctx, tenantID, clientConfig)
+}
+
+func (s *RDBConfigStore) createMCPClientConfigInternal(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error {
 	return s.DB().Transaction(func(tx *gorm.DB) error {
-		// Check if a client with the same name already exists
-		if _, err := s.GetMCPClientByName(ctx, clientConfig.Name); err == nil {
-			return fmt.Errorf("MCP client with name '%s' already exists", clientConfig.Name)
+		// Check if a client with the same name already exists in this
+		// tenant's scope. Composite unique (tenant_id, name) makes
+		// per-tenant name reuse legal.
+		var collision tables.TableMCPClient
+		err := tx.WithContext(ctx).Where("tenant_id = ? AND name = ?", tenantID, clientConfig.Name).First(&collision).Error
+		if err == nil {
+			return fmt.Errorf("MCP client with name '%s' already exists for tenant '%s'", clientConfig.Name, tenantID)
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
 		}
 		// Create a deep copy to avoid modifying the original
 		clientConfigCopy, err := deepCopy(*clientConfig)
@@ -1665,6 +1957,7 @@ func (s *RDBConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfig
 		dbClient := tables.TableMCPClient{
 			ClientID:              clientConfigCopy.ID,
 			Name:                  clientConfigCopy.Name,
+			TenantID:              tenantID,
 			IsCodeModeClient:      clientConfigCopy.IsCodeModeClient,
 			ConnectionType:        string(clientConfigCopy.ConnectionType),
 			ConnectionString:      clientConfigCopy.ConnectionString,
@@ -1852,6 +2145,36 @@ func (s *RDBConfigStore) UpdateMCPClientConfig(ctx context.Context, id string, c
 		}
 		return nil
 	})
+}
+
+// UpdateMCPClientConfigForTenant verifies tenant ownership before
+// delegating to UpdateMCPClientConfig. tenant_id is re-pinned on the
+// supplied row so a malicious payload cannot move the client into
+// another tenant's scope through the update path.
+func (s *RDBConfigStore) UpdateMCPClientConfigForTenant(ctx context.Context, tenantID, id string, clientConfig *tables.TableMCPClient) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if clientConfig == nil {
+		return ErrNotFound
+	}
+	if _, err := s.GetMCPClientByIDForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	clientConfig.TenantID = tenantID
+	return s.UpdateMCPClientConfig(ctx, id, clientConfig)
+}
+
+// DeleteMCPClientConfigForTenant is the tenant-scoped form: verifies
+// tenant ownership before delegating to DeleteMCPClientConfig.
+func (s *RDBConfigStore) DeleteMCPClientConfigForTenant(ctx context.Context, tenantID, id string) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetMCPClientByIDForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	return s.DeleteMCPClientConfig(ctx, id)
 }
 
 // DeleteMCPClientConfig deletes an MCP client configuration from the database.
@@ -2401,6 +2724,22 @@ func (s *RDBConfigStore) GetVirtualKeys(ctx context.Context) ([]tables.TableVirt
 	return virtualKeys, nil
 }
 
+// GetVirtualKeysByTenant retrieves virtual keys scoped to a single
+// tenant. Empty tenantID normalizes to DefaultTenantID.
+func (s *RDBConfigStore) GetVirtualKeysByTenant(ctx context.Context, tenantID string) ([]tables.TableVirtualKey, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	var virtualKeys []tables.TableVirtualKey
+	if err := preloadVirtualKeyBaseRelations(s.ScopedDB(ctx)).
+		Where("governance_virtual_keys.tenant_id = ?", tenantID).
+		Order("created_at ASC").
+		Find(&virtualKeys).Error; err != nil {
+		return nil, err
+	}
+	return virtualKeys, nil
+}
+
 // GetVirtualKeysPaginated retrieves virtual keys with pagination, filtering, and search support.
 func (s *RDBConfigStore) GetVirtualKeysPaginated(ctx context.Context, params VirtualKeyQueryParams) ([]tables.TableVirtualKey, int64, error) {
 	// Build base query with filters
@@ -2514,6 +2853,23 @@ func (s *RDBConfigStore) GetVirtualKey(ctx context.Context, id string) (*tables.
 		return nil, err
 	}
 	return &virtualKey, nil
+}
+
+// GetVirtualKeyByIDForTenant returns the VK only when its tenant_id
+// matches. Cross-tenant probes collapse to ErrNotFound so a caller
+// cannot tell whether a VK exists under another tenant.
+func (s *RDBConfigStore) GetVirtualKeyByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableVirtualKey, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	vk, err := s.GetVirtualKey(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if vk.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	return vk, nil
 }
 
 // GetVirtualKeyByValue retrieves a virtual key by its value using hash-based lookup.
@@ -2663,6 +3019,42 @@ func (s *RDBConfigStore) GetAllRedactedKeys(ctx context.Context, ids []string) (
 		}
 	}
 	return redactedKeys, nil
+}
+
+// UpdateVirtualKeyForTenant verifies tenant ownership before delegating
+// to UpdateVirtualKey. The supplied row gets tenant_id pinned to the
+// verified tenantID so a malicious payload cannot move the VK into
+// another tenant's scope.
+func (s *RDBConfigStore) UpdateVirtualKeyForTenant(ctx context.Context, tenantID string, virtualKey *tables.TableVirtualKey, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if virtualKey == nil || virtualKey.ID == "" {
+		return ErrNotFound
+	}
+	existing, err := s.GetVirtualKeyByIDForTenant(ctx, tenantID, virtualKey.ID)
+	if err != nil {
+		return err
+	}
+	virtualKey.ID = existing.ID
+	virtualKey.TenantID = tenantID
+	return s.UpdateVirtualKey(ctx, virtualKey, tx...)
+}
+
+// DeleteVirtualKeyForTenant is the tenant-scoped form: only removes
+// the VK when its tenant_id matches. Verifies tenant ownership first,
+// then delegates to the existing DeleteVirtualKey transaction (which
+// does the heavy cascade work). Race window between the verify and
+// the delete is acceptable — worst case the caller sees ErrNotFound
+// from the delete step.
+func (s *RDBConfigStore) DeleteVirtualKeyForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetVirtualKeyByIDForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	return s.DeleteVirtualKey(ctx, id, tx...)
 }
 
 // DeleteVirtualKey deletes a virtual key from the database.
@@ -3222,6 +3614,75 @@ func (s *RDBConfigStore) CreateTeam(ctx context.Context, team *tables.TableTeam,
 	return nil
 }
 
+// CreateTeamForTenant pins tenant_id on the new row before delegating
+// to CreateTeam.
+func (s *RDBConfigStore) CreateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if team == nil {
+		return ErrNotFound
+	}
+	team.TenantID = tenantID
+	return s.CreateTeam(ctx, team, tx...)
+}
+
+// GetTeamsByTenant lists teams scoped to a tenant. Empty tenantID
+// normalizes to DefaultTenantID. Optional customerID further filters
+// the result the same way GetTeams does.
+func (s *RDBConfigStore) GetTeamsByTenant(ctx context.Context, tenantID, customerID string) ([]tables.TableTeam, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	q := s.ScopedDB(ctx).
+		Select(teamSelectWithVKCount).
+		Preload("Customer").Preload("Budgets").Preload("RateLimit").
+		Where("governance_teams.tenant_id = ?", tenantID)
+	if customerID != "" {
+		q = q.Where("governance_teams.customer_id = ?", customerID)
+	}
+	var teams []tables.TableTeam
+	if err := q.Order("governance_teams.created_at ASC").Find(&teams).Error; err != nil {
+		return nil, err
+	}
+	return teams, nil
+}
+
+// GetTeamByIDForTenant returns the team only when its tenant_id
+// matches the supplied tenantID; otherwise ErrNotFound.
+func (s *RDBConfigStore) GetTeamByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableTeam, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	t, err := s.GetTeam(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if t.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	return t, nil
+}
+
+// UpdateTeamForTenant verifies tenant ownership before delegating
+// to UpdateTeam. tenant_id is re-pinned on the row so a malicious
+// payload can't migrate the team into another tenant's scope.
+func (s *RDBConfigStore) UpdateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if team == nil || team.ID == "" {
+		return ErrNotFound
+	}
+	existing, err := s.GetTeamByIDForTenant(ctx, tenantID, team.ID)
+	if err != nil {
+		return err
+	}
+	team.ID = existing.ID
+	team.TenantID = tenantID
+	return s.UpdateTeam(ctx, team, tx...)
+}
+
 // UpdateTeam updates an existing team in the database.
 func (s *RDBConfigStore) UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error {
 	var txDB *gorm.DB
@@ -3234,6 +3695,18 @@ func (s *RDBConfigStore) UpdateTeam(ctx context.Context, team *tables.TableTeam,
 		return s.parseGormError(err)
 	}
 	return nil
+}
+
+// DeleteTeamForTenant verifies tenant ownership before delegating
+// to DeleteTeam.
+func (s *RDBConfigStore) DeleteTeamForTenant(ctx context.Context, tenantID, id string) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetTeamByIDForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	return s.DeleteTeam(ctx, id)
 }
 
 // DeleteTeam deletes a team from the database.
@@ -3357,6 +3830,67 @@ func (s *RDBConfigStore) CreateCustomer(ctx context.Context, customer *tables.Ta
 	return nil
 }
 
+// CreateCustomerForTenant pins tenant_id on the new row before delegating.
+func (s *RDBConfigStore) CreateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if customer == nil {
+		return ErrNotFound
+	}
+	customer.TenantID = tenantID
+	return s.CreateCustomer(ctx, customer, tx...)
+}
+
+// GetCustomersByTenant lists customers scoped to a tenant.
+func (s *RDBConfigStore) GetCustomersByTenant(ctx context.Context, tenantID string) ([]tables.TableCustomer, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	var customers []tables.TableCustomer
+	if err := preloadCustomerRelations(s.ScopedDB(ctx), "").
+		Where("governance_customers.tenant_id = ?", tenantID).
+		Order("created_at ASC").
+		Find(&customers).Error; err != nil {
+		return nil, err
+	}
+	return customers, nil
+}
+
+// GetCustomerByIDForTenant returns the customer only when its
+// tenant_id matches; otherwise ErrNotFound.
+func (s *RDBConfigStore) GetCustomerByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableCustomer, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	c, err := s.GetCustomer(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if c.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	return c, nil
+}
+
+// UpdateCustomerForTenant verifies ownership before delegating.
+// tenant_id is re-pinned on the row to prevent migration via PUT.
+func (s *RDBConfigStore) UpdateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if customer == nil || customer.ID == "" {
+		return ErrNotFound
+	}
+	existing, err := s.GetCustomerByIDForTenant(ctx, tenantID, customer.ID)
+	if err != nil {
+		return err
+	}
+	customer.ID = existing.ID
+	customer.TenantID = tenantID
+	return s.UpdateCustomer(ctx, customer, tx...)
+}
+
 // UpdateCustomer updates an existing customer in the database.
 func (s *RDBConfigStore) UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error {
 	var txDB *gorm.DB
@@ -3372,6 +3906,17 @@ func (s *RDBConfigStore) UpdateCustomer(ctx context.Context, customer *tables.Ta
 }
 
 // DeleteCustomer deletes a customer from the database.
+// DeleteCustomerForTenant verifies ownership before delegating.
+func (s *RDBConfigStore) DeleteCustomerForTenant(ctx context.Context, tenantID, id string) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetCustomerByIDForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	return s.DeleteCustomer(ctx, id)
+}
+
 func (s *RDBConfigStore) DeleteCustomer(ctx context.Context, id string) error {
 	if err := s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var customer tables.TableCustomer
@@ -3421,6 +3966,163 @@ func (s *RDBConfigStore) DeleteCustomer(ctx context.Context, id string) error {
 	return nil
 }
 
+// =====================
+// TENANT CRUD METHODS
+// =====================
+//
+// Tenants are the platform-level isolation boundary that sits above the
+// governance entities (customers, teams, virtual keys) and the user-config
+// entities (providers, keys, MCP clients). Each governance/config row
+// carries a tenant_id; the per-tenant Bifrost runtime registry uses that
+// to dispatch requests into the right tenant's world.
+//
+// These methods are deliberately small and do not preload relationships
+// — tenants own a lot of dependents and the admin UI / control plane
+// will paginate them via the entity-specific endpoints.
+
+// GetTenants retrieves all tenants from the database, ordered by creation.
+func (s *RDBConfigStore) GetTenants(ctx context.Context) ([]tables.TableTenant, error) {
+	var tenants []tables.TableTenant
+	if err := s.DB().WithContext(ctx).Order("created_at ASC").Find(&tenants).Error; err != nil {
+		return nil, err
+	}
+	return tenants, nil
+}
+
+// GetTenantsPaginated retrieves tenants with pagination and optional
+// search / status filtering.
+func (s *RDBConfigStore) GetTenantsPaginated(ctx context.Context, params TenantsQueryParams) ([]tables.TableTenant, int64, error) {
+	baseQuery := s.DB().WithContext(ctx).Model(&tables.TableTenant{})
+	if params.Search != "" {
+		search := "%" + strings.ToLower(params.Search) + "%"
+		baseQuery = baseQuery.Where("LOWER(name) LIKE ? OR LOWER(id) LIKE ?", search, search)
+	}
+	if params.Status != "" {
+		baseQuery = baseQuery.Where("status = ?", params.Status)
+	}
+	var totalCount int64
+	if err := baseQuery.Count(&totalCount).Error; err != nil {
+		return nil, 0, err
+	}
+	limit := params.Limit
+	offset := params.Offset
+	if limit <= 0 {
+		limit = 25
+	} else if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var tenants []tables.TableTenant
+	if err := baseQuery.Order("created_at ASC, id ASC").
+		Offset(offset).Limit(limit).
+		Find(&tenants).Error; err != nil {
+		return nil, 0, err
+	}
+	return tenants, totalCount, nil
+}
+
+// GetTenant retrieves a specific tenant by ID.
+func (s *RDBConfigStore) GetTenant(ctx context.Context, id string) (*tables.TableTenant, error) {
+	var tenant tables.TableTenant
+	if err := s.DB().WithContext(ctx).First(&tenant, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &tenant, nil
+}
+
+// CreateTenant inserts a new tenant. Returns ErrAlreadyExists if the ID
+// collides with an existing row (e.g. the seeded "default" tenant).
+func (s *RDBConfigStore) CreateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
+	var txDB *gorm.DB
+	if len(tx) > 0 {
+		txDB = tx[0]
+	} else {
+		txDB = s.DB()
+	}
+	if err := txDB.WithContext(ctx).Create(tenant).Error; err != nil {
+		return s.parseGormError(err)
+	}
+	return nil
+}
+
+// UpdateTenant persists changes to a tenant (rename, status flip,
+// description edit).
+func (s *RDBConfigStore) UpdateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
+	var txDB *gorm.DB
+	if len(tx) > 0 {
+		txDB = tx[0]
+	} else {
+		txDB = s.DB()
+	}
+	if err := txDB.WithContext(ctx).Save(tenant).Error; err != nil {
+		return s.parseGormError(err)
+	}
+	return nil
+}
+
+// DeleteTenant removes a tenant. Refuses if any owned rows remain
+// (ErrTenantNotEmpty) or if the target is the reserved DefaultTenantID
+// (ErrReservedTenant). Operators expecting "deactivate" semantics should
+// flip Status to TenantStatusSuspended via UpdateTenant instead.
+//
+// The emptiness check covers every table that carries a tenant_id today
+// (governance: customers, teams, virtual keys, budgets, rate limits;
+// config: providers, keys, MCP clients). A future patch that adds
+// tenant_id to a new table must extend this loop too.
+func (s *RDBConfigStore) DeleteTenant(ctx context.Context, id string) error {
+	if id == tables.DefaultTenantID {
+		return ErrReservedTenant
+	}
+	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 1) Tenant must exist.
+		var tenant tables.TableTenant
+		if err := tx.WithContext(ctx).First(&tenant, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+
+		// 2) Tenant must be drained. We check each tenant-scoped table; the
+		//    first non-zero count short-circuits with ErrTenantNotEmpty.
+		ownedTables := []struct {
+			model     any
+			tableName string
+		}{
+			{&tables.TableCustomer{}, "governance_customers"},
+			{&tables.TableTeam{}, "governance_teams"},
+			{&tables.TableVirtualKey{}, "governance_virtual_keys"},
+			{&tables.TableBudget{}, "governance_budgets"},
+			{&tables.TableRateLimit{}, "governance_rate_limits"},
+			{&tables.TableProvider{}, "config_providers"},
+			{&tables.TableKey{}, "config_keys"},
+			{&tables.TableMCPClient{}, "config_mcp_clients"},
+		}
+		for _, t := range ownedTables {
+			var count int64
+			if err := tx.WithContext(ctx).Model(t.model).
+				Where("tenant_id = ?", id).
+				Count(&count).Error; err != nil {
+				return fmt.Errorf("count %s rows for tenant %s: %w", t.tableName, id, err)
+			}
+			if count > 0 {
+				return fmt.Errorf("%w: %d row(s) in %s still reference this tenant", ErrTenantNotEmpty, count, t.tableName)
+			}
+		}
+
+		// 3) Safe to delete.
+		if err := tx.WithContext(ctx).Delete(&tables.TableTenant{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 // GetRateLimits retrieves all rate limits from the database.
 func (s *RDBConfigStore) GetRateLimits(ctx context.Context) ([]tables.TableRateLimit, error) {
 	var rateLimits []tables.TableRateLimit
@@ -3431,6 +4133,73 @@ func (s *RDBConfigStore) GetRateLimits(ctx context.Context) ([]tables.TableRateL
 }
 
 // GetRateLimit retrieves a specific rate limit from the database.
+// GetRateLimitsByTenant lists rate limits scoped to a tenant.
+func (s *RDBConfigStore) GetRateLimitsByTenant(ctx context.Context, tenantID string) ([]tables.TableRateLimit, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	var rateLimits []tables.TableRateLimit
+	if err := s.DB().WithContext(ctx).Where("tenant_id = ?", tenantID).Order("id ASC").Find(&rateLimits).Error; err != nil {
+		return nil, err
+	}
+	return rateLimits, nil
+}
+
+// GetRateLimitForTenant returns the rate limit only when its tenant_id matches.
+func (s *RDBConfigStore) GetRateLimitForTenant(ctx context.Context, tenantID, id string) (*tables.TableRateLimit, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	rl, err := s.GetRateLimit(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if rl.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	return rl, nil
+}
+
+// CreateRateLimitForTenant pins tenant_id on the new row.
+func (s *RDBConfigStore) CreateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if rateLimit == nil {
+		return ErrNotFound
+	}
+	rateLimit.TenantID = tenantID
+	return s.CreateRateLimit(ctx, rateLimit, tx...)
+}
+
+// UpdateRateLimitForTenant verifies ownership before delegating.
+func (s *RDBConfigStore) UpdateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if rateLimit == nil || rateLimit.ID == "" {
+		return ErrNotFound
+	}
+	existing, err := s.GetRateLimitForTenant(ctx, tenantID, rateLimit.ID)
+	if err != nil {
+		return err
+	}
+	rateLimit.ID = existing.ID
+	rateLimit.TenantID = tenantID
+	return s.UpdateRateLimit(ctx, rateLimit, tx...)
+}
+
+// DeleteRateLimitForTenant verifies ownership before delegating.
+func (s *RDBConfigStore) DeleteRateLimitForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetRateLimitForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	return s.DeleteRateLimit(ctx, id, tx...)
+}
+
 func (s *RDBConfigStore) GetRateLimit(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableRateLimit, error) {
 	var txDB *gorm.DB
 	if len(tx) > 0 {
@@ -3537,6 +4306,73 @@ func (s *RDBConfigStore) GetBudgets(ctx context.Context) ([]tables.TableBudget, 
 }
 
 // GetBudget retrieves a specific budget from the database.
+// GetBudgetsByTenant lists budgets scoped to a tenant.
+func (s *RDBConfigStore) GetBudgetsByTenant(ctx context.Context, tenantID string) ([]tables.TableBudget, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	var budgets []tables.TableBudget
+	if err := s.DB().WithContext(ctx).Where("tenant_id = ?", tenantID).Order("id ASC").Find(&budgets).Error; err != nil {
+		return nil, err
+	}
+	return budgets, nil
+}
+
+// GetBudgetForTenant returns the budget only when its tenant_id matches.
+func (s *RDBConfigStore) GetBudgetForTenant(ctx context.Context, tenantID, id string) (*tables.TableBudget, error) {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	b, err := s.GetBudget(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if b.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	return b, nil
+}
+
+// CreateBudgetForTenant pins tenant_id on the new row.
+func (s *RDBConfigStore) CreateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if budget == nil {
+		return ErrNotFound
+	}
+	budget.TenantID = tenantID
+	return s.CreateBudget(ctx, budget, tx...)
+}
+
+// UpdateBudgetForTenant verifies ownership before delegating.
+func (s *RDBConfigStore) UpdateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if budget == nil || budget.ID == "" {
+		return ErrNotFound
+	}
+	existing, err := s.GetBudgetForTenant(ctx, tenantID, budget.ID)
+	if err != nil {
+		return err
+	}
+	budget.ID = existing.ID
+	budget.TenantID = tenantID
+	return s.UpdateBudget(ctx, budget, tx...)
+}
+
+// DeleteBudgetForTenant verifies ownership before delegating.
+func (s *RDBConfigStore) DeleteBudgetForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
+	if tenantID == "" {
+		tenantID = tables.DefaultTenantID
+	}
+	if _, err := s.GetBudgetForTenant(ctx, tenantID, id); err != nil {
+		return err
+	}
+	return s.DeleteBudget(ctx, id, tx...)
+}
+
 func (s *RDBConfigStore) GetBudget(ctx context.Context, id string, tx ...*gorm.DB) (*tables.TableBudget, error) {
 	var txDB *gorm.DB
 	if len(tx) > 0 {

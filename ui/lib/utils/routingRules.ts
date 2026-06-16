@@ -91,7 +91,7 @@ export function getScopeLabel(scope: string): string {
 	const labels: Record<string, string> = {
 		global: "Global",
 		team: "Team",
-		customer: "Customer",
+		customer: "Namespace",
 		virtual_key: "Virtual Key",
 	};
 	return labels[scope] || scope;

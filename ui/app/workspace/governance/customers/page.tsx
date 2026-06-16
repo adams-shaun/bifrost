@@ -75,7 +75,7 @@ export default function GovernanceCustomersPage() {
 		} else {
 			if (vkError) toast.error(`Failed to load virtual keys: ${getErrorMessage(vkError)}`);
 			if (teamsError) toast.error(`Failed to load teams: ${getErrorMessage(teamsError)}`);
-			if (customersError) toast.error(`Failed to load customers: ${getErrorMessage(customersError)}`);
+			if (customersError) toast.error(`Failed to load namespaces: ${getErrorMessage(customersError)}`);
 		}
 	}, [vkError, teamsError, customersError]);
 

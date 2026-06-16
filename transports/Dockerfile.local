@@ -29,6 +29,7 @@
   # Copy all local modules
   COPY core/ ./core/
   COPY framework/ ./framework/
+  COPY multitenant/ ./multitenant/
   COPY plugins/ ./plugins/
   COPY transports/ ./transports/
 
@@ -36,6 +37,7 @@
   RUN go work init && \
     go work use ./core && \
     go work use ./framework && \
+    go work use ./multitenant && \
     go work use ./plugins/compat && \
     go work use ./plugins/governance && \
     go work use ./plugins/jsonparser && \

@@ -796,6 +796,21 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationRefreshConfigHashAfterMCPExternalServerURLRemoval(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddTenantsTableAndCustomerTenantID(ctx, db); err != nil {
+		return err
+	}
+	if err := migrationAddTenantIDToGovernanceTables(ctx, db); err != nil {
+		return err
+	}
+	if err := migrationAddTenantIDToProviderConfigTables(ctx, db); err != nil {
+		return err
+	}
+	if err := migrationTenantScopedNameUniques(ctx, db); err != nil {
+		return err
+	}
+	if err := migrationTenantScopedVKNameUnique(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -8536,6 +8551,377 @@ func migrationAddTempTokensTable(ctx context.Context, db *gorm.DB) error {
 	}})
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error running add_temp_tokens_table migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddTenantsTableAndCustomerTenantID is the first migration in the
+// multi-tenant rollout. It creates bf_tenants, seeds a "default" tenant so
+// existing single-tenant deployments keep working, adds tenant_id to
+// governance_customers, and backfills any pre-existing rows to "default".
+//
+// Other governance tables (teams, virtual_keys, budgets, rate_limits,
+// provider_configs) follow this pattern in later migrations to keep each
+// commit reviewable.
+func migrationAddTenantsTableAndCustomerTenantID(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "add_tenants_table_and_customer_tenant_id",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			// 1. Create bf_tenants table.
+			if !mig.HasTable(&tables.TableTenant{}) {
+				if err := mig.CreateTable(&tables.TableTenant{}); err != nil {
+					return fmt.Errorf("failed to create bf_tenants: %w", err)
+				}
+			}
+
+			// 2. Seed the default tenant. ON CONFLICT DO NOTHING lets the
+			//    migration be idempotent across re-runs and across dialects.
+			now := time.Now()
+			defaultTenant := &tables.TableTenant{
+				ID:          tables.DefaultTenantID,
+				Name:        "Default Tenant",
+				Status:      tables.TenantStatusActive,
+				Description: "Seeded by initial multi-tenant migration. Single-tenant deployments stay assigned to this tenant.",
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(defaultTenant).Error; err != nil {
+				return fmt.Errorf("failed to seed default tenant: %w", err)
+			}
+
+			// 3. Add tenant_id to governance_customers.
+			if !mig.HasColumn(&tables.TableCustomer{}, "tenant_id") {
+				if err := mig.AddColumn(&tables.TableCustomer{}, "TenantID"); err != nil {
+					return fmt.Errorf("failed to add tenant_id column to governance_customers: %w", err)
+				}
+			}
+
+			// 4. Backfill any rows the AddColumn default didn't populate
+			//    (Postgres respects the default; older SQLite may not honor
+			//    it when adding NOT NULL columns to existing rows).
+			if err := tx.Exec(`UPDATE governance_customers SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''`,
+				tables.DefaultTenantID).Error; err != nil {
+				return fmt.Errorf("failed to backfill governance_customers.tenant_id: %w", err)
+			}
+
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			if mig.HasColumn(&tables.TableCustomer{}, "tenant_id") {
+				if err := mig.DropColumn(&tables.TableCustomer{}, "tenant_id"); err != nil {
+					return fmt.Errorf("failed to drop tenant_id column from governance_customers: %w", err)
+				}
+			}
+			if mig.HasTable(&tables.TableTenant{}) {
+				if err := mig.DropTable(&tables.TableTenant{}); err != nil {
+					return fmt.Errorf("failed to drop bf_tenants: %w", err)
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running add_tenants_table_and_customer_tenant_id migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddTenantIDToGovernanceTables extends the multi-tenant rollout to
+// the remaining four governance entities — teams, virtual keys, budgets, rate
+// limits — using the same backward-compatible pattern as patch 0007:
+//
+//   - AddColumn with the "default" column default so single-tenant deployments
+//     keep working transparently.
+//   - Backfill UPDATE for any row left with NULL or empty string after the
+//     ALTER (Postgres respects the default but older SQLite may not honor it
+//     when adding a NOT NULL column to existing rows).
+//
+// Provider configs, MCP configs, access profiles, and other entities that
+// transitively belong to a tenant via VK or team are intentionally NOT
+// touched here — the query layer can derive tenant_id by joining to the
+// owning VK/team. Future migrations can promote those if a row-level
+// scoping pass shows joins are too expensive.
+func migrationAddTenantIDToGovernanceTables(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "add_tenant_id_to_governance_tables",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			// Table -> (struct, gorm field name, db table name) for the
+			// AddColumn + backfill loop. Order is teams/VK/budget/ratelimit so
+			// the backfill UPDATEs run in dependency order (teams first since
+			// VKs reference them).
+			targets := []struct {
+				model     any
+				fieldName string
+				tableName string
+			}{
+				{&tables.TableTeam{}, "TenantID", "governance_teams"},
+				{&tables.TableVirtualKey{}, "TenantID", "governance_virtual_keys"},
+				{&tables.TableBudget{}, "TenantID", "governance_budgets"},
+				{&tables.TableRateLimit{}, "TenantID", "governance_rate_limits"},
+			}
+
+			for _, t := range targets {
+				if !mig.HasColumn(t.model, "tenant_id") {
+					if err := mig.AddColumn(t.model, t.fieldName); err != nil {
+						return fmt.Errorf("failed to add tenant_id column to %s: %w", t.tableName, err)
+					}
+				}
+				// Idempotent backfill — only touches rows the default missed.
+				if err := tx.Exec(
+					fmt.Sprintf(`UPDATE %s SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''`, t.tableName),
+					tables.DefaultTenantID,
+				).Error; err != nil {
+					return fmt.Errorf("failed to backfill %s.tenant_id: %w", t.tableName, err)
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			// Reverse order: ratelimit, budget, vk, teams.
+			rollback := []struct {
+				model     any
+				tableName string
+			}{
+				{&tables.TableRateLimit{}, "governance_rate_limits"},
+				{&tables.TableBudget{}, "governance_budgets"},
+				{&tables.TableVirtualKey{}, "governance_virtual_keys"},
+				{&tables.TableTeam{}, "governance_teams"},
+			}
+			for _, t := range rollback {
+				if mig.HasColumn(t.model, "tenant_id") {
+					if err := mig.DropColumn(t.model, "tenant_id"); err != nil {
+						return fmt.Errorf("failed to drop tenant_id column from %s: %w", t.tableName, err)
+					}
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running add_tenant_id_to_governance_tables migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddTenantIDToProviderConfigTables extends multi-tenant scoping to
+// the user-config tables — providers, API keys, and MCP clients. These are
+// what each tenant "brings their own of" in a SaaS deployment, so they need
+// to carry an explicit tenant_id alongside the governance entities seeded by
+// patches 0007 and 0008.
+//
+// This patch only adds the column with the "default" default + backfills
+// pre-existing rows. The follow-up restructure — making provider/MCP/key
+// Names per-tenant unique via a composite (tenant_id, name) index — is a
+// separate patch because it requires coordinated updates to every caller
+// that performs ON CONFLICT (name) upserts in framework/configstore/rdb.go.
+// Until that lands, two tenants cannot register a provider with the same
+// Name; isolation is enforced at the runtime tenant-routing layer rather
+// than the DB index.
+//
+// Children of these tables (TableModel on a provider, TableOauthConfig on
+// an MCP client) derive tenant isolation through their owner and are not
+// touched here.
+func migrationAddTenantIDToProviderConfigTables(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "add_tenant_id_to_provider_config_tables",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			targets := []struct {
+				model     any
+				field     string
+				tableName string
+			}{
+				{&tables.TableProvider{}, "TenantID", "config_providers"},
+				{&tables.TableKey{}, "TenantID", "config_keys"},
+				{&tables.TableMCPClient{}, "TenantID", "config_mcp_clients"},
+			}
+			for _, t := range targets {
+				if !mig.HasColumn(t.model, "tenant_id") {
+					if err := mig.AddColumn(t.model, t.field); err != nil {
+						return fmt.Errorf("add tenant_id to %s: %w", t.tableName, err)
+					}
+				}
+				if err := tx.Exec(
+					fmt.Sprintf(`UPDATE %s SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''`, t.tableName),
+					tables.DefaultTenantID,
+				).Error; err != nil {
+					return fmt.Errorf("backfill %s.tenant_id: %w", t.tableName, err)
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			for _, t := range []struct {
+				model     any
+				tableName string
+			}{
+				{&tables.TableProvider{}, "config_providers"},
+				{&tables.TableKey{}, "config_keys"},
+				{&tables.TableMCPClient{}, "config_mcp_clients"},
+			} {
+				if mig.HasColumn(t.model, "tenant_id") {
+					if err := mig.DropColumn(t.model, "tenant_id"); err != nil {
+						return fmt.Errorf("drop tenant_id on %s: %w", t.tableName, err)
+					}
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running add_tenant_id_to_provider_config_tables migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationTenantScopedNameUniques flips the legacy global Name unique
+// indexes on config_providers / config_keys / config_mcp_clients to
+// composite (tenant_id, name) unique indexes so two tenants can
+// independently register a provider named "openai", an MCP client called
+// "tools", a key called "production", and so on.
+//
+// Must run after migrationAddTenantIDToProviderConfigTables (which seeds
+// the tenant_id column). Coordinates with the OnConflict update in
+// RDBConfigStore.UpdateProvidersConfig — that path now lists
+// (tenant_id, name) as the conflict target, so dropping the old index
+// before this lands would break the upsert. Updating the index +
+// updating the callers must ship in the same patch.
+//
+// ClientID on config_mcp_clients and KeyID on config_keys stay globally
+// unique. ClientID is an FK target for TableOauthUserToken; KeyID is a
+// UUID and doesn't benefit from per-tenant scoping.
+func migrationTenantScopedNameUniques(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "tenant_scoped_name_uniques_providers_keys_mcp",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			// Drop legacy single-column unique indexes. GORM's default
+			// auto-naming is idx_<table>_<column>; idx_key_name is the
+			// explicit name from TableKey's struct tag history.
+			drops := []struct {
+				model   any
+				idxName string
+			}{
+				{&tables.TableProvider{}, "idx_config_providers_name"},
+				{&tables.TableMCPClient{}, "idx_config_mcp_clients_name"},
+				{&tables.TableKey{}, "idx_key_name"},
+			}
+			for _, d := range drops {
+				if mig.HasIndex(d.model, d.idxName) {
+					if err := mig.DropIndex(d.model, d.idxName); err != nil {
+						return fmt.Errorf("drop legacy index %s: %w", d.idxName, err)
+					}
+				}
+			}
+
+			// Create the new composite indexes. GORM picks up the column
+			// set from the struct tag (both Name and TenantID share the
+			// idx_*_tenant_name name).
+			creates := []struct {
+				model   any
+				idxName string
+			}{
+				{&tables.TableProvider{}, "idx_providers_tenant_name"},
+				{&tables.TableMCPClient{}, "idx_mcp_tenant_name"},
+				{&tables.TableKey{}, "idx_key_tenant_name"},
+			}
+			for _, c := range creates {
+				if !mig.HasIndex(c.model, c.idxName) {
+					if err := mig.CreateIndex(c.model, c.idxName); err != nil {
+						return fmt.Errorf("create composite index %s: %w", c.idxName, err)
+					}
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			// Drop composite indexes; rebuilding the legacy single-column
+			// uniques would require reviving the prior struct tags, which
+			// only matters for true rollback testing.
+			for _, idx := range []struct {
+				model   any
+				idxName string
+			}{
+				{&tables.TableProvider{}, "idx_providers_tenant_name"},
+				{&tables.TableMCPClient{}, "idx_mcp_tenant_name"},
+				{&tables.TableKey{}, "idx_key_tenant_name"},
+			} {
+				if mig.HasIndex(idx.model, idx.idxName) {
+					if err := mig.DropIndex(idx.model, idx.idxName); err != nil {
+						return fmt.Errorf("drop composite index %s: %w", idx.idxName, err)
+					}
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running tenant_scoped_name_uniques migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationTenantScopedVKNameUnique is the sibling of
+// migrationTenantScopedNameUniques for governance_virtual_keys. The
+// initial multi-tenant patches scoped the (Name) unique to (TenantID,
+// Name) for providers / MCP clients / keys but missed virtual keys —
+// the first kind E2E run (TestMultiTenantSanity) caught it when two
+// tenants both tried to create a VK named "primary" and the second
+// got 409.
+//
+// VK Value remains globally unique (idx_virtual_key_value): the value
+// is what an inference request supplies via x-bf-vk and must resolve
+// to exactly one tenant, regardless of how many tenants are in play.
+func migrationTenantScopedVKNameUnique(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "tenant_scoped_name_unique_virtual_keys",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			if mig.HasIndex(&tables.TableVirtualKey{}, "idx_virtual_key_name") {
+				if err := mig.DropIndex(&tables.TableVirtualKey{}, "idx_virtual_key_name"); err != nil {
+					return fmt.Errorf("drop legacy index idx_virtual_key_name: %w", err)
+				}
+			}
+			if !mig.HasIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name") {
+				if err := mig.CreateIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name"); err != nil {
+					return fmt.Errorf("create composite index idx_virtual_keys_tenant_name: %w", err)
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			if mig.HasIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name") {
+				if err := mig.DropIndex(&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name"); err != nil {
+					return fmt.Errorf("drop composite index idx_virtual_keys_tenant_name: %w", err)
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running tenant_scoped_name_unique_virtual_keys migration: %s", err.Error())
 	}
 	return nil
 }

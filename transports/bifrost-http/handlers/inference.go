@@ -42,18 +42,83 @@ func forwardProviderHeadersFromContext(ctx *fasthttp.RequestCtx, bifrostCtx *sch
 	}
 }
 
-// CompletionHandler manages HTTP requests for completion operations
+// CompletionHandler manages HTTP requests for completion operations.
+//
+// The handler resolves the Bifrost runtime to use for each request via the
+// router rather than holding a direct *bifrost.Bifrost reference. OSS /
+// single-tenant deployments inject a lib.SingleTenantRouter that always
+// returns the same runtime; multi-tenant deployments inject a router that
+// dispatches to a per-tenant runtime based on the resolved tenant id on
+// the request context.
+//
+// The .client field is a back-compat shortcut for the legacy path (held
+// for shutdown / hot-reload coordination); per-request inference MUST go
+// through h.router.Acquire so the multi-tenant Acquire/Release refcount
+// stays balanced.
 type CompletionHandler struct {
-	client *bifrost.Bifrost
+	router lib.BifrostRouter
+	client *bifrost.Bifrost // legacy / hot-reload back-pointer; do NOT use in the request path
 	config *lib.Config
 }
 
-// NewInferenceHandler creates a new completion handler instance
+// NewInferenceHandler creates a new completion handler instance.
+// Accepts the BifrostRouter the handler will dispatch through. The
+// router-aware constructor lets the same handler code serve both
+// single-tenant (SingleTenantRouter) and multi-tenant (next patch)
+// deployments without per-request branching.
+//
+// client is kept on the struct only for back-compat with the existing
+// hot-reload paths that grab the runtime directly (e.g. Shutdown,
+// ReloadConfig). Inference MUST go through router.Acquire.
 func NewInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *CompletionHandler {
 	return &CompletionHandler{
+		router: lib.NewSingleTenantRouter(client),
 		client: client,
 		config: config,
 	}
+}
+
+// NewInferenceHandlerWithRouter is the explicit constructor for callers
+// that want to inject a custom BifrostRouter (e.g. the multi-tenant
+// dispatcher in the f5xc multi-tenant series). client is still required
+// for hot-reload back-compat — pass the same Bifrost the router will
+// hand out by default.
+func NewInferenceHandlerWithRouter(router lib.BifrostRouter, client *bifrost.Bifrost, config *lib.Config) *CompletionHandler {
+	return &CompletionHandler{
+		router: router,
+		client: client,
+		config: config,
+	}
+}
+
+// acquireBifrost is the per-request shortcut every inference entry point
+// uses: it returns the *bifrost.Bifrost to dispatch through and a release
+// func that MUST be deferred. Errors are terminal; the entry point should
+// send a 500 and return without invoking the runtime.
+func (h *CompletionHandler) acquireBifrost(ctx context.Context) (*bifrost.Bifrost, func(), error) {
+	return h.router.Acquire(ctx)
+}
+
+// clientOrFail is the convenience wrapper most entry-point methods use:
+// it acquires the per-tenant runtime, sends a 500 + returns ok=false on
+// failure (so the caller can `if !ok { return }` cheaply), and returns
+// the *bifrost.Bifrost + release func on success. ALWAYS defer the
+// release when ok is true so the multi-tenant Manager's refcount stays
+// balanced.
+//
+//	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+//	if !ok { return }
+//	defer release()
+//	resp, err := client.ChatCompletionRequest(bifrostCtx, req)
+//
+// For streaming entry points see clientOrFailForStream.
+func (h *CompletionHandler) clientOrFail(ctx *fasthttp.RequestCtx, bifrostCtx context.Context) (*bifrost.Bifrost, func(), bool) {
+	client, release, err := h.acquireBifrost(bifrostCtx)
+	if err != nil {
+		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to acquire bifrost runtime: %v", err))
+		return nil, nil, false
+	}
+	return client, release, true
 }
 
 // resolveModelAndProvider parses the model string, validates it, and resolves
@@ -827,11 +892,16 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		bifrostListModelsReq.ExtraParams = extraParams
 	}
 
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
 	// If provider is empty, list all models from all providers
 	if provider == "" {
-		resp, bifrostErr = h.client.ListAllModels(bifrostCtx, bifrostListModelsReq)
+		resp, bifrostErr = client.ListAllModels(bifrostCtx, bifrostListModelsReq)
 	} else {
-		resp, bifrostErr = h.client.ListModelsRequest(bifrostCtx, bifrostListModelsReq)
+		resp, bifrostErr = client.ListModelsRequest(bifrostCtx, bifrostListModelsReq)
 	}
 
 	if bifrostErr != nil {
@@ -930,7 +1000,12 @@ func (h *CompletionHandler) textCompletion(ctx *fasthttp.RequestCtx) {
 	// This is a known issue of valyala/fasthttp. And will be fixed here once it is fixed upstream.
 	defer cancel() // Ensure cleanup on function exit
 
-	resp, bifrostErr := h.client.TextCompletionRequest(bifrostCtx, bifrostTextReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.TextCompletionRequest(bifrostCtx, bifrostTextReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1005,7 +1080,12 @@ func (h *CompletionHandler) chatCompletion(ctx *fasthttp.RequestCtx) {
 	}
 	defer cancel() // Ensure cleanup on function exit
 	// Complete the request
-	resp, bifrostErr := h.client.ChatCompletionRequest(bifrostCtx, bifrostChatReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ChatCompletionRequest(bifrostCtx, bifrostChatReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1076,7 +1156,12 @@ func (h *CompletionHandler) responses(ctx *fasthttp.RequestCtx) {
 
 	defer cancel() // Ensure cleanup on function exit
 
-	resp, bifrostErr := h.client.ResponsesRequest(bifrostCtx, bifrostResponsesReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ResponsesRequest(bifrostCtx, bifrostResponsesReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1130,7 +1215,12 @@ func (h *CompletionHandler) embeddings(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.EmbeddingRequest(bifrostCtx, bifrostEmbeddingReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.EmbeddingRequest(bifrostCtx, bifrostEmbeddingReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1197,7 +1287,12 @@ func (h *CompletionHandler) rerank(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.RerankRequest(bifrostCtx, bifrostRerankReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.RerankRequest(bifrostCtx, bifrostRerankReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1260,7 +1355,12 @@ func (h *CompletionHandler) ocr(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.OCRRequest(bifrostCtx, bifrostOCRReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.OCRRequest(bifrostCtx, bifrostOCRReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1321,7 +1421,12 @@ func (h *CompletionHandler) speech(ctx *fasthttp.RequestCtx) {
 
 	defer cancel() // Ensure cleanup on function exit
 
-	resp, bifrostErr := h.client.SpeechRequest(bifrostCtx, bifrostSpeechReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.SpeechRequest(bifrostCtx, bifrostSpeechReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1448,7 +1553,12 @@ func (h *CompletionHandler) transcription(ctx *fasthttp.RequestCtx) {
 
 	defer cancel()
 
-	resp, bifrostErr := h.client.TranscriptionRequest(bifrostCtx, bifrostTranscriptionReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.TranscriptionRequest(bifrostCtx, bifrostTranscriptionReq)
 
 	// Handle response
 	if bifrostErr != nil {
@@ -1482,7 +1592,12 @@ func (h *CompletionHandler) countTokens(ctx *fasthttp.RequestCtx) {
 	}
 	defer cancel()
 
-	response, bifrostErr := h.client.CountTokensRequest(bifrostCtx, bifrostResponsesReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	response, bifrostErr := client.CountTokensRequest(bifrostCtx, bifrostResponsesReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1499,73 +1614,103 @@ func (h *CompletionHandler) countTokens(ctx *fasthttp.RequestCtx) {
 
 // handleStreamingTextCompletion handles streaming text completion requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingTextCompletion(ctx *fasthttp.RequestCtx, req *schemas.BifrostTextCompletionRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.TextCompletionStreamRequest(bifrostCtx, req)
+	// Acquire the per-tenant runtime up-front; handleStreamingResponse
+	// holds the release until the producer goroutine finishes.
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.TextCompletionStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // handleStreamingChatCompletion handles streaming chat completion requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingChatCompletion(ctx *fasthttp.RequestCtx, req *schemas.BifrostChatRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.ChatCompletionStreamRequest(bifrostCtx, req)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.ChatCompletionStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // handleStreamingResponses handles streaming responses requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingResponses(ctx *fasthttp.RequestCtx, req *schemas.BifrostResponsesRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.ResponsesStreamRequest(bifrostCtx, req)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.ResponsesStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // handleStreamingSpeech handles streaming speech requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingSpeech(ctx *fasthttp.RequestCtx, req *schemas.BifrostSpeechRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.SpeechStreamRequest(bifrostCtx, req)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.SpeechStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // handleStreamingTranscriptionRequest handles streaming transcription requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.RequestCtx, req *schemas.BifrostTranscriptionRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.TranscriptionStreamRequest(bifrostCtx, req)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.TranscriptionStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // handleStreamingResponse is a generic function to handle streaming responses using Server-Sent Events (SSE)
 // The cancel function is called ONLY when client disconnects are detected via write errors.
 // Bifrost handles cleanup internally for normal completion and errors, so we only cancel
 // upstream streams when write errors indicate the client has disconnected.
-func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc) {
+//
+// releaseBifrost is the multi-tenant router Acquire's release callback,
+// pinning the per-tenant *bifrost.Bifrost runtime for the duration of
+// stream consumption. It's called exactly once:
+//   - on the early-return error path here in handleStreamingResponse
+//   - in the producer goroutine's outer defer, after the stream finishes
+//
+// Pass a no-op (e.g. lib.SingleTenantRouter's release) when no real
+// runtime is being pinned.
+func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc, releaseBifrost func()) {
+	if releaseBifrost == nil {
+		releaseBifrost = func() {}
+	}
 	// Get the streaming channel — called BEFORE setting SSE headers so that
 	// provider errors return proper HTTP status codes + JSON content type.
 	stream, bifrostErr := getStream()
 	if bifrostErr != nil {
+		releaseBifrost()
 		cancel()
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1671,6 +1816,11 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 			if traceCompleter != nil {
 				traceCompleter(transportLogs)
 			}
+			// Release the per-tenant *bifrost.Bifrost handle now that the
+			// stream is fully consumed — only the stream goroutine knows
+			// when consumption is done; the request handler returns
+			// immediately after SetBodyStream and so can't release safely.
+			releaseBifrost()
 		}()
 
 		var includeEventType bool
@@ -1897,7 +2047,12 @@ func (h *CompletionHandler) imageGeneration(ctx *fasthttp.RequestCtx) {
 	defer cancel()
 
 	// Execute request
-	resp, bifrostErr := h.client.ImageGenerationRequest(bifrostCtx, bifrostReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ImageGenerationRequest(bifrostCtx, bifrostReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -1915,15 +2070,17 @@ func (h *CompletionHandler) imageGeneration(ctx *fasthttp.RequestCtx) {
 
 // handleStreamingImageGeneration handles streaming image generation requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingImageGeneration(ctx *fasthttp.RequestCtx, req *schemas.BifrostImageGenerationRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-	// Pass the context directly instead of copying to avoid copying lock values
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.ImageGenerationStreamRequest(bifrostCtx, req)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.ImageGenerationStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // prepareImageEditRequest prepares a BifrostImageEditRequest from a multipart form
@@ -2104,7 +2261,12 @@ func (h *CompletionHandler) imageEdit(ctx *fasthttp.RequestCtx) {
 	defer cancel()
 
 	// Execute request
-	resp, bifrostErr := h.client.ImageEditRequest(bifrostCtx, bifrostReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ImageEditRequest(bifrostCtx, bifrostReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2122,14 +2284,17 @@ func (h *CompletionHandler) imageEdit(ctx *fasthttp.RequestCtx) {
 
 // handleStreamingImageEditRequest handles streaming image edit requests using Server-Sent Events (SSE)
 func (h *CompletionHandler) handleStreamingImageEditRequest(ctx *fasthttp.RequestCtx, req *schemas.BifrostImageEditRequest, bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc) {
-	// Use the cancellable context from ConvertToBifrostContext
-	// See router.go for detailed explanation of why we need a cancellable context
-
-	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-		return h.client.ImageEditStreamRequest(bifrostCtx, req)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		cancel()
+		return
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return client.ImageEditStreamRequest(bifrostCtx, req)
+	}
+
+	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel, release)
 }
 
 // prepareImageVariationRequest prepares a BifrostImageVariationRequest from a multipart form
@@ -2241,7 +2406,12 @@ func (h *CompletionHandler) imageVariation(ctx *fasthttp.RequestCtx) {
 	defer cancel()
 
 	// Execute request (no streaming for variations)
-	resp, bifrostErr := h.client.ImageVariationRequest(bifrostCtx, bifrostReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ImageVariationRequest(bifrostCtx, bifrostReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2309,7 +2479,12 @@ func (h *CompletionHandler) videoGeneration(ctx *fasthttp.RequestCtx) {
 	}
 	defer cancel()
 
-	resp, bifrostErr := h.client.VideoGenerationRequest(bifrostCtx, bifrostReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.VideoGenerationRequest(bifrostCtx, bifrostReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2362,7 +2537,12 @@ func (h *CompletionHandler) videoRetrieve(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.VideoRetrieveRequest(bifrostCtx, bifrostVideoReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.VideoRetrieveRequest(bifrostCtx, bifrostVideoReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2420,7 +2600,12 @@ func (h *CompletionHandler) videoDownload(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.VideoDownloadRequest(bifrostCtx, bifrostVideoReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.VideoDownloadRequest(bifrostCtx, bifrostVideoReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2482,7 +2667,12 @@ func (h *CompletionHandler) videoList(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.VideoListRequest(bifrostCtx, bifrostVideoReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.VideoListRequest(bifrostCtx, bifrostVideoReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2533,7 +2723,12 @@ func (h *CompletionHandler) videoDelete(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.VideoDeleteRequest(bifrostCtx, bifrostVideoReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.VideoDeleteRequest(bifrostCtx, bifrostVideoReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2610,7 +2805,12 @@ func (h *CompletionHandler) videoRemix(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.VideoRemixRequest(bifrostCtx, bifrostVideoReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.VideoRemixRequest(bifrostCtx, bifrostVideoReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2680,7 +2880,12 @@ func (h *CompletionHandler) batchCreate(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.BatchCreateRequest(bifrostCtx, bifrostBatchReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.BatchCreateRequest(bifrostCtx, bifrostBatchReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2740,7 +2945,12 @@ func (h *CompletionHandler) batchList(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.BatchListRequest(bifrostCtx, bifrostBatchReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.BatchListRequest(bifrostCtx, bifrostBatchReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2786,7 +2996,12 @@ func (h *CompletionHandler) batchRetrieve(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.BatchRetrieveRequest(bifrostCtx, bifrostBatchReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.BatchRetrieveRequest(bifrostCtx, bifrostBatchReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2832,7 +3047,12 @@ func (h *CompletionHandler) batchCancel(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.BatchCancelRequest(bifrostCtx, bifrostBatchReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.BatchCancelRequest(bifrostCtx, bifrostBatchReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2878,7 +3098,12 @@ func (h *CompletionHandler) batchResults(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.BatchResultsRequest(bifrostCtx, bifrostBatchReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.BatchResultsRequest(bifrostCtx, bifrostBatchReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -2967,7 +3192,12 @@ func (h *CompletionHandler) fileUpload(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.FileUploadRequest(bifrostCtx, bifrostFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.FileUploadRequest(bifrostCtx, bifrostFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3033,7 +3263,12 @@ func (h *CompletionHandler) fileList(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.FileListRequest(bifrostCtx, bifrostFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.FileListRequest(bifrostCtx, bifrostFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3079,7 +3314,12 @@ func (h *CompletionHandler) fileRetrieve(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.FileRetrieveRequest(bifrostCtx, bifrostFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.FileRetrieveRequest(bifrostCtx, bifrostFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3125,7 +3365,12 @@ func (h *CompletionHandler) fileDelete(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.FileDeleteRequest(bifrostCtx, bifrostFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.FileDeleteRequest(bifrostCtx, bifrostFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3171,7 +3416,12 @@ func (h *CompletionHandler) fileContent(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	resp, bifrostErr := h.client.FileContentRequest(bifrostCtx, bifrostFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.FileContentRequest(bifrostCtx, bifrostFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3233,7 +3483,12 @@ func (h *CompletionHandler) containerCreate(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerCreateRequest(bifrostCtx, bifrostContainerReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerCreateRequest(bifrostCtx, bifrostContainerReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3292,7 +3547,12 @@ func (h *CompletionHandler) containerList(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerListRequest(bifrostCtx, bifrostContainerReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerListRequest(bifrostCtx, bifrostContainerReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3339,7 +3599,12 @@ func (h *CompletionHandler) containerRetrieve(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerRetrieveRequest(bifrostCtx, bifrostContainerReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerRetrieveRequest(bifrostCtx, bifrostContainerReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3386,7 +3651,12 @@ func (h *CompletionHandler) containerDelete(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerDeleteRequest(bifrostCtx, bifrostContainerReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerDeleteRequest(bifrostCtx, bifrostContainerReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3483,7 +3753,12 @@ func (h *CompletionHandler) containerFileCreate(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerFileCreateRequest(bifrostCtx, bifrostContainerFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerFileCreateRequest(bifrostCtx, bifrostContainerFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3543,7 +3818,12 @@ func (h *CompletionHandler) containerFileList(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerFileListRequest(bifrostCtx, bifrostContainerFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerFileListRequest(bifrostCtx, bifrostContainerFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3598,7 +3878,12 @@ func (h *CompletionHandler) containerFileRetrieve(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerFileRetrieveRequest(bifrostCtx, bifrostContainerFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerFileRetrieveRequest(bifrostCtx, bifrostContainerFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3653,7 +3938,12 @@ func (h *CompletionHandler) containerFileContent(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerFileContentRequest(bifrostCtx, bifrostContainerFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerFileContentRequest(bifrostCtx, bifrostContainerFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
@@ -3708,7 +3998,12 @@ func (h *CompletionHandler) containerFileDelete(ctx *fasthttp.RequestCtx) {
 	}
 	enableRawRequestResponseForContainer(bifrostCtx)
 
-	resp, bifrostErr := h.client.ContainerFileDeleteRequest(bifrostCtx, bifrostContainerFileReq)
+	client, release, ok := h.clientOrFail(ctx, bifrostCtx)
+	if !ok {
+		return
+	}
+	defer release()
+	resp, bifrostErr := client.ContainerFileDeleteRequest(bifrostCtx, bifrostContainerFileReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)

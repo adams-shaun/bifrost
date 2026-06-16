@@ -58,6 +58,12 @@ type SearchFilters struct {
 	CustomerIDs       []string          `json:"customer_ids,omitempty"`
 	UserIDs           []string          `json:"user_ids,omitempty"`
 	BusinessUnitIDs   []string          `json:"business_unit_ids,omitempty"`
+	// TenantIDs filters the log set to rows tagged with these tenant
+	// ids. Multi-valued so the dashboard can show "Acme + Globex"
+	// side-by-side, but the typical call site sets exactly one entry
+	// (the active workspace tenant). Empty slice = no filter
+	// (admin-wide view).
+	TenantIDs         []string          `json:"tenant_ids,omitempty"`
 	RoutingEngineUsed []string          `json:"routing_engine_used,omitempty"` // For filtering by routing engine (routing-rule, governance, loadbalancing)
 	StartTime         *time.Time        `json:"start_time,omitempty"`
 	EndTime           *time.Time        `json:"end_time,omitempty"`
@@ -153,6 +159,14 @@ type Log struct {
 	CustomerName            *string   `gorm:"type:varchar(255)" json:"customer_name"`
 	BusinessUnitID          *string   `gorm:"type:varchar(255);index:idx_logs_business_unit_id" json:"business_unit_id"`
 	BusinessUnitName        *string   `gorm:"type:varchar(255)" json:"business_unit_name"`
+	// TenantID captures the multi-tenant scope of the inference request
+	// at the time it was logged, resolved from ctx via the tenant
+	// resolver middleware (see transports/bifrost-http/handlers/
+	// tenant_resolver.go). NULL on single-tenant deployments and on
+	// rows written by replicas that haven't been routed through the
+	// resolver (e.g. legacy /api inference calls without a VK). Index
+	// so the dashboard's tenant filter is cheap on large log tables.
+	TenantID                *string   `gorm:"type:varchar(255);index:idx_logs_tenant_id" json:"tenant_id"`
 	InputHistory            string    `gorm:"type:text" json:"-"` // JSON serialized []schemas.ChatMessage
 	ResponsesInputHistory   string    `gorm:"type:text" json:"-"` // JSON serialized []schemas.ResponsesMessage
 	OutputMessage           string    `gorm:"type:text" json:"-"` // JSON serialized *schemas.ChatMessage

@@ -479,7 +479,19 @@ func (m *MockConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.M
 	return m.providers, nil
 }
 
+// GetProvidersConfigByTenant — the mock is single-tenant; ignore tenantID and
+// return the same map as GetProvidersConfig. Multi-tenant scoping is tested
+// against the real RDBConfigStore in framework/configstore.
+func (m *MockConfigStore) GetProvidersConfigByTenant(ctx context.Context, tenantID string) (map[schemas.ModelProvider]configstore.ProviderConfig, error) {
+	return m.GetProvidersConfig(ctx)
+}
+
 func (m *MockConfigStore) AddProvider(ctx context.Context, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
+	m.providers[provider] = config
+	return nil
+}
+
+func (m *MockConfigStore) AddProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
 	m.providers[provider] = config
 	return nil
 }
@@ -489,9 +501,17 @@ func (m *MockConfigStore) UpdateProvider(ctx context.Context, provider schemas.M
 	return nil
 }
 
+func (m *MockConfigStore) UpdateProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, config configstore.ProviderConfig, tx ...*gorm.DB) error {
+	return m.UpdateProvider(ctx, provider, config, tx...)
+}
+
 func (m *MockConfigStore) DeleteProvider(ctx context.Context, provider schemas.ModelProvider, tx ...*gorm.DB) error {
 	delete(m.providers, provider)
 	return nil
+}
+
+func (m *MockConfigStore) DeleteProviderForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, tx ...*gorm.DB) error {
+	return m.DeleteProvider(ctx, provider, tx...)
 }
 
 func (m *MockConfigStore) GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error) {
@@ -500,6 +520,22 @@ func (m *MockConfigStore) GetProviderKeys(ctx context.Context, provider schemas.
 		return nil, configstore.ErrNotFound
 	}
 	return append([]schemas.Key(nil), config.Keys...), nil
+}
+
+func (m *MockConfigStore) GetProviderKeysForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) ([]schemas.Key, error) {
+	return m.GetProviderKeys(ctx, provider)
+}
+
+func (m *MockConfigStore) GetProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
+	return m.GetProviderKey(ctx, provider, keyID)
+}
+
+func (m *MockConfigStore) CreateProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, key schemas.Key, tx ...*gorm.DB) error {
+	return m.CreateProviderKey(ctx, provider, key, tx...)
+}
+
+func (m *MockConfigStore) DeleteProviderKeyForTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider, keyID string, tx ...*gorm.DB) error {
+	return m.DeleteProviderKey(ctx, provider, keyID, tx...)
 }
 
 func (m *MockConfigStore) GetProviderKey(ctx context.Context, provider schemas.ModelProvider, keyID string) (*schemas.Key, error) {
@@ -561,8 +597,24 @@ func (m *MockConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig,
 	return m.mcpConfig, nil
 }
 
+func (m *MockConfigStore) GetMCPConfigByTenant(ctx context.Context, tenantID string) (*schemas.MCPConfig, error) {
+	return m.mcpConfig, nil
+}
+
 func (m *MockConfigStore) GetMCPClientByID(ctx context.Context, id string) (*tables.TableMCPClient, error) {
 	return nil, nil
+}
+
+func (m *MockConfigStore) GetMCPClientByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableMCPClient, error) {
+	return m.GetMCPClientByID(ctx, id)
+}
+
+func (m *MockConfigStore) DeleteMCPClientConfigForTenant(ctx context.Context, tenantID, id string) error {
+	return m.DeleteMCPClientConfig(ctx, id)
+}
+
+func (m *MockConfigStore) UpdateMCPClientConfigForTenant(ctx context.Context, tenantID, id string, clientConfig *tables.TableMCPClient) error {
+	return m.UpdateMCPClientConfig(ctx, id, clientConfig)
 }
 
 func (m *MockConfigStore) GetMCPClientConfigByID(ctx context.Context, id string) (*schemas.MCPClientConfig, error) {
@@ -577,6 +629,10 @@ func (m *MockConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfi
 	m.mcpConfig.ClientConfigs = append(m.mcpConfig.ClientConfigs, clientConfig)
 	m.mcpConfigsCreated = append(m.mcpConfigsCreated, clientConfig)
 	return nil
+}
+
+func (m *MockConfigStore) CreateMCPClientConfigForTenant(ctx context.Context, tenantID string, clientConfig *schemas.MCPClientConfig) error {
+	return m.CreateMCPClientConfig(ctx, clientConfig)
 }
 
 func (m *MockConfigStore) UpdateMCPClientConfig(ctx context.Context, id string, clientConfig *tables.TableMCPClient) error {
@@ -704,6 +760,46 @@ func (m *MockConfigStore) DeleteRateLimit(ctx context.Context, id string, tx ...
 	return nil
 }
 
+func (m *MockConfigStore) CreateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
+	return m.CreateBudget(ctx, budget, tx...)
+}
+
+func (m *MockConfigStore) UpdateBudgetForTenant(ctx context.Context, tenantID string, budget *tables.TableBudget, tx ...*gorm.DB) error {
+	return m.UpdateBudget(ctx, budget, tx...)
+}
+
+func (m *MockConfigStore) DeleteBudgetForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
+	return m.DeleteBudget(ctx, id, tx...)
+}
+
+func (m *MockConfigStore) GetBudgetsByTenant(ctx context.Context, tenantID string) ([]tables.TableBudget, error) {
+	return m.GetBudgets(ctx)
+}
+
+func (m *MockConfigStore) GetBudgetForTenant(ctx context.Context, tenantID, id string) (*tables.TableBudget, error) {
+	return m.GetBudget(ctx, id)
+}
+
+func (m *MockConfigStore) CreateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
+	return m.CreateRateLimit(ctx, rateLimit, tx...)
+}
+
+func (m *MockConfigStore) UpdateRateLimitForTenant(ctx context.Context, tenantID string, rateLimit *tables.TableRateLimit, tx ...*gorm.DB) error {
+	return m.UpdateRateLimit(ctx, rateLimit, tx...)
+}
+
+func (m *MockConfigStore) DeleteRateLimitForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
+	return m.DeleteRateLimit(ctx, id, tx...)
+}
+
+func (m *MockConfigStore) GetRateLimitsByTenant(ctx context.Context, tenantID string) ([]tables.TableRateLimit, error) {
+	return m.GetRateLimits(ctx)
+}
+
+func (m *MockConfigStore) GetRateLimitForTenant(ctx context.Context, tenantID, id string) (*tables.TableRateLimit, error) {
+	return m.GetRateLimit(ctx, id)
+}
+
 func (m *MockConfigStore) DeleteBudget(ctx context.Context, id string, tx ...*gorm.DB) error {
 	if m.governanceConfig == nil || len(m.governanceConfig.Budgets) == 0 {
 		return nil
@@ -731,6 +827,26 @@ func (m *MockConfigStore) CreateCustomer(ctx context.Context, customer *tables.T
 	return nil
 }
 
+func (m *MockConfigStore) CreateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
+	return m.CreateCustomer(ctx, customer, tx...)
+}
+
+func (m *MockConfigStore) UpdateCustomerForTenant(ctx context.Context, tenantID string, customer *tables.TableCustomer, tx ...*gorm.DB) error {
+	return m.UpdateCustomer(ctx, customer, tx...)
+}
+
+func (m *MockConfigStore) DeleteCustomerForTenant(ctx context.Context, tenantID, id string) error {
+	return m.DeleteCustomer(ctx, id)
+}
+
+func (m *MockConfigStore) GetCustomersByTenant(ctx context.Context, tenantID string) ([]tables.TableCustomer, error) {
+	return m.GetCustomers(ctx)
+}
+
+func (m *MockConfigStore) GetCustomerByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableCustomer, error) {
+	return m.GetCustomer(ctx, id)
+}
+
 func (m *MockConfigStore) UpdateCustomer(ctx context.Context, customer *tables.TableCustomer, tx ...*gorm.DB) error {
 	return nil
 }
@@ -751,6 +867,29 @@ func (m *MockConfigStore) GetCustomersPaginated(ctx context.Context, params conf
 	return nil, 0, nil
 }
 
+// Tenant CRUD — added in the multi-tenant patch series. The mock is
+// intentionally minimal: no in-memory state, just satisfy the interface so
+// test-only callers compile. Tenant-CRUD-specific tests live next to the
+// real RDBConfigStore impl in framework/configstore.
+func (m *MockConfigStore) GetTenants(ctx context.Context) ([]tables.TableTenant, error) {
+	return nil, nil
+}
+func (m *MockConfigStore) GetTenantsPaginated(ctx context.Context, params configstore.TenantsQueryParams) ([]tables.TableTenant, int64, error) {
+	return nil, 0, nil
+}
+func (m *MockConfigStore) GetTenant(ctx context.Context, id string) (*tables.TableTenant, error) {
+	return nil, configstore.ErrNotFound
+}
+func (m *MockConfigStore) CreateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
+	return nil
+}
+func (m *MockConfigStore) UpdateTenant(ctx context.Context, tenant *tables.TableTenant, tx ...*gorm.DB) error {
+	return nil
+}
+func (m *MockConfigStore) DeleteTenant(ctx context.Context, id string) error {
+	return nil
+}
+
 func (m *MockConfigStore) CreateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error {
 	if m.governanceConfig == nil {
 		m.governanceConfig = &configstore.GovernanceConfig{}
@@ -758,6 +897,26 @@ func (m *MockConfigStore) CreateTeam(ctx context.Context, team *tables.TableTeam
 	m.governanceConfig.Teams = append(m.governanceConfig.Teams, *team)
 	m.governanceItemsCreated.teams = append(m.governanceItemsCreated.teams, *team)
 	return nil
+}
+
+func (m *MockConfigStore) CreateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
+	return m.CreateTeam(ctx, team, tx...)
+}
+
+func (m *MockConfigStore) UpdateTeamForTenant(ctx context.Context, tenantID string, team *tables.TableTeam, tx ...*gorm.DB) error {
+	return m.UpdateTeam(ctx, team, tx...)
+}
+
+func (m *MockConfigStore) DeleteTeamForTenant(ctx context.Context, tenantID, id string) error {
+	return m.DeleteTeam(ctx, id)
+}
+
+func (m *MockConfigStore) GetTeamsByTenant(ctx context.Context, tenantID, customerID string) ([]tables.TableTeam, error) {
+	return m.GetTeams(ctx, customerID)
+}
+
+func (m *MockConfigStore) GetTeamByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableTeam, error) {
+	return m.GetTeam(ctx, id)
 }
 
 func (m *MockConfigStore) UpdateTeam(ctx context.Context, team *tables.TableTeam, tx ...*gorm.DB) error {
@@ -805,12 +964,28 @@ func (m *MockConfigStore) DeleteVirtualKey(ctx context.Context, id string, tx ..
 	return nil
 }
 
+func (m *MockConfigStore) DeleteVirtualKeyForTenant(ctx context.Context, tenantID, id string, tx ...*gorm.DB) error {
+	return m.DeleteVirtualKey(ctx, id, tx...)
+}
+
+func (m *MockConfigStore) UpdateVirtualKeyForTenant(ctx context.Context, tenantID string, vk *tables.TableVirtualKey, tx ...*gorm.DB) error {
+	return m.UpdateVirtualKey(ctx, vk, tx...)
+}
+
 func (m *MockConfigStore) GetVirtualKey(ctx context.Context, id string) (*tables.TableVirtualKey, error) {
 	return nil, nil
 }
 
+func (m *MockConfigStore) GetVirtualKeyByIDForTenant(ctx context.Context, tenantID, id string) (*tables.TableVirtualKey, error) {
+	return m.GetVirtualKey(ctx, id)
+}
+
 func (m *MockConfigStore) GetVirtualKeys(ctx context.Context) ([]tables.TableVirtualKey, error) {
 	return nil, nil
+}
+
+func (m *MockConfigStore) GetVirtualKeysByTenant(ctx context.Context, tenantID string) ([]tables.TableVirtualKey, error) {
+	return m.GetVirtualKeys(ctx)
 }
 
 func (m *MockConfigStore) GetVirtualKeysPaginated(ctx context.Context, params configstore.VirtualKeyQueryParams) ([]tables.TableVirtualKey, int64, error) {
@@ -1061,6 +1236,10 @@ func (m *MockConfigStore) GetProvider(ctx context.Context, provider schemas.Mode
 
 func (m *MockConfigStore) GetProviders(ctx context.Context) ([]tables.TableProvider, error) {
 	return nil, nil
+}
+
+func (m *MockConfigStore) GetProviderConfigByTenant(ctx context.Context, tenantID string, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
+	return m.GetProviderConfig(ctx, provider)
 }
 
 func (m *MockConfigStore) GetProviderConfig(ctx context.Context, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
@@ -15732,11 +15911,13 @@ var excludedGoFields = map[string]map[string]bool{
 		"updated_at":         true,
 		"virtual_key_id":     true, // Internal DB FK for multi-budget ownership
 		"provider_config_id": true, // Internal DB FK for multi-budget ownership
+		"tenant_id":          true, // Multi-tenant scoping; not user-facing config
 	},
 	"tables.TableRateLimit": {
 		"config_hash": true,
 		"created_at":  true,
 		"updated_at":  true,
+		"tenant_id":   true, // Multi-tenant scoping; not user-facing config
 	},
 	"tables.TableCustomer": {
 		"config_hash":  true,
@@ -15746,6 +15927,7 @@ var excludedGoFields = map[string]map[string]bool{
 		"rate_limit":   true, // GORM relation
 		"teams":        true, // GORM relation
 		"virtual_keys": true, // GORM relation
+		"tenant_id":    true, // Multi-tenant scoping; not user-facing config
 	},
 	"tables.TableTeam": {
 		"config_hash":  true,
@@ -15755,6 +15937,8 @@ var excludedGoFields = map[string]map[string]bool{
 		"rate_limit":   true, // GORM relation
 		"customer":     true, // GORM relation
 		"virtual_keys": true, // GORM relation
+		"source_id":    true, // IdP / SCIM sync identifier; not user-facing config
+		"tenant_id":    true, // Multi-tenant scoping; not user-facing config
 	},
 	"tables.TableVirtualKey": {
 		"config_hash": true,
@@ -15764,6 +15948,7 @@ var excludedGoFields = map[string]map[string]bool{
 		"rate_limit":  true, // GORM relation
 		"team":        true, // GORM relation
 		"customer":    true, // GORM relation
+		"tenant_id":   true, // Multi-tenant scoping; not user-facing config
 	},
 	"tables.TableVirtualKeyProviderConfig": {
 		"rate_limit":     true, // GORM relation

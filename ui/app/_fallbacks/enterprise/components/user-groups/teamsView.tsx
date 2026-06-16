@@ -81,7 +81,7 @@ export function TeamsView() {
 			toast.error("Failed to load governance data.");
 		} else {
 			if (vkError) toast.error(`Failed to load virtual keys: ${getErrorMessage(vkError)}`);
-			if (customersError) toast.error(`Failed to load customers: ${getErrorMessage(customersError)}`);
+			if (customersError) toast.error(`Failed to load namespaces: ${getErrorMessage(customersError)}`);
 			if (teamsError) toast.error(`Failed to load teams: ${getErrorMessage(teamsError)}`);
 		}
 	}, [vkError, customersError, teamsError]);
