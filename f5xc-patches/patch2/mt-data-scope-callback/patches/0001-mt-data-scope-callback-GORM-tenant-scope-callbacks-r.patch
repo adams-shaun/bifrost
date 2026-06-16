@@ -1,7 +1,7 @@
-From 5423c09f3c9fb139657ac4ac39dc5b3774b1e4fd Mon Sep 17 00:00:00 2001
+From 078b217e30dfc4190e635a0dca6e8358ec938116 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 13:47:57 -0600
-Subject: [PATCH] mt-data-scope-callback: GORM tenant-scope callbacks + rdb
+Subject: [PATCH 2/5] mt-data-scope-callback: GORM tenant-scope callbacks + rdb
  tenant-scoped fallback + team composite uniqueness
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -46,14 +46,16 @@ Installs the back-end half of the header-model multi-tenant story:
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
- framework/configstore/migrations.go   |  49 +++++-
- framework/configstore/postgres.go     |   9 ++
- framework/configstore/rdb.go          |   9 +-
- framework/configstore/sqlite.go       |   8 +
- framework/configstore/tables/team.go  |  10 +-
- framework/configstore/tenant_scope.go | 211 ++++++++++++++++++++++++++
- 6 files changed, 289 insertions(+), 7 deletions(-)
+ framework/configstore/migrations.go        |  49 ++++-
+ framework/configstore/postgres.go          |   9 +
+ framework/configstore/rdb.go               |  19 +-
+ framework/configstore/sqlite.go            |   8 +
+ framework/configstore/tables/team.go       |  10 +-
+ framework/configstore/tenant_scope.go      | 211 +++++++++++++++++++++
+ framework/configstore/tenant_scope_test.go | 105 ++++++++++
+ 7 files changed, 404 insertions(+), 7 deletions(-)
  create mode 100644 framework/configstore/tenant_scope.go
+ create mode 100644 framework/configstore/tenant_scope_test.go
 
 diff --git a/framework/configstore/migrations.go b/framework/configstore/migrations.go
 index 7638e829d..39d3eae6e 100644
@@ -147,7 +149,7 @@ index ef6ba0eb1..ab66bca32 100644
  	// migrateOnFreshFn: downstream consumers (e.g. bifrost-enterprise) run
  	// their migrations via this hook on a throwaway pool that closes after fn.
 diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
-index de67cd722..6a9a54ec8 100644
+index de67cd722..8c47df2bb 100644
 --- a/framework/configstore/rdb.go
 +++ b/framework/configstore/rdb.go
 @@ -769,8 +769,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
@@ -166,6 +168,23 @@ index de67cd722..6a9a54ec8 100644
  				if result.Error == nil {
  					// Found by name - update existing key, preserve original KeyID
  					dbKey.ID = existingKey.ID                             // Keep the same database ID
+@@ -1358,6 +1363,16 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
+ 	dbKey.ConfigHash = existingKey.ConfigHash
+ 	dbKey.EncryptionStatus = existingKey.EncryptionStatus
+ 	dbKey.CreatedAt = existingKey.CreatedAt // Preserve original creation timestamp
++	// Preserve the row's existing TenantID. schemas.Key (the request body
++	// shape) carries no tenant; tableKeyFromSchemaKey doesn't propagate
++	// one either (the stub TableProvider passed in above has only ID +
++	// Name). Without this assignment dbKey.TenantID is the zero string
++	// and gorm.Save would issue `UPDATE ... SET tenant_id = '' WHERE id
++	// = ? AND tenant_id = '<ctx>'` (the WHERE comes from the tenant-
++	// scope callback). The UPDATE matches and silently corrupts the
++	// row's tenant_id to '', after which every subsequent tenant-scoped
++	// read 404s the key.
++	dbKey.TenantID = existingKey.TenantID
+ 
+ 	if err := txDB.WithContext(ctx).Save(&dbKey).Error; err != nil {
+ 		return s.parseGormError(err)
 diff --git a/framework/configstore/sqlite.go b/framework/configstore/sqlite.go
 index 9482801d0..421f1ea79 100644
 --- a/framework/configstore/sqlite.go
@@ -427,6 +446,117 @@ index 000000000..786ab1c11
 +		return
 +	}
 +	field.SetString(tid)
++}
+diff --git a/framework/configstore/tenant_scope_test.go b/framework/configstore/tenant_scope_test.go
+new file mode 100644
+index 000000000..fda3d5a52
+--- /dev/null
++++ b/framework/configstore/tenant_scope_test.go
+@@ -0,0 +1,105 @@
++// Tests covering the GORM tenant-scope callback registered by
++// RegisterTenantScopes and the data paths that interact with it.
++//
++// Regression-test conventions:
++//   - Every test wires its own RegisterTenantScopes-equipped *gorm.DB
++//     via setupRDBTestStoreWithTenantScope, because the default
++//     setupRDBTestStore (in rdb_test.go) does not register the callback
++//     and therefore cannot reproduce tenant-isolation bugs.
++//   - Tenant identity is pushed onto the context with the typed
++//     BifrostContextKeyTenantID — same form the HTTP-layer resolver
++//     middleware uses.
++
++package configstore
++
++import (
++	"context"
++	"testing"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// setupRDBTestStoreWithTenantScope is the tenant-aware sibling of
++// setupRDBTestStore. It additionally registers the four scope
++// callbacks so SELECT/UPDATE/DELETE on tenant-scoped tables get
++// `WHERE tenant_id = ?` from ctx and INSERTs get tenant_id populated.
++func setupRDBTestStoreWithTenantScope(t *testing.T) *RDBConfigStore {
++	store := setupRDBTestStore(t)
++	require.NoError(t, RegisterTenantScopes(store.DB()), "register tenant-scope callbacks")
++	return store
++}
++
++// withTenant returns a context carrying the supplied tenant id under
++// multitenant.BifrostContextKeyTenantID — the form the configstore
++// tenant-scope callback reads.
++func withTenant(parent context.Context, tid string) context.Context {
++	return context.WithValue(parent, multitenant.BifrostContextKeyTenantID, tid)
++}
++
++// TestUpdateProviderKey_PreservesTenantID is the regression for a
++// silent data-corruption bug:
++//
++//   - UpdateProviderKey reconstructs a TableKey from a stub
++//     TableProvider (only ID + Name) and never copies the existing
++//     row's TenantID onto the struct.
++//   - gorm.Save then issues UPDATE SET tenant_id = '' WHERE id = ? AND
++//     tenant_id = '<ctx tenant>' (the WHERE comes from the scope
++//     callback). The row's tenant_id is overwritten to empty string.
++//   - Subsequent reads filtered by tenant_id = '<ctx tenant>' return
++//     ErrNotFound; the row is orphaned.
++//
++// Symptom in production: a PUT /api/providers/{p}/keys/{kid} returns
++// 404 on the NEXT update attempt, even though the key is visibly still
++// in the DB.
++func TestUpdateProviderKey_PreservesTenantID(t *testing.T) {
++	store := setupRDBTestStoreWithTenantScope(t)
++	ctx := withTenant(context.Background(), tables.DefaultTenantID)
++
++	// Provider + key in the default tenant scope.
++	require.NoError(t, store.AddProvider(ctx, "openai", ProviderConfig{}))
++	originalKey := schemas.Key{
++		ID:     "key-uuid-1",
++		Name:   "openai-primary",
++		Value:  *schemas.NewEnvVar("sk-original"),
++		Weight: 1.0,
++		Models: []string{"gpt-4"},
++	}
++	require.NoError(t, store.CreateProviderKey(ctx, "openai", originalKey))
++
++	// Pre-flight: verify the row was created with the expected tenant_id.
++	var rowBefore tables.TableKey
++	require.NoError(t, store.DB().WithContext(context.Background()).
++		Where("key_id = ?", originalKey.ID).First(&rowBefore).Error)
++	require.Equal(t, tables.DefaultTenantID, rowBefore.TenantID,
++		"freshly-created key row must carry the ctx tenant on tenant_id")
++
++	// Update the model list — the UI-equivalent of the failing
++	// PUT /api/providers/{p}/keys/{kid} from the field report.
++	updated := originalKey
++	updated.Models = []string{"gpt-4", "gpt-4-turbo"}
++	require.NoError(t, store.UpdateProviderKey(ctx, "openai", originalKey.ID, updated),
++		"UpdateProviderKey under tenant ctx must succeed")
++
++	// Critical assertion: the row's tenant_id must NOT have been
++	// overwritten to the empty string by the UPDATE. If this fails,
++	// every subsequent tenant-scoped read of the key will 404.
++	var rowAfter tables.TableKey
++	require.NoError(t, store.DB().WithContext(context.Background()).
++		Where("key_id = ?", originalKey.ID).First(&rowAfter).Error)
++	assert.Equal(t, tables.DefaultTenantID, rowAfter.TenantID,
++		"UpdateProviderKey must not zero out the row's tenant_id; "+
++			"the GORM tenant-scope callback would then 404 every "+
++			"subsequent read under the same tenant header.")
++
++	// Belt and braces: re-fetch via the public API (which goes through
++	// the scope callback). Before the fix this 404s with ErrNotFound.
++	roundTrip, err := store.GetProviderKey(ctx, "openai", originalKey.ID)
++	require.NoError(t, err, "GetProviderKey after UpdateProviderKey must not 404")
++	require.NotNil(t, roundTrip)
++	assert.ElementsMatch(t, []string{"gpt-4", "gpt-4-turbo"}, roundTrip.Models,
++		"the model list update should round-trip")
 +}
 -- 
 2.51.0
