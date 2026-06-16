@@ -83,6 +83,7 @@ import { ChevronRight } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCookies } from "react-cookie";
+import TenantBadge from "./tenantBadge";
 import { ThemeToggle } from "./themeToggle";
 import { Badge } from "./ui/badge";
 import { PromoCardStack } from "./ui/promoCardStack";
@@ -978,14 +979,6 @@ export default function AppSidebar() {
           ]
         : []),
       {
-        title: "Evals",
-        url: "https://www.getmaxim.ai",
-        icon: FlaskConical,
-        isExternal: true,
-        description: "Evaluations",
-        hasAccess: true,
-      },
-      {
         title: "Settings",
         url: "/workspace/config",
         icon: Settings2Icon,
@@ -1318,11 +1311,12 @@ export default function AppSidebar() {
   };
 
   // Always render the light theme version for SSR to avoid hydration mismatch
-  const logoSrc =
-    mounted && resolvedTheme === "dark"
-      ? "/bifrost-logo-dark.webp"
-      : "/bifrost-logo.webp";
-  const iconSrc =
+  // 2026-06-15: swapped Bifrost wordmark for the SHAUNFROST stylized SVG
+  // so the multi-tenant dev cluster is obviously distinguishable from
+  // upstream Bifrost UI at a glance.
+  const logoSrc = "/shaunfrost-logo.svg";
+  const iconSrc = "/shaunfrost-icon.svg";
+  const _legacyIcon =
     mounted && resolvedTheme === "dark"
       ? "/bifrost-icon-dark.webp"
       : "/bifrost-icon.webp";
@@ -1353,34 +1347,15 @@ export default function AppSidebar() {
         variant: "warning" as const,
       });
     }
-    if (showNewReleaseBanner && latestRelease) {
-      cards.push({
-        id: "new-release",
-        title: `${latestRelease.name} is now available.`,
-        description: (
-          <div className="flex h-full flex-col gap-2">
-            <img
-              src={newReleaseImage}
-              alt="Bifrost"
-              className="h-[95px] rounded-md object-cover"
-            />
-            <a
-              href={`https://docs.getbifrost.ai/changelogs/${latestRelease.name}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary mt-auto pb-1 font-medium underline"
-            >
-              View release notes
-            </a>
-          </div>
-        ),
-        dismissible: true,
-      });
-    }
-    // Only show after mounted to ensure cookie is properly hydrated and avoid flash
-    if (!IS_ENTERPRISE && mounted && !isProductionSetupDismissed) {
-      cards.push(productionSetupHelpCard);
-    }
+    // Upstream's "new release" banner + "Book a demo" upsell card are
+    // intentionally suppressed on this dev fork — see SHAUNFROST
+    // header for context.  Restore by reading getbifrost.ai changelog
+    // metadata + productionSetupHelpCard if you want them back.
+    void latestRelease;
+    void newReleaseImage;
+    void showNewReleaseBanner;
+    void isProductionSetupDismissed;
+    void productionSetupHelpCard;
     return cards;
   }, [
     coreConfig?.restart_required,
@@ -1481,6 +1456,11 @@ export default function AppSidebar() {
           />
         </div>
       </SidebarHeader>
+      {/* Multi-tenant: tenant switcher between header and search.
+          Hidden in the collapsed (icon-only) sidebar state. */}
+      <div className="mx-2 pt-1 pb-2 group-data-[collapsible=icon]:hidden">
+        <TenantBadge />
+      </div>
       <div className="mx-2 pb-1 group-data-[collapsible=icon]:hidden">
         <div className="relative">
           <Search className="text-muted-foreground absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2" />

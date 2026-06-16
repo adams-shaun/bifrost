@@ -42,7 +42,7 @@ export const clearAuthStorage = () => {
 const baseQuery = fetchBaseQuery({
 	baseUrl: getApiBaseUrl(),
 	credentials: "include",
-	prepareHeaders: async (headers) => {
+	prepareHeaders: async (headers, { getState }) => {
     if (!headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
@@ -58,6 +58,19 @@ const baseQuery = fetchBaseQuery({
 		const tempToken = getActiveTempToken();
 		if (tempToken) {
 			headers.set("X-Bifrost-Temp-Token", tempToken);
+		}
+		// Multi-tenant: stamp x-f5xc-tenant from the Redux tenant slice
+		// onto every outgoing request.  The backend's GORM tenant-scope
+		// callback (framework/configstore/tenant_scope.go) reads this
+		// header from the request context and auto-filters every
+		// SELECT and auto-populates every INSERT on tenant-scoped
+		// tables.  When the slice is empty (first load before the user
+		// picks a tenant), we omit the header — the backend falls back
+		// to "default" via the column default + no implicit filter.
+		const state = getState() as { tenant?: { currentTenantID: string | null } };
+		const tid = state.tenant?.currentTenantID;
+		if (tid) {
+			headers.set("x-f5xc-tenant", tid);
 		}
 		return headers;
 	},
@@ -191,6 +204,7 @@ export const baseApi = createApi({
     "MCPSessions",
     "MCPPerUserHeaderCredentials",
     "FeatureFlags",
+    "Tenants",
   ],
   endpoints: () => ({}),
 });

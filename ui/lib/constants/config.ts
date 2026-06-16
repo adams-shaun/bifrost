@@ -88,7 +88,14 @@ export const DefaultNetworkConfig = {
 	stream_idle_timeout_in_seconds: 60,
 	max_conns_per_host: 5000,
 	enforce_http2: false,
-	allow_private_network: false,
+	// Default to true for this fork: the cluster deploys upstream LLMs
+	// behind *.svc.cluster.local (private RFC 1918), so a default-off
+	// toggle blocks every realistic provider URL with "private IP
+	// addresses are not allowed". Operators who care about SSRF on
+	// public-network bifrost deployments can flip the toggle back off
+	// per provider; cloud metadata (169.254.x.x) is always blocked
+	// regardless of this flag (see core/utils.go ValidateExternalURL).
+	allow_private_network: true,
 } satisfies NetworkConfig;
 
 export const DefaultPerformanceConfig = {
