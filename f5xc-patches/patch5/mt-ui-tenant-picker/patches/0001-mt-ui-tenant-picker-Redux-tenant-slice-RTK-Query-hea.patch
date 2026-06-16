@@ -1,0 +1,574 @@
+From 4271315dd6308a947c0c2044c0cc67e4f5b6d2d0 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 14:09:38 -0600
+Subject: [PATCH] mt-ui-tenant-picker: Redux tenant slice + RTK Query header
+ injection + sidebar picker
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Front-end half of the multi-tenant header story. The store keeps the
+selected tenant id in a Redux slice, the RTK Query baseApi stamps
+x-f5xc-tenant on every outbound request from that slice, and a sidebar
+picker exposes the switch so a user can flip tenants without page
+reloads.
+
+Redux store
+* slices/tenantSlice.ts (new) — selected tenant id + display label;
+  setCurrentTenant / clearTenant reducers. localStorage hydration with
+  try/catch fallback so a quota/disabled-storage error degrades to
+  no-tenant rather than crashing the app on boot.
+* apis/tenantsApi.ts (new) — RTK Query endpoints against
+  /api/platform/tenants for list + get + create + update + delete.
+* apis/baseApi.ts — prepareHeaders reads currentTenantID from state
+  and adds x-f5xc-tenant. Single header-injection point; no per-
+  endpoint changes needed. Adds "Tenants" tag for cache invalidation.
+* apis/index.ts + slices/index.ts + store.ts — re-export + reducer
+  wiring so the app picks up the new slice + api.
+* hooks/useCurrentTenant.ts (new) — small reader hook with a setter
+  that pushes through the slice so components don't import dispatch.
+
+Components
+* components/tenantBadge.tsx (new) — sidebar picker + inline "+ new
+  tenant" form. Reads the tenants list from RTK Query, lets the user
+  switch, shows the current identity. When only the seeded `default`
+  tenant exists, the picker still renders for visual consistency.
+* components/sidebar.tsx — mounts TenantBadge between SidebarHeader
+  and the search box; hidden in the collapsed (icon-only) state.
+  Branding swap (shaunfrost icons) intentionally NOT included — that's
+  a fork-vanity change with no multi-tenant value.
+
+Scope note: The `allow_private_network: true` default flip from
+mt-header is NOT included. The NetworkConfig type at this patch base
+doesn't carry the field, so the default doesn't exist yet — adding it
+would also require schema/Go-side changes that are out of multi-tenant
+scope. The operator can still flip allow_private_network per provider
+via the existing provider edit form when the field lands upstream.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ ui/components/sidebar.tsx              |   6 +
+ ui/components/tenantBadge.tsx          | 212 +++++++++++++++++++++++++
+ ui/lib/store/apis/baseApi.ts           |  16 +-
+ ui/lib/store/apis/index.ts             |   3 +-
+ ui/lib/store/apis/tenantsApi.ts        |  65 ++++++++
+ ui/lib/store/hooks/useCurrentTenant.ts |  21 +++
+ ui/lib/store/slices/index.ts           |   6 +
+ ui/lib/store/slices/tenantSlice.ts     |  67 ++++++++
+ ui/lib/store/store.ts                  |   6 +-
+ 9 files changed, 399 insertions(+), 3 deletions(-)
+ create mode 100644 ui/components/tenantBadge.tsx
+ create mode 100644 ui/lib/store/apis/tenantsApi.ts
+ create mode 100644 ui/lib/store/hooks/useCurrentTenant.ts
+ create mode 100644 ui/lib/store/slices/tenantSlice.ts
+
+diff --git a/ui/components/sidebar.tsx b/ui/components/sidebar.tsx
+index 5d8049c5c..399e22540 100644
+--- a/ui/components/sidebar.tsx
++++ b/ui/components/sidebar.tsx
+@@ -83,6 +83,7 @@ import { ChevronRight } from "lucide-react";
+ import { useTheme } from "next-themes";
+ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+ import { useCookies } from "react-cookie";
++import TenantBadge from "./tenantBadge";
+ import { ThemeToggle } from "./themeToggle";
+ import { Badge } from "./ui/badge";
+ import { PromoCardStack } from "./ui/promoCardStack";
+@@ -1476,6 +1477,11 @@ export default function AppSidebar() {
+           />
+         </div>
+       </SidebarHeader>
++      {/* Multi-tenant: tenant switcher between header and search.
++          Hidden in the collapsed (icon-only) sidebar state. */}
++      <div className="mx-2 pt-1 pb-2 group-data-[collapsible=icon]:hidden">
++        <TenantBadge />
++      </div>
+       <div className="mx-2 pb-1 group-data-[collapsible=icon]:hidden">
+         <div className="relative">
+           <Search className="text-muted-foreground absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2" />
+diff --git a/ui/components/tenantBadge.tsx b/ui/components/tenantBadge.tsx
+new file mode 100644
+index 000000000..b0c46c845
+--- /dev/null
++++ b/ui/components/tenantBadge.tsx
+@@ -0,0 +1,212 @@
++import { useState } from "react";
++import { Button } from "@/components/ui/button";
++import {
++	DropdownMenu,
++	DropdownMenuContent,
++	DropdownMenuItem,
++	DropdownMenuLabel,
++	DropdownMenuSeparator,
++	DropdownMenuTrigger,
++} from "@/components/ui/dropdownMenu";
++import { Input } from "@/components/ui/input";
++import { useCreateTenantMutation, useGetTenantsQuery } from "@/lib/store/apis";
++import { useCurrentTenant } from "@/lib/store/hooks/useCurrentTenant";
++import { Buildings, CaretDown, Check, Plus } from "@phosphor-icons/react";
++
++// TenantBadge — the in-workspace tenant indicator + switcher. Shows the
++// current tenant's name with a dropdown listing every tenant the caller
++// can see (today: all of them, since AdminAuthz is a stub; Phase 4 will
++// scope this to the caller's grants).
++//
++// Designed for the workspace shell's top-right corner. Stays mounted
++// across route changes so the active tenant is always visible.
++//
++// Behavior:
++//   - If no tenant is currently selected (e.g. first paint before
++//     the login flow seeded one), renders "Select tenant" with the
++//     dropdown open-by-default affordance.
++//   - If the persisted tenant id no longer exists in the list (e.g.
++//     was deleted between sessions), falls back to "Unknown tenant"
++//     and offers to switch.
++//   - Switching is purely client-side state — the next API call to a
++//     tenant-scoped endpoint will pick up the new id.
++//   - The "+ new tenant" entry expands inline (no modal) into a small
++//     id+name form that POSTs to /api/platform/tenants and auto-
++//     switches into the newly minted tenant on success.
++export default function TenantBadge() {
++	const { currentTenantID, setCurrentTenant } = useCurrentTenant();
++	const { data: tenants, isLoading } = useGetTenantsQuery();
++	const [createTenant, { isLoading: creating }] = useCreateTenantMutation();
++
++	const [isCreating, setIsCreating] = useState(false);
++	const [newID, setNewID] = useState("");
++	const [newName, setNewName] = useState("");
++	const [error, setError] = useState<string | null>(null);
++
++	const current = tenants?.find((t) => t.id === currentTenantID) ?? null;
++	const label = isLoading
++		? "Loading tenants…"
++		: current
++		? current.name
++		: currentTenantID
++		? `Unknown tenant (${currentTenantID})`
++		: "Select tenant";
++
++	const resetCreate = () => {
++		setIsCreating(false);
++		setNewID("");
++		setNewName("");
++		setError(null);
++	};
++
++	const submitCreate = async () => {
++		const id = newID.trim();
++		const name = newName.trim();
++		if (!id || !name) {
++			setError("id and name are required");
++			return;
++		}
++		try {
++			const res = await createTenant({ id, name }).unwrap();
++			setCurrentTenant(res.tenant?.id ?? id);
++			resetCreate();
++		} catch (err: unknown) {
++			// RTK Query surfaces { data: { error: { message } } } for
++			// our SendError envelope; fall back to a generic string
++			// when the shape is different (network failure, etc.).
++			const msg =
++				(err as { data?: { error?: { message?: string } } })?.data?.error?.message ??
++				(err as { error?: string })?.error ??
++				"failed to create tenant";
++			setError(String(msg));
++		}
++	};
++
++	return (
++		<DropdownMenu
++			onOpenChange={(open) => {
++				if (!open) resetCreate();
++			}}
++		>
++			<DropdownMenuTrigger asChild>
++				<Button
++					variant="outline"
++					size="sm"
++					className="h-8 gap-1.5 text-xs font-normal"
++					data-testid="tenant-badge"
++					aria-label="Active tenant"
++				>
++					<Buildings className="h-3.5 w-3.5 opacity-70" weight="regular" />
++					<span className="max-w-[14rem] truncate">{label}</span>
++					<CaretDown className="h-3 w-3 opacity-60" weight="bold" />
++				</Button>
++			</DropdownMenuTrigger>
++			<DropdownMenuContent align="end" className="min-w-56">
++				<DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
++					Switch tenant
++				</DropdownMenuLabel>
++				<DropdownMenuSeparator />
++				{(tenants ?? []).map((t) => {
++					const isCurrent = t.id === currentTenantID;
++					return (
++						<DropdownMenuItem
++							key={t.id}
++							onSelect={() => {
++								if (!isCurrent) setCurrentTenant(t.id);
++							}}
++							className="flex items-center justify-between gap-2"
++						>
++							<span className="flex flex-col">
++								<span className="text-sm">{t.name}</span>
++								<span className="text-muted-foreground text-[10px]">{t.id}</span>
++							</span>
++							{isCurrent ? <Check className="h-3.5 w-3.5" weight="bold" /> : null}
++						</DropdownMenuItem>
++					);
++				})}
++				{!isLoading && (tenants?.length ?? 0) === 0 ? (
++					<DropdownMenuItem disabled className="text-muted-foreground text-xs">
++						No tenants configured
++					</DropdownMenuItem>
++				) : null}
++
++				<DropdownMenuSeparator />
++
++				{isCreating ? (
++					// Inline create form — kept in the dropdown so the operator
++					// stays in the switching flow. `e.preventDefault()` on every
++					// key/click stops Radix from auto-closing the menu.
++					<div
++						className="flex flex-col gap-2 px-2 py-1.5"
++						onClick={(e) => e.stopPropagation()}
++						onKeyDown={(e) => {
++							if (e.key === "Enter") {
++								e.preventDefault();
++								void submitCreate();
++							} else if (e.key === "Escape") {
++								e.preventDefault();
++								resetCreate();
++							}
++						}}
++					>
++						<Input
++							autoFocus
++							value={newID}
++							onChange={(e) => setNewID(e.target.value)}
++							placeholder="tenant id (slug)"
++							className="h-7 text-xs"
++							data-testid="tenant-create-id"
++						/>
++						<Input
++							value={newName}
++							onChange={(e) => setNewName(e.target.value)}
++							placeholder="display name"
++							className="h-7 text-xs"
++							data-testid="tenant-create-name"
++						/>
++						{error ? <p className="text-destructive text-[10px]">{error}</p> : null}
++						<div className="flex gap-1.5">
++							<Button
++								size="sm"
++								className="h-7 flex-1 text-xs"
++								onClick={(e) => {
++									e.preventDefault();
++									void submitCreate();
++								}}
++								disabled={creating}
++								data-testid="tenant-create-submit"
++							>
++								{creating ? "Creating…" : "Create"}
++							</Button>
++							<Button
++								size="sm"
++								variant="ghost"
++								className="h-7 text-xs"
++								onClick={(e) => {
++									e.preventDefault();
++									resetCreate();
++								}}
++								disabled={creating}
++							>
++								Cancel
++							</Button>
++						</div>
++					</div>
++				) : (
++					<DropdownMenuItem
++						onSelect={(e) => {
++							// Keep the dropdown open so the form is visible.
++							e.preventDefault();
++							setIsCreating(true);
++						}}
++						className="flex items-center gap-2 text-sm"
++						data-testid="tenant-create-trigger"
++					>
++						<Plus className="h-3.5 w-3.5" weight="bold" />
++						<span>New tenant</span>
++					</DropdownMenuItem>
++				)}
++			</DropdownMenuContent>
++		</DropdownMenu>
++	);
++}
+diff --git a/ui/lib/store/apis/baseApi.ts b/ui/lib/store/apis/baseApi.ts
+index c040b517a..24e9381ff 100644
+--- a/ui/lib/store/apis/baseApi.ts
++++ b/ui/lib/store/apis/baseApi.ts
+@@ -42,7 +42,7 @@ export const clearAuthStorage = () => {
+ const baseQuery = fetchBaseQuery({
+ 	baseUrl: getApiBaseUrl(),
+ 	credentials: "include",
+-	prepareHeaders: async (headers) => {
++	prepareHeaders: async (headers, { getState }) => {
+     if (!headers.has("Content-Type")) {
+       headers.set("Content-Type", "application/json");
+     }
+@@ -59,6 +59,19 @@ const baseQuery = fetchBaseQuery({
+ 		if (tempToken) {
+ 			headers.set("X-Bifrost-Temp-Token", tempToken);
+ 		}
++		// Multi-tenant: stamp x-f5xc-tenant from the Redux tenant slice
++		// onto every outgoing request. The backend's GORM tenant-scope
++		// callback (framework/configstore/tenant_scope.go) reads this
++		// header from the request context and auto-filters every SELECT
++		// and auto-populates every INSERT on tenant-scoped tables. When
++		// the slice is empty (first load before the user picks a
++		// tenant), we omit the header — the backend falls back to
++		// "default" via the column default + no implicit filter.
++		const state = getState() as { tenant?: { currentTenantID: string | null } };
++		const tid = state.tenant?.currentTenantID;
++		if (tid) {
++			headers.set("x-f5xc-tenant", tid);
++		}
+ 		return headers;
+ 	},
+ });
+@@ -190,6 +203,7 @@ export const baseApi = createApi({
+     "AuthType",
+     "MCPSessions",
+     "FeatureFlags",
++    "Tenants",
+   ],
+   endpoints: () => ({}),
+ });
+diff --git a/ui/lib/store/apis/index.ts b/ui/lib/store/apis/index.ts
+index 675331b38..68457a5cf 100644
+--- a/ui/lib/store/apis/index.ts
++++ b/ui/lib/store/apis/index.ts
+@@ -13,4 +13,5 @@ export * from "./mcpSessionsApi";
+ export * from "./pluginsApi";
+ export * from "./providersApi";
+ export * from "./promptsApi";
+-export * from "./sessionApi";
+\ No newline at end of file
++export * from "./sessionApi";
++export * from "./tenantsApi";
+\ No newline at end of file
+diff --git a/ui/lib/store/apis/tenantsApi.ts b/ui/lib/store/apis/tenantsApi.ts
+new file mode 100644
+index 000000000..1058ec32f
+--- /dev/null
++++ b/ui/lib/store/apis/tenantsApi.ts
+@@ -0,0 +1,65 @@
++import { baseApi } from "./baseApi";
++
++// Tenant is the shape returned by GET /api/platform/tenants — the
++// fields the UI surfaces (id for selection, name for display, status
++// for filtering inactive).  The full TableTenant has more fields
++// (timestamps, etc.); add them here as views need them.
++export interface Tenant {
++	id: string;
++	name: string;
++	status: "active" | "suspended" | string;
++	description?: string;
++	created_at?: string;
++	updated_at?: string;
++}
++
++export interface ListTenantsResponse {
++	tenants: Tenant[];
++	count: number;
++}
++
++export interface CreateTenantRequest {
++	id: string;
++	name: string;
++	status?: "active" | "suspended";
++	description?: string;
++}
++
++export interface CreateTenantResponse {
++	message: string;
++	tenant: Tenant;
++}
++
++// tenantsApi wraps the /api/platform/tenants admin surface.  All
++// endpoints are auth-gated — the user logs in normally, lands in the
++// workspace, and the tenant badge fetches the list to drive the
++// switcher dropdown.  There's no pre-login tenant picker in the
++// header model: the request header is the source of truth and
++// defaults to "default" until the user picks otherwise.
++export const tenantsApi = baseApi.injectEndpoints({
++	endpoints: (builder) => ({
++		getTenants: builder.query<Tenant[], void>({
++			query: () => "/platform/tenants",
++			transformResponse: (response: ListTenantsResponse): Tenant[] =>
++				(response.tenants ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
++			providesTags: ["Tenants"],
++		}),
++
++		getTenant: builder.query<Tenant, string>({
++			query: (id) => `/platform/tenants/${encodeURIComponent(id)}`,
++			transformResponse: (response: { tenant: Tenant }) => response.tenant,
++			providesTags: (_result, _err, id) => [{ type: "Tenants", id }],
++		}),
++
++		createTenant: builder.mutation<CreateTenantResponse, CreateTenantRequest>({
++			query: (body) => ({
++				url: "/platform/tenants",
++				method: "POST",
++				body,
++			}),
++			invalidatesTags: ["Tenants"],
++		}),
++	}),
++});
++
++export const { useGetTenantsQuery, useGetTenantQuery, useCreateTenantMutation } = tenantsApi;
+diff --git a/ui/lib/store/hooks/useCurrentTenant.ts b/ui/lib/store/hooks/useCurrentTenant.ts
+new file mode 100644
+index 000000000..3b8245e68
+--- /dev/null
++++ b/ui/lib/store/hooks/useCurrentTenant.ts
+@@ -0,0 +1,21 @@
++import { useAppDispatch, useAppSelector } from "../hooks";
++import { setCurrentTenant, clearTenant } from "../slices/tenantSlice";
++
++// useCurrentTenant is the canonical hook every multi-tenant-aware
++// component should reach for. Returns the current tenant id (or null)
++// and setter/clearer actions that automatically persist to localStorage
++// via the slice's reducer.
++//
++// Returning `null` is a deliberate signal — "no tenant selected yet".
++// Components should NOT default to "default" silently; either render a
++// "pick a tenant" prompt or skip the query. The login page is the only
++// place that normalizes null → a real tenant id.
++export function useCurrentTenant() {
++	const dispatch = useAppDispatch();
++	const currentTenantID = useAppSelector((s) => s.tenant.currentTenantID);
++	return {
++		currentTenantID,
++		setCurrentTenant: (id: string | null) => dispatch(setCurrentTenant(id)),
++		clearTenant: () => dispatch(clearTenant()),
++	};
++}
+diff --git a/ui/lib/store/slices/index.ts b/ui/lib/store/slices/index.ts
+index bf4b75fc3..5d5de47d9 100644
+--- a/ui/lib/store/slices/index.ts
++++ b/ui/lib/store/slices/index.ts
+@@ -10,5 +10,11 @@ export { default as providerReducer } from "./providerSlice";
+ export * from "./pluginSlice";
+ export { default as pluginReducer } from "./pluginSlice";
+ 
++// Tenant slice exports — holds the selected tenant id for the
++// header-model multi-tenant story; baseApi.prepareHeaders reads from
++// it on every outgoing /api/* request.
++export * from "./tenantSlice";
++export { default as tenantReducer } from "./tenantSlice";
++
+ // Enterprise slice exports
+ export * from "@enterprise/lib/store/slices";
+\ No newline at end of file
+diff --git a/ui/lib/store/slices/tenantSlice.ts b/ui/lib/store/slices/tenantSlice.ts
+new file mode 100644
+index 000000000..99643eec7
+--- /dev/null
++++ b/ui/lib/store/slices/tenantSlice.ts
+@@ -0,0 +1,67 @@
++import { createSlice, PayloadAction } from "@reduxjs/toolkit";
++
++// LocalStorage key for the active tenant id. SSR-safe (we only read in
++// the browser; window is guarded).
++const STORAGE_KEY = "bifrost-current-tenant-id";
++
++// hydrateInitial reads the persisted tenant id at slice-init time. Wrap
++// localStorage access in try/catch so a quota / disabled-storage error
++// degrades to no-tenant rather than crashing the whole app on boot.
++function hydrateInitial(): string | null {
++	if (typeof window === "undefined") return null;
++	try {
++		const v = window.localStorage.getItem(STORAGE_KEY);
++		return v && v.trim() !== "" ? v : null;
++	} catch {
++		return null;
++	}
++}
++
++export interface TenantState {
++	// currentTenantID is null until the user picks one (or until login
++	// hydration runs). Components that need a tenant should treat null
++	// as "no tenant in scope" and short-circuit their queries.
++	currentTenantID: string | null;
++}
++
++const initialState: TenantState = {
++	currentTenantID: hydrateInitial(),
++};
++
++const tenantSlice = createSlice({
++	name: "tenant",
++	initialState,
++	reducers: {
++		// setCurrentTenant persists to localStorage as a side effect so a
++		// page reload preserves the selection. The persist failure is
++		// intentionally silent — the in-memory state already reflects the
++		// user's choice; losing it on reload is a graceful degradation.
++		setCurrentTenant(state, action: PayloadAction<string | null>) {
++			state.currentTenantID = action.payload;
++			if (typeof window !== "undefined") {
++				try {
++					if (action.payload) {
++						window.localStorage.setItem(STORAGE_KEY, action.payload);
++					} else {
++						window.localStorage.removeItem(STORAGE_KEY);
++					}
++				} catch {
++					// best-effort
++				}
++			}
++		},
++		clearTenant(state) {
++			state.currentTenantID = null;
++			if (typeof window !== "undefined") {
++				try {
++					window.localStorage.removeItem(STORAGE_KEY);
++				} catch {
++					// best-effort
++				}
++			}
++		},
++	},
++});
++
++export const { setCurrentTenant, clearTenant } = tenantSlice.actions;
++export default tenantSlice.reducer;
+diff --git a/ui/lib/store/store.ts b/ui/lib/store/store.ts
+index 07cb6f085..042c9f84e 100644
+--- a/ui/lib/store/store.ts
++++ b/ui/lib/store/store.ts
+@@ -1,6 +1,6 @@
+ import { configureStore } from "@reduxjs/toolkit";
+ import { baseApi } from "./apis/baseApi";
+-import { appReducer, pluginReducer, providerReducer } from "./slices";
++import { appReducer, pluginReducer, providerReducer, tenantReducer } from "./slices";
+ import { reducers as enterpriseReducers, type EnterpriseState } from "@enterprise/lib/store/slices";
+ // Importing enterprise APIs triggers their self-injection into baseApi
+ import "@enterprise/lib/store/apis";
+@@ -15,6 +15,10 @@ export const store = configureStore({
+ 		provider: providerReducer,
+ 		// Plugin state slice
+ 		plugin: pluginReducer,
++		// Tenant state slice — selected tenant id for the header-model
++		// multi-tenant story. baseApi.prepareHeaders reads from this
++		// slice to stamp `x-f5xc-tenant` on every outgoing request.
++		tenant: tenantReducer,
+ 		// Enterprise reducers (if available)
+ 		...enterpriseReducers,
+ 	},
+-- 
+2.51.0
+

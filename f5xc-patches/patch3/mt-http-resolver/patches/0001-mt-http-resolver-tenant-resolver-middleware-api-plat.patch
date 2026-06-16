@@ -1,0 +1,508 @@
+From 2cb5c2589888151c37f5d7a6660c4966a589cc32 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 14:01:39 -0600
+Subject: [PATCH] mt-http-resolver: tenant-resolver middleware +
+ /api/platform/tenants + VK bearer auth
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HTTP-edge half of the multi-tenant story. After this patch any request
+carrying `x-f5xc-tenant: acme` becomes tenant-aware end-to-end via the
+GORM callback (patch2) — no per-handler edits required to make the
+existing /api/governance/virtual-keys, /api/providers, /api/mcp/clients,
+etc. handlers tenant-scoped.
+
+* handlers/tenant_resolver.go (new) — TenantResolverMiddleware peeks
+  the `x-f5xc-tenant` header and stashes the value on the fasthttp
+  UserValue + any pre-attached BifrostContext. When the
+  BIFROST_DISABLE_DEFAULT_TENANT_CONFIG flag is on, any POST/PUT/PATCH/
+  DELETE targeting the `default` tenant on an /api/<entity>/... path
+  gets 403'd at ingress. /api/platform/* and /v1/* are intentionally
+  excluded — operators sitting on default must be able to create their
+  first real tenant via /api/platform/tenants, and inference policy
+  lives in the governance plugin downstream.
+
+* handlers/platform_tenants.go (new) — /api/platform/tenants CRUD for
+  cross-tenant tenant-directory management. The ONE admin surface that
+  is NOT per-tenant-scoped (the tenants table has no tenant_id column,
+  so the GORM callback is a no-op here). When disableDefaultTenant is
+  true, the seeded `default` tenant is hidden from list / get /
+  update / delete responses.
+
+* handlers/middlewares.go — auth middleware recognises the Bifrost VK
+  prefix (sk-bf-…) as a valid bearer credential format and lets the
+  request through. Governance plugin downstream remains the
+  authoritative validator (active/inactive, scope, allowed_models,
+  budget). Without this, a VK-only client (opencode, curl, an SDK)
+  could not talk to /v1 when DisableAuthOnInference is false because
+  validateSession would 401 on a non-session token.
+
+* server/server.go — wires TenantResolverMiddleware into both the
+  inference (/v1/*) and admin (/api/*) chains, instantiates
+  NewPlatformTenantsHandler with the disable-default flag, and adds an
+  envBool helper that gates BIFROST_DISABLE_DEFAULT_TENANT_CONFIG
+  without pulling a flag library.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../bifrost-http/handlers/middlewares.go      |  14 ++
+ .../bifrost-http/handlers/platform_tenants.go | 207 ++++++++++++++++++
+ .../bifrost-http/handlers/tenant_resolver.go  | 122 +++++++++++
+ transports/bifrost-http/server/server.go      |  51 ++++-
+ 4 files changed, 389 insertions(+), 5 deletions(-)
+ create mode 100644 transports/bifrost-http/handlers/platform_tenants.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_resolver.go
+
+diff --git a/transports/bifrost-http/handlers/middlewares.go b/transports/bifrost-http/handlers/middlewares.go
+index 46b4d2254..41c90eb56 100644
+--- a/transports/bifrost-http/handlers/middlewares.go
++++ b/transports/bifrost-http/handlers/middlewares.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/maximhq/bifrost/framework/encrypt"
+ 	"github.com/maximhq/bifrost/framework/temptoken"
+ 	"github.com/maximhq/bifrost/framework/tracing"
++	"github.com/maximhq/bifrost/plugins/governance"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/integrations"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ 	"github.com/valyala/fasthttp"
+@@ -970,6 +971,19 @@ func (m *AuthMiddleware) middleware(shouldSkip func(*configstore.AuthConfig, str
+ 			}
+ 			// Checking bearer auth for dashboard calls
+ 			if scheme == "Bearer" {
++				// A Bifrost virtual key (sk-bf-…) is a valid bearer
++				// credential for the inference surface — the governance
++				// plugin downstream is the authoritative validator
++				// (active / inactive, scope, allowed_models, budget).
++				// The auth middleware just needs to recognise the
++				// credential FORMAT so a VK-only client (opencode, curl,
++				// an SDK) can talk to /v1 when DisableAuthOnInference is
++				// false. Falling through to validateSession would 401
++				// here because a VK is not a session token.
++				if strings.HasPrefix(token, governance.VirtualKeyPrefix) {
++					next(ctx)
++					return
++				}
+ 				// We are checking for API keys first; it it seems like a valid Bifrost API key
+ 
+ 				// Verify the session
+diff --git a/transports/bifrost-http/handlers/platform_tenants.go b/transports/bifrost-http/handlers/platform_tenants.go
+new file mode 100644
+index 000000000..fa22898cb
+--- /dev/null
++++ b/transports/bifrost-http/handlers/platform_tenants.go
+@@ -0,0 +1,207 @@
++// Package handlers — platform_tenants.go.
++//
++// /api/platform/tenants — cross-tenant admin CRUD for managing the
++// tenant directory itself.  This is the ONE surface in the API that
++// is explicitly NOT tenant-scoped (a platform admin reading the
++// list of tenants can't filter by their own tenant; they need to
++// see them all).  The tenant-scope GORM callback skips it because
++// the `tenants` table doesn't carry a `tenant_id` column.
++//
++// Auth is platform-admin only.  In single-tenant deployments the
++// default seeded tenant is the only row; the surface still works.
++package handlers
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/bytedance/sonic"
++	"github.com/fasthttp/router"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// PlatformTenantsHandler implements /api/platform/tenants admin CRUD.
++type PlatformTenantsHandler struct {
++	configStore configstore.ConfigStore
++	// disableDefaultTenant, when true, hides the seeded `default`
++	// tenant from list / get / update / delete responses so it can't
++	// be discovered or manipulated through the admin UI. Pair with
++	// TenantResolverMiddleware's flag so writes targeting it via the
++	// `x-f5xc-tenant: default` header are rejected at ingress too.
++	disableDefaultTenant bool
++}
++
++// NewPlatformTenantsHandler constructs a handler.  configStore is required.
++// When disableDefaultTenant is true the seeded "default" tenant is hidden
++// from every response.
++func NewPlatformTenantsHandler(configStore configstore.ConfigStore, disableDefaultTenant bool) (*PlatformTenantsHandler, error) {
++	if configStore == nil {
++		return nil, fmt.Errorf("config store is required")
++	}
++	return &PlatformTenantsHandler{configStore: configStore, disableDefaultTenant: disableDefaultTenant}, nil
++}
++
++// RegisterRoutes mounts /api/platform/tenants{,/:id} under the
++// supplied middleware chain.  Callers should mount platform-admin
++// auth on top so non-admin requests get rejected.
++func (h *PlatformTenantsHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	r.GET("/api/platform/tenants", lib.ChainMiddlewares(h.list, middlewares...))
++	r.POST("/api/platform/tenants", lib.ChainMiddlewares(h.create, middlewares...))
++	r.GET("/api/platform/tenants/{id}", lib.ChainMiddlewares(h.get, middlewares...))
++	r.PUT("/api/platform/tenants/{id}", lib.ChainMiddlewares(h.update, middlewares...))
++	r.DELETE("/api/platform/tenants/{id}", lib.ChainMiddlewares(h.delete, middlewares...))
++}
++
++type tenantCreateRequest struct {
++	ID          string `json:"id"`
++	Name        string `json:"name"`
++	Status      string `json:"status,omitempty"`
++	Description string `json:"description,omitempty"`
++}
++
++type tenantUpdateRequest struct {
++	Name        *string `json:"name,omitempty"`
++	Status      *string `json:"status,omitempty"`
++	Description *string `json:"description,omitempty"`
++}
++
++func (h *PlatformTenantsHandler) list(ctx *fasthttp.RequestCtx) {
++	q := h.configStore.DB().WithContext(ctx)
++	if h.disableDefaultTenant {
++		q = q.Where("id <> ?", configstoreTables.DefaultTenantID)
++	}
++	var tenants []configstoreTables.TableTenant
++	// Plain DB list — no tenant scope (the tenants table has no
++	// tenant_id column, so the GORM callback is a no-op here).
++	if err := q.Find(&tenants).Error; err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("list tenants: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{
++		"tenants": tenants,
++		"count":   len(tenants),
++	})
++}
++
++func (h *PlatformTenantsHandler) create(ctx *fasthttp.RequestCtx) {
++	var req tenantCreateRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
++		return
++	}
++	if req.ID == "" || req.Name == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "id and name are required")
++		return
++	}
++	if h.disableDefaultTenant && req.ID == configstoreTables.DefaultTenantID {
++		SendError(ctx, fasthttp.StatusForbidden, "the 'default' tenant id is reserved and disabled on this cluster")
++		return
++	}
++	status := req.Status
++	if status == "" {
++		status = configstoreTables.TenantStatusActive
++	}
++	row := &configstoreTables.TableTenant{
++		ID:          req.ID,
++		Name:        req.Name,
++		Status:      status,
++		Description: req.Description,
++	}
++	if err := h.configStore.DB().WithContext(ctx).Create(row).Error; err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("create tenant: %v", err))
++		return
++	}
++	SendJSONWithStatus(ctx, map[string]any{
++		"message": "Tenant created",
++		"tenant":  row,
++	}, fasthttp.StatusCreated)
++}
++
++func (h *PlatformTenantsHandler) get(ctx *fasthttp.RequestCtx) {
++	id, _ := ctx.UserValue("id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "id is required")
++		return
++	}
++	if h.disableDefaultTenant && id == configstoreTables.DefaultTenantID {
++		SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
++		return
++	}
++	var row configstoreTables.TableTenant
++	if err := h.configStore.DB().WithContext(ctx).First(&row, "id = ?", id).Error; err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
++			return
++		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("get tenant: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{"tenant": row})
++}
++
++func (h *PlatformTenantsHandler) update(ctx *fasthttp.RequestCtx) {
++	id, _ := ctx.UserValue("id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "id is required")
++		return
++	}
++	if h.disableDefaultTenant && id == configstoreTables.DefaultTenantID {
++		SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
++		return
++	}
++	var req tenantUpdateRequest
++	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
++		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
++		return
++	}
++	var row configstoreTables.TableTenant
++	if err := h.configStore.DB().WithContext(ctx).First(&row, "id = ?", id).Error; err != nil {
++		SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
++		return
++	}
++	if req.Name != nil {
++		row.Name = *req.Name
++	}
++	if req.Status != nil {
++		row.Status = *req.Status
++	}
++	if req.Description != nil {
++		row.Description = *req.Description
++	}
++	if err := h.configStore.DB().WithContext(ctx).Save(&row).Error; err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("update tenant: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{
++		"message": "Tenant updated",
++		"tenant":  row,
++	})
++}
++
++func (h *PlatformTenantsHandler) delete(ctx *fasthttp.RequestCtx) {
++	id, _ := ctx.UserValue("id").(string)
++	if id == "" {
++		SendError(ctx, fasthttp.StatusBadRequest, "id is required")
++		return
++	}
++	if id == configstoreTables.DefaultTenantID {
++		// With the flag on, hide existence; without it, surface the
++		// original "cannot delete" guard so the operator gets a hint
++		// about WHY rather than a flat 404.
++		if h.disableDefaultTenant {
++			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
++		} else {
++			SendError(ctx, fasthttp.StatusBadRequest, "cannot delete the default tenant")
++		}
++		return
++	}
++	if err := h.configStore.DB().WithContext(ctx).Delete(&configstoreTables.TableTenant{}, "id = ?", id).Error; err != nil {
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("delete tenant: %v", err))
++		return
++	}
++	SendJSON(ctx, map[string]any{"message": "Tenant deleted"})
++}
+diff --git a/transports/bifrost-http/handlers/tenant_resolver.go b/transports/bifrost-http/handlers/tenant_resolver.go
+new file mode 100644
+index 000000000..24d0c1661
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_resolver.go
+@@ -0,0 +1,122 @@
++// Package handlers — tenant_resolver.go.
++//
++// The middleware that turns the `x-f5xc-tenant` request header into a
++// fasthttp UserValue (for downstream code that pokes at the request
++// context) and a BifrostContext value (for plugins that flow through
++// the inference path).  Mount it ONCE near the front of the chain;
++// every handler / configstore method / plugin hook downstream then
++// sees the same tenant id without further plumbing.
++//
++// The contract is intentionally narrow: header present → ctx populated,
++// header absent → ctx left alone (the configstore tenant-scope
++// callback treats that as "single-tenant N=1, no implicit filter").
++// We DO NOT reject requests without the header here — that's a policy
++// decision the surrounding auth middleware can make if it wants.
++package handlers
++
++import (
++	"strings"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantResolverMiddleware extracts the `x-f5xc-tenant` header and
++// stashes the value under multitenant.BifrostContextKeyTenantID
++// (twice — once as a string-keyed fasthttp UserValue so configstore
++// callbacks reading from gorm's stmt.Context.Value(...) see it, and
++// once on the BifrostContext if one is already attached so inference
++// plugins see it).
++//
++// When disableDefaultTenant is true, any request whose tenant header
++// resolves to "default" gets rejected with 403 before any handler
++// runs. Operators opt into this when their cluster is meant to be
++// multi-tenant only and the seeded `default` tenant should not be
++// usable as a write target. /v1/* inference paths still flow through
++// even with the flag on — the resolver's job is admin-surface
++// isolation; inference-time policy lives in the governance plugin.
++//
++// Skip paths (health probes) bypass the lookup entirely.
++func TenantResolverMiddleware(disableDefaultTenant bool) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			path := string(ctx.Path())
++			if shouldSkipTenantResolve(path) {
++				next(ctx)
++				return
++			}
++			raw := ctx.Request.Header.Peek(multitenant.HeaderName)
++			if len(raw) == 0 {
++				next(ctx)
++				return
++			}
++			tid := string(raw)
++			if disableDefaultTenant && tid == string(multitenant.DefaultTenantID) && isAdminPath(path) && isUnsafeMethod(string(ctx.Method())) {
++				SendError(ctx, fasthttp.StatusForbidden,
++					"the 'default' tenant is disabled on this cluster (BIFROST_DISABLE_DEFAULT_TENANT_CONFIG=true); pick a different tenant via the x-f5xc-tenant header")
++				return
++			}
++			// Both forms — fasthttp UserValue (read by configstore
++			// callback via gorm stmt.Context which wraps the
++			// fasthttp.RequestCtx) and any pre-attached
++			// BifrostContext (read by inference plugins).
++			ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tid)
++			if bfCtxIface := ctx.UserValue(lib.FastHTTPUserValueBifrostContext); bfCtxIface != nil {
++				if bfCtx, ok := bfCtxIface.(*schemas.BifrostContext); ok && bfCtx != nil {
++					bfCtx.SetValue(multitenant.BifrostContextKeyTenantID, tid)
++				}
++			}
++			next(ctx)
++		}
++	}
++}
++
++// isUnsafeMethod returns true for HTTP methods that mutate server
++// state. GET / HEAD / OPTIONS are read-only and never count as writes
++// so the UI can render bootstrap reads (e.g. GET /api/config) from
++// the default tenant even when the disable flag is on; only POST /
++// PUT / PATCH / DELETE are gated by the flag.
++func isUnsafeMethod(method string) bool {
++	switch method {
++	case fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch, fasthttp.MethodDelete:
++		return true
++	}
++	return false
++}
++
++// isAdminPath returns true for the per-tenant admin surfaces where a
++// "default tenant write" is in scope of the disable flag.
++//
++// /api/platform/* is intentionally NOT a tenant-scoped surface — the
++// tenants table itself has no tenant_id column, and the only way for
++// an operator sitting on the seeded `default` tenant to provision
++// their first real tenant is to call POST /api/platform/tenants. If
++// the resolver blocked that based on the caller's header, the flag
++// would be a chicken-and-egg trap: you can't get off `default` without
++// already being off `default`.
++//
++// Inference (/v1/*) is also excluded — governance owns admit/deny
++// there. So the flag only fires on /api/<entity>/... (providers,
++// virtual-keys, mcp/clients, config, etc.).
++func isAdminPath(path string) bool {
++	if !strings.HasPrefix(path, "/api/") {
++		return false
++	}
++	if strings.HasPrefix(path, "/api/platform/") {
++		return false
++	}
++	return true
++}
++
++// shouldSkipTenantResolve returns true for paths that have no per-
++// tenant dispatch and so don't benefit from a header read.  Keep this
++// list short — every entry is a per-request header peek we avoid.
++func shouldSkipTenantResolve(path string) bool {
++	switch path {
++	case "/health", "/api/version", "/favicon.ico":
++		return true
++	}
++	return false
++}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index fe81ea986..7dd89e85d 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -151,6 +151,18 @@ func SetLogger(l schemas.Logger) {
+ 	logger = l
+ }
+ 
++// envBool returns true when the named env var is set to a recognised
++// truthy value (true / 1 / yes / y / on, case-insensitive). Used to
++// gate header-model multi-tenancy policy toggles like
++// BIFROST_DISABLE_DEFAULT_TENANT_CONFIG without pulling a flag library.
++func envBool(name string) bool {
++	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
++	case "true", "1", "yes", "y", "on":
++		return true
++	}
++	return false
++}
++
+ // NewBifrostHTTPServer creates a new instance of BifrostHTTPServer.
+ func NewBifrostHTTPServer(version string, uiContent embed.FS) *BifrostHTTPServer {
+ 	return &BifrostHTTPServer{
+@@ -1095,11 +1107,19 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
+ 	}
+ 	s.MCPServerHandler = mcpServerHandler
+ 	asyncHandler := handlers.NewAsyncHandler(s.Client, s.Config)
+-	s.IntegrationHandler.RegisterRoutes(s.Router, middlewares...)
+-	inferenceHandler.RegisterRoutes(s.Router, middlewares...)
+-	asyncHandler.RegisterRoutes(s.Router, middlewares...)
+-	mcpInferenceHandler.RegisterRoutes(s.Router, middlewares...)
+-	s.MCPServerHandler.RegisterRoutes(s.Router, middlewares...)
++	// Header-model multi-tenancy: prepend the tenant-resolver middleware
++	// so every inference request that carries `x-f5xc-tenant` stamps the
++	// value on the request context BEFORE auth / governance / logging
++	// plugins see it. Header absent → no stamp → configstore tenant-scope
++	// callback skips the implicit WHERE (single-tenant N=1 fallback).
++	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
++	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
++	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
++	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
++	inferenceHandler.RegisterRoutes(s.Router, chained...)
++	asyncHandler.RegisterRoutes(s.Router, chained...)
++	mcpInferenceHandler.RegisterRoutes(s.Router, chained...)
++	s.MCPServerHandler.RegisterRoutes(s.Router, chained...)
+ 	return nil
+ }
+ 
+@@ -1160,6 +1180,27 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
+ 	sessionHandler := handlers.NewSessionHandler(s.Config.ConfigStore, s.WSTicketStore)
+ 	promptsHandler := handlers.NewPromptsHandler(s.Config.ConfigStore, promptsReloader)
+ 	featureFlagsHandler := handlers.NewFeatureFlagsHandler(s.Config.FeatureFlags, s.Config.ConfigStore)
++	// Header-model multi-tenancy: prepend the tenant-resolver middleware
++	// to the admin chain so every /api/* request that carries
++	// `x-f5xc-tenant` stamps the value on the request context BEFORE
++	// handler logic runs. The configstore tenant-scope callback
++	// (framework/configstore/tenant_scope.go) reads from the same
++	// context to auto-filter every SELECT and auto-populate every
++	// INSERT against tenant-scoped tables.
++	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
++	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
++	middlewares = append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
++	// Platform-admin: /api/platform/tenants for cross-tenant tenant
++	// directory management. This surface is the ONE admin endpoint that
++	// is explicitly NOT per-tenant-scoped — the tenant-scope GORM
++	// callback skips it because the tenants table doesn't carry a
++	// tenant_id column. When disableDefaultTenant is true the seeded
++	// `default` tenant is hidden from list/get/update/delete responses.
++	platformTenantsHandler, err := handlers.NewPlatformTenantsHandler(s.Config.ConfigStore, disableDefaultTenant)
++	if err != nil {
++		return fmt.Errorf("failed to initialize platform tenants handler: %v", err)
++	}
++	platformTenantsHandler.RegisterRoutes(s.Router, middlewares...)
+ 	// Going ahead with API handlers
+ 	healthHandler.RegisterRoutes(s.Router, middlewares...)
+ 	providerHandler.RegisterRoutes(s.Router, middlewares...)
+-- 
+2.51.0
+

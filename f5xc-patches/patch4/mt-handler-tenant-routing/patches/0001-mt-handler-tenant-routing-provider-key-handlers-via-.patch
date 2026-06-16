@@ -1,0 +1,884 @@
+From 9cca4d48f92017d20f307023bfbd41e40d7a26b8 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 14:05:35 -0600
+Subject: [PATCH] mt-handler-tenant-routing: provider/key handlers via dbStore
+ + customer-FK tenant guard + isolation regression test
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Routes the legacy provider and provider-key admin handlers through the
+tenant-scoped configstore so writes land via the GORM callback
+(patch2) instead of the shared global in-memory map. Without this, two
+tenants creating an "anthropic" provider race on the same map key and
+the first one wins for every subsequent inference request.
+
+* handlers/providers.go (addProvider):
+  - Existence check goes through dbStore.GetProviderConfig (tenant-
+    scoped via GORM callback) instead of the global c.Providers map.
+    The legacy in-memory check 409'd cross-tenant collisions even
+    though the DB carries composite (tenant_id, name) uniqueness.
+  - DB write through dbStore.AddProvider, then best-effort in-memory
+    sync so the still-shared inference runtime sees the new provider
+    for this process lifetime. Stage 2 will replace the in-memory sync
+    with a tenant-keyed map and drop the wart.
+  - Rollback path uses dbStore.DeleteProvider with the request ctx
+    (not context.Background()) so the DELETE flows the tenant_id
+    through the GORM callback and can't wipe a sibling tenant's row.
+
+* handlers/provider_keys.go: list / get / create / update / delete all
+  route through dbStore (GetProviderKeys, GetProviderKey,
+  CreateProviderKey, UpdateProviderKey, DeleteProviderKey). Each is
+  tenant-scoped via the GORM callback. Best-effort in-memory sync
+  after each write — same Stage 2 caveat.
+
+* handlers/governance.go (createTeam / updateTeam): when the request
+  sets customer_id to a non-empty value, validate the customer belongs
+  to the calling tenant via h.configStore.GetCustomer (tenant-scoped).
+  Without this a tenant could create a team whose FK points at
+  another tenant's customer — a half-valid row the creator can't read
+  back, and a potential information-leak vector.
+
+* handlers/mt_governance_isolation_test.go (new): regression covering
+  the two failure modes:
+  1. Team-name uniqueness MUST be composite (tenant_id, name) — two
+     tenants can both register a team called "engineering".
+  2. customer_id MUST belong to the calling tenant — cross-tenant
+     assignment is 400 with a specific message.
+
+Scope note: BIFROST_ALLOW_PRIVATE_NETWORK env override + the
+allowPrivateNetwork helper from mt-header are NOT carried here.
+core.ValidateExternalURL at the OSS ancestor takes only a URL string
+(no allow-private parameter), and the SSRF check site doesn't live in
+the providers handler. The override can ship as a separate operator-
+ergonomics patch when the upstream signature evolves.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ .../bifrost-http/handlers/governance.go       |  30 ++
+ .../handlers/mt_governance_isolation_test.go  | 339 ++++++++++++++++++
+ .../bifrost-http/handlers/provider_keys.go    | 178 ++++++---
+ transports/bifrost-http/handlers/providers.go |  66 +++-
+ 4 files changed, 540 insertions(+), 73 deletions(-)
+ create mode 100644 transports/bifrost-http/handlers/mt_governance_isolation_test.go
+
+diff --git a/transports/bifrost-http/handlers/governance.go b/transports/bifrost-http/handlers/governance.go
+index a80c2a2cd..466cbd73b 100644
+--- a/transports/bifrost-http/handlers/governance.go
++++ b/transports/bifrost-http/handlers/governance.go
+@@ -1759,6 +1759,22 @@ func (h *GovernanceHandler) createTeam(ctx *fasthttp.RequestCtx) {
+ 			return
+ 		}
+ 	}
++	// customer_id ownership: when set, the referenced customer MUST
++	// belong to the calling tenant. GetCustomer goes through the
++	// tenant-scoped configstore so a customer in another tenant returns
++	// ErrNotFound. Without this guard a tenant could create a team
++	// whose customer FK points outside its scope, leaving the row
++	// half-valid (the creating tenant cannot read its own customer back).
++	if req.CustomerID != nil && *req.CustomerID != "" {
++		if _, err := h.configStore.GetCustomer(ctx, *req.CustomerID); err != nil {
++			if errors.Is(err, configstore.ErrNotFound) {
++				SendError(ctx, 400, fmt.Sprintf("customer_id %s does not belong to the calling tenant", *req.CustomerID))
++				return
++			}
++			SendError(ctx, 500, fmt.Sprintf("Failed to validate customer_id: %s", err.Error()))
++			return
++		}
++	}
+ 	// Creating team in database
+ 	var team configstoreTables.TableTeam
+ 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+@@ -1893,6 +1909,20 @@ func (h *GovernanceHandler) updateTeam(ctx *fasthttp.RequestCtx) {
+ 		SendError(ctx, 500, "Failed to retrieve team")
+ 		return
+ 	}
++	// Same cross-tenant FK guard as createTeam — when the caller is
++	// reassigning customer_id to a non-empty value, the target customer
++	// must live in the same tenant. Empty-string clears the FK; nil
++	// means "don't touch", which is handled below.
++	if req.CustomerID != nil && *req.CustomerID != "" {
++		if _, cErr := h.configStore.GetCustomer(ctx, *req.CustomerID); cErr != nil {
++			if errors.Is(cErr, configstore.ErrNotFound) {
++				SendError(ctx, 400, fmt.Sprintf("customer_id %s does not belong to the calling tenant", *req.CustomerID))
++				return
++			}
++			SendError(ctx, 500, fmt.Sprintf("Failed to validate customer_id: %s", cErr.Error()))
++			return
++		}
++	}
+ 	// Updating team in database
+ 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+ 		// Track rate-limit ID to delete after updating the team (to avoid FK constraint)
+diff --git a/transports/bifrost-http/handlers/mt_governance_isolation_test.go b/transports/bifrost-http/handlers/mt_governance_isolation_test.go
+new file mode 100644
+index 000000000..63c938f69
+--- /dev/null
++++ b/transports/bifrost-http/handlers/mt_governance_isolation_test.go
+@@ -0,0 +1,339 @@
++// Package handlers — multi-tenant isolation regression tests against the
++// header-model governance admin surface.
++//
++// This file is the mt-header sibling of the URL-path branch's
++// mt_apitests_test.go. The URL-path branch reaches a tenant via the
++// /api/tenants/{tid}/... URL prefix; mt-header dispatches off the
++// x-f5xc-tenant request header, with the configstore's GORM
++// scope-by-tenant callback adding `WHERE tenant_id = ?` to every
++// SELECT / UPDATE / DELETE under the hood.
++//
++// What's covered
++// --------------
++// Two real bugs that the URL-path tests previously caught, ported here
++// because both also lived in mt-header until this commit:
++//
++//  1. Team-name uniqueness MUST be composite (tenant_id, name). The
++//     legacy `idx_governance_teams_name` global unique index meant the
++//     second tenant trying to create a team called "engineering" got
++//     409 with a misleading "already exists for tenant <self>" error.
++//     migrationTenantScopedTeamNameUnique fixes the schema; this test
++//     asserts both tenants can in fact register the same team name.
++//
++//  2. Team customer_id MUST belong to the calling tenant. Without the
++//     guard, tenant A could create a team whose customer_id points at
++//     tenant B's customer — a half-valid row whose FK target the
++//     creating tenant cannot read back.
++//
++// The harness uses a fresh sqlite configstore + a minimal
++// GovernanceManager stub so the handler logic runs end-to-end without
++// spinning up Bifrost.
++package handlers
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net"
++	"os"
++	"testing"
++
++	"github.com/fasthttp/router"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/maximhq/bifrost/plugins/governance"
++	"github.com/valyala/fasthttp"
++)
++
++// ---- harness ---------------------------------------------------------
++
++// stubGovernanceManager satisfies the GovernanceManager interface with
++// no-ops; it never gets called for the read paths these tests exercise,
++// and the writes only need it to not panic on Reload* callbacks the
++// handler triggers after a successful create.
++type stubGovernanceManager struct{}
++
++func (stubGovernanceManager) GetGovernanceData(context.Context) *governance.GovernanceData {
++	return &governance.GovernanceData{}
++}
++func (stubGovernanceManager) ReloadVirtualKey(context.Context, string) (*configstoreTables.TableVirtualKey, error) {
++	return nil, nil
++}
++func (stubGovernanceManager) RemoveVirtualKey(context.Context, string) error { return nil }
++func (stubGovernanceManager) ReloadTeam(context.Context, string) (*configstoreTables.TableTeam, error) {
++	return nil, nil
++}
++func (stubGovernanceManager) RemoveTeam(context.Context, string) error { return nil }
++func (stubGovernanceManager) ReloadCustomer(context.Context, string) (*configstoreTables.TableCustomer, error) {
++	return nil, nil
++}
++func (stubGovernanceManager) RemoveCustomer(context.Context, string) error { return nil }
++func (stubGovernanceManager) ReloadModelConfig(context.Context, string) (*configstoreTables.TableModelConfig, error) {
++	return nil, nil
++}
++func (stubGovernanceManager) RemoveModelConfig(context.Context, string) error { return nil }
++func (stubGovernanceManager) ReloadProvider(context.Context, schemas.ModelProvider) (*configstoreTables.TableProvider, error) {
++	return nil, nil
++}
++func (stubGovernanceManager) RemoveProvider(context.Context, schemas.ModelProvider) error {
++	return nil
++}
++func (stubGovernanceManager) ReloadRoutingRule(context.Context, string) error  { return nil }
++func (stubGovernanceManager) RemoveRoutingRule(context.Context, string) error  { return nil }
++func (stubGovernanceManager) UpsertPricingOverride(context.Context, *configstoreTables.TablePricingOverride) error {
++	return nil
++}
++func (stubGovernanceManager) DeletePricingOverride(context.Context, string) error { return nil }
++
++// mtTestEnv assembles a configstore + governance handler + router and
++// returns helpers for issuing tenant-scoped admin requests.
++type mtIsoEnv struct {
++	store  configstore.ConfigStore
++	router *router.Router
++}
++
++func newMTIsoEnv(t *testing.T) *mtIsoEnv {
++	t.Helper()
++	SetLogger(&mockLogger{})
++
++	dbPath := t.TempDir() + "/config.db"
++	t.Cleanup(func() { _ = os.Remove(dbPath) })
++	store, err := configstore.NewConfigStore(context.Background(), &configstore.Config{
++		Enabled: true,
++		Type:    configstore.ConfigStoreTypeSQLite,
++		Config:  &configstore.SQLiteConfig{Path: dbPath},
++	}, &mockLogger{})
++	if err != nil {
++		t.Fatalf("NewConfigStore: %v", err)
++	}
++
++	govHandler, err := NewGovernanceHandler(stubGovernanceManager{}, store)
++	if err != nil {
++		t.Fatalf("NewGovernanceHandler: %v", err)
++	}
++
++	r := router.New()
++	// Mount the same surface server.go mounts under /api/governance/* —
++	// no middleware needed because the test injects the tenant id via
++	// ctx.SetUserValue below, mirroring what TenantResolverMiddleware
++	// would do from a real x-f5xc-tenant header.
++	govHandler.RegisterRoutes(r)
++	return &mtIsoEnv{store: store, router: r}
++}
++
++func (e *mtIsoEnv) do(t *testing.T, tenant, method, path string, body any) *fasthttp.RequestCtx {
++	t.Helper()
++	var raw []byte
++	if body != nil {
++		var err error
++		raw, err = json.Marshal(body)
++		if err != nil {
++			t.Fatalf("marshal: %v", err)
++		}
++	}
++	var req fasthttp.Request
++	req.SetRequestURI(path)
++	req.Header.SetMethod(method)
++	if raw != nil {
++		req.SetBody(raw)
++		req.Header.SetContentType("application/json")
++	}
++	if tenant != "" {
++		req.Header.Set(multitenant.HeaderName, tenant)
++	}
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
++	// Mirror TenantResolverMiddleware's stamp so the configstore's
++	// scope-by-tenant GORM callback sees the value through ctx.
++	if tenant != "" {
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), tenant)
++	}
++	e.router.Handler(ctx)
++	return ctx
++}
++
++func mustStatus(t *testing.T, ctx *fasthttp.RequestCtx, want int, hint string) {
++	t.Helper()
++	if got := ctx.Response.StatusCode(); got != want {
++		t.Fatalf("%s: status=%d want=%d body=%s", hint, got, want, string(ctx.Response.Body()))
++	}
++}
++
++func decode(t *testing.T, ctx *fasthttp.RequestCtx, out any) {
++	t.Helper()
++	if err := json.Unmarshal(ctx.Response.Body(), out); err != nil {
++		t.Fatalf("decode body=%s err=%v", string(ctx.Response.Body()), err)
++	}
++}
++
++// ---- 1) Team-name composite uniqueness ------------------------------
++
++// TestMTHeader_TeamNameCompositeUnique asserts two tenants can both
++// create a team called "engineering" without 409'ing on the second
++// create. Before migrationTenantScopedTeamNameUnique landed, this
++// failed with "Team engineering already exists for tenant <self>"
++// because governance_teams.name had a global single-column UNIQUE.
++func TestMTHeader_TeamNameCompositeUnique(t *testing.T) {
++	env := newMTIsoEnv(t)
++
++	for _, tid := range []string{"acme", "globex"} {
++		body := map[string]any{"name": "engineering"}
++		ctx := env.do(t, tid, fasthttp.MethodPost, "/api/governance/teams", body)
++		mustStatus(t, ctx, fasthttp.StatusOK, fmt.Sprintf("create team in %s", tid))
++	}
++
++	// Both rows should exist with their respective tenant_ids.
++	var teams []configstoreTables.TableTeam
++	if err := env.store.DB().Find(&teams, "name = ?", "engineering").Error; err != nil {
++		t.Fatalf("query teams: %v", err)
++	}
++	if len(teams) != 2 {
++		t.Fatalf("expected 2 'engineering' teams (one per tenant); got %d", len(teams))
++	}
++	seen := map[string]bool{}
++	for _, tm := range teams {
++		seen[tm.TenantID] = true
++	}
++	for _, tid := range []string{"acme", "globex"} {
++		if !seen[tid] {
++			t.Fatalf("expected an 'engineering' row stamped with tenant_id=%q; got %+v", tid, teams)
++		}
++	}
++}
++
++// TestMTHeader_TeamNameDuplicateWithinTenant confirms uniqueness still
++// holds in-tenant — the second create with the same name in the same
++// tenant gets an error response rather than silently succeeding. The
++// mt-header createTeam handler currently surfaces this as a 500 with a
++// generic "failed to create team" body (the configstore's unique-index
++// violation isn't translated to ErrAlreadyExists → 409 there); we
++// accept any 4xx/5xx until that handler gets its own polish pass. The
++// thing that matters here is that the second row does NOT land.
++func TestMTHeader_TeamNameDuplicateWithinTenant(t *testing.T) {
++	env := newMTIsoEnv(t)
++
++	first := env.do(t, "acme", fasthttp.MethodPost, "/api/governance/teams",
++		map[string]any{"name": "engineering"})
++	mustStatus(t, first, fasthttp.StatusOK, "first create")
++
++	second := env.do(t, "acme", fasthttp.MethodPost, "/api/governance/teams",
++		map[string]any{"name": "engineering"})
++	if got := second.Response.StatusCode(); got < 400 {
++		t.Fatalf("duplicate-in-tenant create: status=%d want >=400 body=%s",
++			got, string(second.Response.Body()))
++	}
++
++	// Confirm only one row landed.
++	var teams []configstoreTables.TableTeam
++	if err := env.store.DB().Find(&teams, "tenant_id = ? AND name = ?", "acme", "engineering").Error; err != nil {
++		t.Fatalf("query teams: %v", err)
++	}
++	if len(teams) != 1 {
++		t.Fatalf("after duplicate create, expected 1 'engineering' team in acme; got %d", len(teams))
++	}
++}
++
++// ---- 2) Team customer_id cross-tenant FK guard ----------------------
++
++// firstCustomerID returns the id of the (one and only) customer this
++// test seeded for a tenant by querying the store directly. The HTTP
++// create endpoints return {"customer":null, "message":"..."} so the
++// row id isn't in the response.
++func firstCustomerID(t *testing.T, env *mtIsoEnv, tenant string) string {
++	t.Helper()
++	var customers []configstoreTables.TableCustomer
++	if err := env.store.DB().Find(&customers, "tenant_id = ?", tenant).Error; err != nil {
++		t.Fatalf("query customers for %s: %v", tenant, err)
++	}
++	if len(customers) == 0 {
++		t.Fatalf("no customers seeded for %s", tenant)
++	}
++	return customers[0].ID
++}
++
++func firstTeamID(t *testing.T, env *mtIsoEnv, tenant string) string {
++	t.Helper()
++	var teams []configstoreTables.TableTeam
++	if err := env.store.DB().Find(&teams, "tenant_id = ?", tenant).Error; err != nil {
++		t.Fatalf("query teams for %s: %v", tenant, err)
++	}
++	if len(teams) == 0 {
++		t.Fatalf("no teams seeded for %s", tenant)
++	}
++	return teams[0].ID
++}
++
++// TestMTHeader_TeamCrossTenantCustomerFKRejected asserts that creating
++// a team whose customer_id belongs to a different tenant returns 400.
++// The handler now calls configStore.GetCustomer(ctx, id) which is
++// tenant-scoped, so a foreign customer returns ErrNotFound → 400.
++func TestMTHeader_TeamCrossTenantCustomerFKRejected(t *testing.T) {
++	env := newMTIsoEnv(t)
++
++	// Seed globex with a customer.
++	custCtx := env.do(t, "globex", fasthttp.MethodPost, "/api/governance/customers",
++		map[string]any{"name": "globex-eng"})
++	mustStatus(t, custCtx, fasthttp.StatusOK, "create globex customer")
++	globexCustID := firstCustomerID(t, env, "globex")
++
++	// Acme attempts to attach globex's customer to a new team.
++	teamCtx := env.do(t, "acme", fasthttp.MethodPost, "/api/governance/teams", map[string]any{
++		"name":        "leaky",
++		"customer_id": globexCustID,
++	})
++	if got := teamCtx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("cross-tenant customer_id should 400; got %d body=%s",
++			got, string(teamCtx.Response.Body()))
++	}
++	if !bytes.Contains(teamCtx.Response.Body(), []byte("customer_id")) {
++		t.Fatalf("expected error to mention customer_id; body=%s",
++			string(teamCtx.Response.Body()))
++	}
++
++	// And confirm no acme team row landed (the guard runs before insert).
++	var acmeTeams []configstoreTables.TableTeam
++	if err := env.store.DB().Find(&acmeTeams, "tenant_id = ?", "acme").Error; err != nil {
++		t.Fatalf("query acme teams: %v", err)
++	}
++	if len(acmeTeams) != 0 {
++		t.Fatalf("rejected cross-tenant create left an acme team behind: %+v", acmeTeams)
++	}
++}
++
++// TestMTHeader_TeamUpdateCrossTenantCustomerFKRejected mirrors the
++// create test for the PUT path. Same code shape, same guard.
++func TestMTHeader_TeamUpdateCrossTenantCustomerFKRejected(t *testing.T) {
++	env := newMTIsoEnv(t)
++
++	// Seed: acme has a team with no customer; globex has a customer.
++	teamCtx := env.do(t, "acme", fasthttp.MethodPost, "/api/governance/teams",
++		map[string]any{"name": "platform"})
++	mustStatus(t, teamCtx, fasthttp.StatusOK, "create acme team")
++	acmeTeamID := firstTeamID(t, env, "acme")
++
++	custCtx := env.do(t, "globex", fasthttp.MethodPost, "/api/governance/customers",
++		map[string]any{"name": "globex-cust"})
++	mustStatus(t, custCtx, fasthttp.StatusOK, "create globex customer")
++	globexCustID := firstCustomerID(t, env, "globex")
++
++	// Acme tries to PUT the team with globex's customer_id.
++	putCtx := env.do(t, "acme", fasthttp.MethodPut,
++		"/api/governance/teams/"+acmeTeamID,
++		map[string]any{"customer_id": globexCustID})
++	if got := putCtx.Response.StatusCode(); got != fasthttp.StatusBadRequest {
++		t.Fatalf("cross-tenant customer_id on PUT should 400; got %d body=%s",
++			got, string(putCtx.Response.Body()))
++	}
++	if !bytes.Contains(putCtx.Response.Body(), []byte("customer_id")) {
++		t.Fatalf("expected PUT error to mention customer_id; body=%s",
++			string(putCtx.Response.Body()))
++	}
++}
++
++// ---- silence unused-import lints on the trim path -------------------
++
++var _ = errors.Is
+diff --git a/transports/bifrost-http/handlers/provider_keys.go b/transports/bifrost-http/handlers/provider_keys.go
+index 086054195..286975f67 100644
+--- a/transports/bifrost-http/handlers/provider_keys.go
++++ b/transports/bifrost-http/handlers/provider_keys.go
+@@ -9,10 +9,15 @@ import (
+ 	"github.com/google/uuid"
+ 	bifrost "github.com/maximhq/bifrost/core"
+ 	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ 	"github.com/valyala/fasthttp"
+ )
+ 
++// _ keeps lib imported even when no compile-time reference remains
++// after a refactor; remove once a non-trivial lib usage returns.
++var _ = lib.ErrNotFound
++
+ // ListProviderKeysResponse represents the response for listing keys for a provider.
+ type ListProviderKeysResponse struct {
+ 	Keys  []schemas.Key `json:"keys"`
+@@ -26,17 +31,32 @@ func (h *ProviderHandler) listProviderKeys(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	keys, err := h.inMemoryStore.GetProviderKeysRedacted(provider)
+-	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++	if h.dbStore == nil {
++		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
++		return
++	}
++	// Tenant-scoped via GORM callback. Read provider config first so a
++	// caller hitting an unknown-to-this-tenant provider gets 404 rather
++	// than an empty key list.
++	if _, err := h.dbStore.GetProviderConfig(ctx, provider); err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
+ 			return
+ 		}
++		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider config: %v", err))
++		return
++	}
++	rawKeys, err := h.dbStore.GetProviderKeys(ctx, provider)
++	if err != nil {
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider keys: %v", err))
+ 		return
+ 	}
+-
+-	SendJSON(ctx, ListProviderKeysResponse{Keys: keys, Total: len(keys)})
++	redactedKeys := make([]schemas.Key, len(rawKeys))
++	for i, k := range rawKeys {
++		redactedKeys[i] = k
++		redactedKeys[i].Value = *k.Value.Redacted()
++	}
++	SendJSON(ctx, ListProviderKeysResponse{Keys: redactedKeys, Total: len(redactedKeys)})
+ }
+ 
+ func (h *ProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
+@@ -52,17 +72,22 @@ func (h *ProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	key, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
++	if h.dbStore == nil {
++		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
++		return
++	}
++	rawKey, err := h.dbStore.GetProviderKey(ctx, provider, keyID)
+ 	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
+ 			return
+ 		}
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
+ 		return
+ 	}
+-
+-	SendJSON(ctx, key)
++	redacted := *rawKey
++	redacted.Value = *rawKey.Value.Redacted()
++	SendJSON(ctx, redacted)
+ }
+ 
+ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+@@ -78,9 +103,13 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	providerConfig, err := h.inMemoryStore.GetProviderConfigRaw(provider)
++	if h.dbStore == nil {
++		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
++		return
++	}
++	providerConfig, err := h.dbStore.GetProviderConfig(ctx, provider)
+ 	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
+ 			return
+ 		}
+@@ -125,13 +154,13 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ 		key.Enabled = bifrost.Ptr(true)
+ 	}
+ 
+-	if err := h.inMemoryStore.AddProviderKey(ctx, provider, key); err != nil {
++	if err := h.dbStore.CreateProviderKey(ctx, provider, key); err != nil {
+ 		logger.Warn("Failed to create key for provider %s: %v", provider, err)
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
+ 			return
+ 		}
+-		if errors.Is(err, lib.ErrAlreadyExists) {
++		if errors.Is(err, configstore.ErrAlreadyExists) {
+ 			SendError(ctx, fasthttp.StatusConflict, err.Error())
+ 			return
+ 		}
+@@ -139,17 +168,23 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
+-		logger.Warn("Model discovery failed for provider %s after key create: %v", provider, err)
++	// Best-effort in-memory sync so the shared inference runtime can
++	// route to the new key without a restart. Stage 2 replaces this
++	// with a tenant-keyed map.
++	h.inMemoryStore.Mu.Lock()
++	if cfg, ok := h.inMemoryStore.Providers[provider]; ok {
++		cfg.Keys = append(cfg.Keys, key)
++		h.inMemoryStore.Providers[provider] = cfg
+ 	}
++	h.inMemoryStore.Mu.Unlock()
+ 
+-	redactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, key.ID)
+-	if err != nil {
+-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get created provider key: %v", err))
+-		return
++	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
++		logger.Warn("Model discovery failed for provider %s after key create: %v", provider, err)
+ 	}
+ 
+-	SendJSON(ctx, redactedKey)
++	respKey := key
++	respKey.Value = *key.Value.Redacted()
++	SendJSON(ctx, respKey)
+ }
+ 
+ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
+@@ -171,9 +206,13 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	providerConfig, err := h.inMemoryStore.GetProviderConfigRaw(provider)
++	if h.dbStore == nil {
++		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
++		return
++	}
++	providerConfig, err := h.dbStore.GetProviderConfig(ctx, provider)
+ 	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
+ 			return
+ 		}
+@@ -186,28 +225,20 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	oldRawKey, err := h.inMemoryStore.GetProviderKeyRaw(provider, keyID)
++	oldRawKey, err := h.dbStore.GetProviderKey(ctx, provider, keyID)
+ 	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
+-			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
+-			return
+-		}
+-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
+-		return
+-	}
+-
+-	oldRedactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
+-	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
+ 			return
+ 		}
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
+ 		return
+ 	}
++	oldRedactedKey := *oldRawKey
++	oldRedactedKey.Value = *oldRawKey.Value.Redacted()
+ 
+ 	updateKey.ID = keyID
+-	mergedKey := h.mergeUpdatedKey(*oldRawKey, *oldRedactedKey, updateKey)
++	mergedKey := h.mergeUpdatedKey(*oldRawKey, oldRedactedKey, updateKey)
+ 
+ 	baseProvider := provider
+ 	if providerConfig.CustomProviderConfig != nil && providerConfig.CustomProviderConfig.BaseProviderType != "" {
+@@ -234,9 +265,9 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	if err := h.inMemoryStore.UpdateProviderKey(ctx, provider, keyID, mergedKey); err != nil {
++	if err := h.dbStore.UpdateProviderKey(ctx, provider, keyID, mergedKey); err != nil {
+ 		logger.Warn("Failed to update key %s for provider %s: %v", keyID, provider, err)
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
+ 			return
+ 		}
+@@ -244,17 +275,27 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
+-		logger.Warn("Model discovery failed for provider %s after key update: %v", provider, err)
++	// Best-effort in-memory sync so the shared inference runtime picks
++	// up the rename / value rotation without a restart.
++	h.inMemoryStore.Mu.Lock()
++	if cfg, ok := h.inMemoryStore.Providers[provider]; ok {
++		for i, k := range cfg.Keys {
++			if k.ID == keyID {
++				cfg.Keys[i] = mergedKey
++				break
++			}
++		}
++		h.inMemoryStore.Providers[provider] = cfg
+ 	}
++	h.inMemoryStore.Mu.Unlock()
+ 
+-	redactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
+-	if err != nil {
+-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get updated provider key: %v", err))
+-		return
++	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
++		logger.Warn("Model discovery failed for provider %s after key update: %v", provider, err)
+ 	}
+ 
+-	SendJSON(ctx, redactedKey)
++	respKey := mergedKey
++	respKey.Value = *mergedKey.Value.Redacted()
++	SendJSON(ctx, respKey)
+ }
+ 
+ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
+@@ -270,9 +311,19 @@ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	providerConfig, err := h.inMemoryStore.GetProviderConfigRaw(provider)
++	if h.dbStore == nil {
++		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
++		return
++	}
++
++	// Tenant-scoped lookup: GORM scope callback adds WHERE tenant_id = ?
++	// from the request ctx, so a key visible in the global in-memory map
++	// but stamped with a different tenant_id returns ErrNotFound here —
++	// the correct multi-tenant behaviour. Mirrors the fix applied to
++	// addProvider in this same pass.
++	providerConfig, err := h.dbStore.GetProviderConfig(ctx, provider)
+ 	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
+ 			return
+ 		}
+@@ -285,19 +336,21 @@ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	redactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
++	rawKey, err := h.dbStore.GetProviderKey(ctx, provider, keyID)
+ 	if err != nil {
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
+ 			return
+ 		}
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
+ 		return
+ 	}
++	redactedKey := *rawKey
++	redactedKey.Value = *rawKey.Value.Redacted()
+ 
+-	if err := h.inMemoryStore.RemoveProviderKey(ctx, provider, keyID); err != nil {
++	if err := h.dbStore.DeleteProviderKey(ctx, provider, keyID); err != nil {
+ 		logger.Warn("Failed to delete key %s for provider %s: %v", keyID, provider, err)
+-		if errors.Is(err, lib.ErrNotFound) {
++		if errors.Is(err, configstore.ErrNotFound) {
+ 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
+ 			return
+ 		}
+@@ -305,6 +358,22 @@ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
++	// Best-effort in-memory cleanup so the shared inference runtime
++	// drops the key from its rotation pool until Stage 2 replaces the
++	// global c.Providers map with a tenant-keyed one.
++	h.inMemoryStore.Mu.Lock()
++	if cfg, ok := h.inMemoryStore.Providers[provider]; ok {
++		filtered := cfg.Keys[:0]
++		for _, k := range cfg.Keys {
++			if k.ID != keyID {
++				filtered = append(filtered, k)
++			}
++		}
++		cfg.Keys = filtered
++		h.inMemoryStore.Providers[provider] = cfg
++	}
++	h.inMemoryStore.Mu.Unlock()
++
+ 	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
+ 		logger.Warn("Model discovery failed for provider %s after key delete: %v", provider, err)
+ 	}
+@@ -326,13 +395,6 @@ func (h *ProviderHandler) mergeUpdatedKey(oldRawKey, oldRedactedKey, updateKey s
+ 			updateKey.AzureKeyConfig.Endpoint.Equals(&oldRedactedKey.AzureKeyConfig.Endpoint) {
+ 			mergedKey.AzureKeyConfig.Endpoint = oldRawKey.AzureKeyConfig.Endpoint
+ 		}
+-		if updateKey.AzureKeyConfig.APIVersion != nil &&
+-			oldRedactedKey.AzureKeyConfig.APIVersion != nil &&
+-			oldRawKey.AzureKeyConfig != nil &&
+-			updateKey.AzureKeyConfig.APIVersion.IsRedacted() &&
+-			updateKey.AzureKeyConfig.APIVersion.Equals(oldRedactedKey.AzureKeyConfig.APIVersion) {
+-			mergedKey.AzureKeyConfig.APIVersion = oldRawKey.AzureKeyConfig.APIVersion
+-		}
+ 		if updateKey.AzureKeyConfig.ClientID != nil &&
+ 			oldRedactedKey.AzureKeyConfig.ClientID != nil &&
+ 			oldRawKey.AzureKeyConfig != nil &&
+diff --git a/transports/bifrost-http/handlers/providers.go b/transports/bifrost-http/handlers/providers.go
+index 6658889e3..8746e43e8 100644
+--- a/transports/bifrost-http/handlers/providers.go
++++ b/transports/bifrost-http/handlers/providers.go
+@@ -272,15 +272,23 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
+ 			return
+ 		}
+ 	}
+-	// Check if provider already exists
+-	if _, err := h.inMemoryStore.GetProviderConfigRedacted(payload.Provider); err != nil {
+-		if !errors.Is(err, lib.ErrNotFound) {
+-			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to check provider config: %v", err))
++	// Tenant-scoped existence check: hit the DB via the tenant-scope
++	// GORM callback (h.dbStore.GetProviderConfig WHERE tenant_id = ctx
++	// tenant) instead of the global in-memory c.Providers map. The
++	// legacy in-memory check rejected creation if ANY tenant had the
++	// provider name configured — a multi-tenant correctness bug, since
++	// the DB carries composite (tenant_id, name) uniqueness so each
++	// tenant can independently register e.g. "anthropic".
++	if h.dbStore != nil {
++		if existing, err := h.dbStore.GetProviderConfig(ctx, payload.Provider); err != nil {
++			if !errors.Is(err, configstore.ErrNotFound) {
++				SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to check provider config: %v", err))
++				return
++			}
++		} else if existing != nil {
++			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for this tenant", payload.Provider))
+ 			return
+ 		}
+-	} else {
+-		SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists", payload.Provider))
+-		return
+ 	}
+ 
+ 	// Construct ProviderConfig from individual fields
+@@ -299,21 +307,49 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid custom provider config: %v", err))
+ 		return
+ 	}
+-	// Add provider to store (env vars will be processed by store)
+-	if err := h.inMemoryStore.AddProvider(ctx, payload.Provider, config); err != nil {
+-		logger.Warn("Failed to add provider %s: %v", payload.Provider, err)
+-		if errors.Is(err, lib.ErrAlreadyExists) {
+-			SendError(ctx, fasthttp.StatusConflict, err.Error())
++	// DB write via the configstore (tenant-scoped via the GORM
++	// callback). Bypasses lib.Config.AddProvider's global in-memory
++	// existence check so a name already owned by another tenant in
++	// the shared c.Providers map does not 409 us.
++	if h.dbStore != nil {
++		if err := h.dbStore.AddProvider(ctx, payload.Provider, config); err != nil {
++			if errors.Is(err, configstore.ErrAlreadyExists) {
++				SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for this tenant", payload.Provider))
++				return
++			}
++			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
+ 			return
+ 		}
+-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
+-		return
+ 	}
++	// Update the shared in-memory map best-effort so the legacy
++	// inference runtime can see the new provider for this process
++	// lifetime. Stage 2 will replace this with a tenant-keyed map;
++	// for now a clobber is acceptable since the DB is the source of
++	// truth and the inference runtime is shared across tenants anyway.
++	h.inMemoryStore.Mu.Lock()
++	if h.inMemoryStore.Providers == nil {
++		h.inMemoryStore.Providers = map[schemas.ModelProvider]configstore.ProviderConfig{}
++	}
++	h.inMemoryStore.Providers[payload.Provider] = config
++	h.inMemoryStore.Mu.Unlock()
+ 	logger.Info("Provider %s added successfully", payload.Provider)
+ 
+ 	if err := h.reloadProviderAfterCreate(ctx, payload.Provider); err != nil {
+ 		logger.Warn("Failed to reload provider %s after add: %v", payload.Provider, err)
+-		if rollbackErr := h.inMemoryStore.RemoveProvider(context.Background(), payload.Provider); rollbackErr != nil {
++		// Rollback through dbStore directly so the DELETE flows the
++		// request ctx's tenant_id through the GORM tenant-scope callback
++		// (WHERE tenant_id = ?). Using context.Background() here would
++		// drop the predicate and risk wiping the same provider name
++		// from a sibling tenant.
++		var rollbackErr error
++		if h.dbStore != nil {
++			rollbackErr = h.dbStore.DeleteProvider(ctx, payload.Provider)
++		}
++		// Best-effort in-memory cleanup.
++		h.inMemoryStore.Mu.Lock()
++		delete(h.inMemoryStore.Providers, payload.Provider)
++		h.inMemoryStore.Mu.Unlock()
++		if rollbackErr != nil && !errors.Is(rollbackErr, configstore.ErrNotFound) {
+ 			logger.Error("Failed to rollback provider %s after reload failure: %v", payload.Provider, rollbackErr)
+ 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to initialize provider after add: %v (rollback failed: %v)", err, rollbackErr))
+ 			return
+-- 
+2.51.0
+
