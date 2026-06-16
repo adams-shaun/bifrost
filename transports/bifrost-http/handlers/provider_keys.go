@@ -9,9 +9,14 @@ import (
 	"github.com/google/uuid"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
+
+// _ keeps lib imported even when no compile-time reference remains
+// after a refactor; remove once a non-trivial lib usage returns.
+var _ = lib.ErrNotFound
 
 // ListProviderKeysResponse represents the response for listing keys for a provider.
 type ListProviderKeysResponse struct {
@@ -26,17 +31,32 @@ func (h *ProviderHandler) listProviderKeys(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	keys, err := h.inMemoryStore.GetProviderKeysRedacted(provider)
-	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+	if h.dbStore == nil {
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
+		return
+	}
+	// Tenant-scoped via GORM callback. Read provider config first so a
+	// caller hitting an unknown-to-this-tenant provider gets 404 rather
+	// than an empty key list.
+	if _, err := h.dbStore.GetProviderConfig(ctx, provider); err != nil {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
 			return
 		}
+		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider config: %v", err))
+		return
+	}
+	rawKeys, err := h.dbStore.GetProviderKeys(ctx, provider)
+	if err != nil {
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider keys: %v", err))
 		return
 	}
-
-	SendJSON(ctx, ListProviderKeysResponse{Keys: keys, Total: len(keys)})
+	redactedKeys := make([]schemas.Key, len(rawKeys))
+	for i, k := range rawKeys {
+		redactedKeys[i] = k
+		redactedKeys[i].Value = *k.Value.Redacted()
+	}
+	SendJSON(ctx, ListProviderKeysResponse{Keys: redactedKeys, Total: len(redactedKeys)})
 }
 
 func (h *ProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
@@ -52,17 +72,22 @@ func (h *ProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	key, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
+	if h.dbStore == nil {
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
+		return
+	}
+	rawKey, err := h.dbStore.GetProviderKey(ctx, provider, keyID)
 	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
 			return
 		}
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
 		return
 	}
-
-	SendJSON(ctx, key)
+	redacted := *rawKey
+	redacted.Value = *rawKey.Value.Redacted()
+	SendJSON(ctx, redacted)
 }
 
 func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
@@ -78,9 +103,13 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	providerConfig, err := h.inMemoryStore.GetProviderConfigRaw(provider)
+	if h.dbStore == nil {
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
+		return
+	}
+	providerConfig, err := h.dbStore.GetProviderConfig(ctx, provider)
 	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
 			return
 		}
@@ -125,13 +154,13 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
 		key.Enabled = bifrost.Ptr(true)
 	}
 
-	if err := h.inMemoryStore.AddProviderKey(ctx, provider, key); err != nil {
+	if err := h.dbStore.CreateProviderKey(ctx, provider, key); err != nil {
 		logger.Warn("Failed to create key for provider %s: %v", provider, err)
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
 			return
 		}
-		if errors.Is(err, lib.ErrAlreadyExists) {
+		if errors.Is(err, configstore.ErrAlreadyExists) {
 			SendError(ctx, fasthttp.StatusConflict, err.Error())
 			return
 		}
@@ -139,17 +168,23 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// Best-effort in-memory sync so the shared inference runtime can
+	// route to the new key without a restart. Stage 2 replaces this
+	// with a tenant-keyed map.
+	h.inMemoryStore.Mu.Lock()
+	if cfg, ok := h.inMemoryStore.Providers[provider]; ok {
+		cfg.Keys = append(cfg.Keys, key)
+		h.inMemoryStore.Providers[provider] = cfg
+	}
+	h.inMemoryStore.Mu.Unlock()
+
 	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
 		logger.Warn("Model discovery failed for provider %s after key create: %v", provider, err)
 	}
 
-	redactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, key.ID)
-	if err != nil {
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get created provider key: %v", err))
-		return
-	}
-
-	SendJSON(ctx, redactedKey)
+	respKey := key
+	respKey.Value = *key.Value.Redacted()
+	SendJSON(ctx, respKey)
 }
 
 func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
@@ -171,9 +206,13 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	providerConfig, err := h.inMemoryStore.GetProviderConfigRaw(provider)
+	if h.dbStore == nil {
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
+		return
+	}
+	providerConfig, err := h.dbStore.GetProviderConfig(ctx, provider)
 	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
 			return
 		}
@@ -186,28 +225,20 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	oldRawKey, err := h.inMemoryStore.GetProviderKeyRaw(provider, keyID)
+	oldRawKey, err := h.dbStore.GetProviderKey(ctx, provider, keyID)
 	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
 			return
 		}
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
 		return
 	}
-
-	oldRedactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
-	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
-			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
-			return
-		}
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
-		return
-	}
+	oldRedactedKey := *oldRawKey
+	oldRedactedKey.Value = *oldRawKey.Value.Redacted()
 
 	updateKey.ID = keyID
-	mergedKey := h.mergeUpdatedKey(*oldRawKey, *oldRedactedKey, updateKey)
+	mergedKey := h.mergeUpdatedKey(*oldRawKey, oldRedactedKey, updateKey)
 
 	baseProvider := provider
 	if providerConfig.CustomProviderConfig != nil && providerConfig.CustomProviderConfig.BaseProviderType != "" {
@@ -234,9 +265,9 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if err := h.inMemoryStore.UpdateProviderKey(ctx, provider, keyID, mergedKey); err != nil {
+	if err := h.dbStore.UpdateProviderKey(ctx, provider, keyID, mergedKey); err != nil {
 		logger.Warn("Failed to update key %s for provider %s: %v", keyID, provider, err)
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
 			return
 		}
@@ -244,17 +275,27 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// Best-effort in-memory sync so the shared inference runtime picks
+	// up the rename / value rotation without a restart.
+	h.inMemoryStore.Mu.Lock()
+	if cfg, ok := h.inMemoryStore.Providers[provider]; ok {
+		for i, k := range cfg.Keys {
+			if k.ID == keyID {
+				cfg.Keys[i] = mergedKey
+				break
+			}
+		}
+		h.inMemoryStore.Providers[provider] = cfg
+	}
+	h.inMemoryStore.Mu.Unlock()
+
 	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
 		logger.Warn("Model discovery failed for provider %s after key update: %v", provider, err)
 	}
 
-	redactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
-	if err != nil {
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get updated provider key: %v", err))
-		return
-	}
-
-	SendJSON(ctx, redactedKey)
+	respKey := mergedKey
+	respKey.Value = *mergedKey.Value.Redacted()
+	SendJSON(ctx, respKey)
 }
 
 func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
@@ -270,9 +311,19 @@ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	providerConfig, err := h.inMemoryStore.GetProviderConfigRaw(provider)
+	if h.dbStore == nil {
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "Config store not configured")
+		return
+	}
+
+	// Tenant-scoped lookup: GORM scope callback adds WHERE tenant_id = ?
+	// from the request ctx, so a key visible in the global in-memory map
+	// but stamped with a different tenant_id returns ErrNotFound here —
+	// the correct multi-tenant behaviour. Mirrors the fix applied to
+	// addProvider in this same pass.
+	providerConfig, err := h.dbStore.GetProviderConfig(ctx, provider)
 	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider not found: %v", err))
 			return
 		}
@@ -285,25 +336,43 @@ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	redactedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
+	rawKey, err := h.dbStore.GetProviderKey(ctx, provider, keyID)
 	if err != nil {
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
 			return
 		}
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider key: %v", err))
 		return
 	}
+	redactedKey := *rawKey
+	redactedKey.Value = *rawKey.Value.Redacted()
 
-	if err := h.inMemoryStore.RemoveProviderKey(ctx, provider, keyID); err != nil {
+	if err := h.dbStore.DeleteProviderKey(ctx, provider, keyID); err != nil {
 		logger.Warn("Failed to delete key %s for provider %s: %v", keyID, provider, err)
-		if errors.Is(err, lib.ErrNotFound) {
+		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("Provider key not found: %v", err))
 			return
 		}
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to delete provider key: %v", err))
 		return
 	}
+
+	// Best-effort in-memory cleanup so the shared inference runtime
+	// drops the key from its rotation pool until Stage 2 replaces the
+	// global c.Providers map with a tenant-keyed one.
+	h.inMemoryStore.Mu.Lock()
+	if cfg, ok := h.inMemoryStore.Providers[provider]; ok {
+		filtered := cfg.Keys[:0]
+		for _, k := range cfg.Keys {
+			if k.ID != keyID {
+				filtered = append(filtered, k)
+			}
+		}
+		cfg.Keys = filtered
+		h.inMemoryStore.Providers[provider] = cfg
+	}
+	h.inMemoryStore.Mu.Unlock()
 
 	if err := h.attemptModelDiscovery(ctx, provider, providerConfig.CustomProviderConfig); err != nil {
 		logger.Warn("Model discovery failed for provider %s after key delete: %v", provider, err)

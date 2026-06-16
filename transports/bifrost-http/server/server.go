@@ -164,6 +164,18 @@ func SetLogger(l schemas.Logger) {
 	logger = l
 }
 
+// envBool reads an env var as a permissive boolean — "true", "1",
+// "yes", "y", "on" (case-insensitive) all return true; anything else
+// (including the unset case) is false. Centralised so feature-flag
+// env vars in this package have consistent semantics.
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "true", "1", "yes", "y", "on":
+		return true
+	}
+	return false
+}
+
 // NewBifrostHTTPServer creates a new instance of BifrostHTTPServer.
 func NewBifrostHTTPServer(version string, uiContent embed.FS) *BifrostHTTPServer {
 	return &BifrostHTTPServer{
@@ -1218,7 +1230,11 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
 	// BEFORE auth / governance / logging plugins see it.  Header
 	// absent → no stamp → configstore tenant-scope callback skips
 	// the implicit WHERE (single-tenant N=1 fallback).
-	tenantMW := handlers.TenantResolverMiddleware()
+	//
+	// disableDefaultTenant only affects admin paths; inference (/v1/*)
+	// flows through with the seeded default-tenant fallback so the
+	// flag doesn't accidentally take down the governance pipeline.
+	tenantMW := handlers.TenantResolverMiddleware(envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG"))
 	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
 	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
 	inferenceHandler.RegisterRoutes(s.Router, chained...)
@@ -1293,14 +1309,22 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	// callback (framework/configstore/tenant_scope.go) reads from
 	// the same context to auto-filter every SELECT and auto-populate
 	// every INSERT against tenant-scoped tables.
-	tenantMW := handlers.TenantResolverMiddleware()
+	// BIFROST_DISABLE_DEFAULT_TENANT_CONFIG: when set to "true"/"1"/"yes",
+	// (1) the resolver rejects admin requests carrying
+	//     `x-f5xc-tenant: default` with 403, and
+	// (2) the platform-tenants admin surface hides the seeded `default`
+	//     row from list / get / update / delete.
+	// Operators flip this on in deployments meant to be multi-tenant
+	// only, where the legacy single-tenant fallback isn't desired.
+	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
+	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
 	middlewares = append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
 	// Platform-admin: /api/platform/tenants for cross-tenant tenant
 	// directory management.  This surface is the ONE admin endpoint
 	// that is explicitly NOT per-tenant-scoped — the tenant-scope
 	// GORM callback skips it because the tenants table doesn't
 	// carry a tenant_id column.
-	platformTenantsHandler, err := handlers.NewPlatformTenantsHandler(s.Config.ConfigStore)
+	platformTenantsHandler, err := handlers.NewPlatformTenantsHandler(s.Config.ConfigStore, disableDefaultTenant)
 	if err != nil {
 		return fmt.Errorf("failed to initialize platform tenants handler: %v", err)
 	}

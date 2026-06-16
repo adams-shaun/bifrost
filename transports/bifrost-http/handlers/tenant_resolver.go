@@ -15,6 +15,8 @@
 package handlers
 
 import (
+	"strings"
+
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/multitenant"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
@@ -28,8 +30,16 @@ import (
 // once on the BifrostContext if one is already attached so inference
 // plugins see it).
 //
+// When disableDefaultTenant is true, any request whose tenant header
+// resolves to "default" gets rejected with 403 before any handler
+// runs. Operators opt into this when their cluster is meant to be
+// multi-tenant only and the seeded `default` tenant should not be
+// usable as a write target. /v1/* inference paths still flow through
+// even with the flag on — the resolver's job is admin-surface
+// isolation; inference-time policy lives in the governance plugin.
+//
 // Skip paths (health probes) bypass the lookup entirely.
-func TenantResolverMiddleware() schemas.BifrostHTTPMiddleware {
+func TenantResolverMiddleware(disableDefaultTenant bool) schemas.BifrostHTTPMiddleware {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
 			path := string(ctx.Path())
@@ -43,6 +53,11 @@ func TenantResolverMiddleware() schemas.BifrostHTTPMiddleware {
 				return
 			}
 			tid := string(raw)
+			if disableDefaultTenant && tid == string(multitenant.DefaultTenantID) && isAdminPath(path) && isUnsafeMethod(string(ctx.Method())) {
+				SendError(ctx, fasthttp.StatusForbidden,
+					"the 'default' tenant is disabled on this cluster (BIFROST_DISABLE_DEFAULT_TENANT_CONFIG=true); pick a different tenant via the x-f5xc-tenant header")
+				return
+			}
 			// Both forms — fasthttp UserValue (read by configstore
 			// callback via gorm stmt.Context which wraps the
 			// fasthttp.RequestCtx) and any pre-attached
@@ -56,6 +71,43 @@ func TenantResolverMiddleware() schemas.BifrostHTTPMiddleware {
 			next(ctx)
 		}
 	}
+}
+
+// isUnsafeMethod returns true for HTTP methods that mutate server
+// state. GET / HEAD / OPTIONS are read-only and never count as writes
+// so the UI can render bootstrap reads (e.g. GET /api/config) from
+// the default tenant even when the disable flag is on; only POST /
+// PUT / PATCH / DELETE are gated by the flag.
+func isUnsafeMethod(method string) bool {
+	switch method {
+	case fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch, fasthttp.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// isAdminPath returns true for the per-tenant admin surfaces where a
+// "default tenant write" is in scope of the disable flag.
+//
+// /api/platform/* is intentionally NOT a tenant-scoped surface — the
+// tenants table itself has no tenant_id column, and the only way for
+// an operator sitting on the seeded `default` tenant to provision
+// their first real tenant is to call POST /api/platform/tenants. If
+// the resolver blocked that based on the caller's header, the flag
+// would be a chicken-and-egg trap: you can't get off `default` without
+// already being off `default`.
+//
+// Inference (/v1/*) is also excluded — governance owns admit/deny
+// there. So the flag only fires on /api/<entity>/... (providers,
+// virtual-keys, mcp/clients, config, etc.).
+func isAdminPath(path string) bool {
+	if !strings.HasPrefix(path, "/api/") {
+		return false
+	}
+	if strings.HasPrefix(path, "/api/platform/") {
+		return false
+	}
+	return true
 }
 
 // shouldSkipTenantResolve returns true for paths that have no per-

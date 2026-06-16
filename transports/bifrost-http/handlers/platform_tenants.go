@@ -27,14 +27,22 @@ import (
 // PlatformTenantsHandler implements /api/platform/tenants admin CRUD.
 type PlatformTenantsHandler struct {
 	configStore configstore.ConfigStore
+	// disableDefaultTenant, when true, hides the seeded `default`
+	// tenant from list / get / update / delete responses so it can't
+	// be discovered or manipulated through the admin UI. Pair with
+	// TenantResolverMiddleware's flag so writes targeting it via the
+	// `x-f5xc-tenant: default` header are rejected at ingress too.
+	disableDefaultTenant bool
 }
 
 // NewPlatformTenantsHandler constructs a handler.  configStore is required.
-func NewPlatformTenantsHandler(configStore configstore.ConfigStore) (*PlatformTenantsHandler, error) {
+// When disableDefaultTenant is true the seeded "default" tenant is hidden
+// from every response.
+func NewPlatformTenantsHandler(configStore configstore.ConfigStore, disableDefaultTenant bool) (*PlatformTenantsHandler, error) {
 	if configStore == nil {
 		return nil, fmt.Errorf("config store is required")
 	}
-	return &PlatformTenantsHandler{configStore: configStore}, nil
+	return &PlatformTenantsHandler{configStore: configStore, disableDefaultTenant: disableDefaultTenant}, nil
 }
 
 // RegisterRoutes mounts /api/platform/tenants{,/:id} under the
@@ -62,10 +70,14 @@ type tenantUpdateRequest struct {
 }
 
 func (h *PlatformTenantsHandler) list(ctx *fasthttp.RequestCtx) {
+	q := h.configStore.DB().WithContext(ctx)
+	if h.disableDefaultTenant {
+		q = q.Where("id <> ?", configstoreTables.DefaultTenantID)
+	}
 	var tenants []configstoreTables.TableTenant
 	// Plain DB list — no tenant scope (the tenants table has no
 	// tenant_id column, so the GORM callback is a no-op here).
-	if err := h.configStore.DB().WithContext(ctx).Find(&tenants).Error; err != nil {
+	if err := q.Find(&tenants).Error; err != nil {
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("list tenants: %v", err))
 		return
 	}
@@ -83,6 +95,10 @@ func (h *PlatformTenantsHandler) create(ctx *fasthttp.RequestCtx) {
 	}
 	if req.ID == "" || req.Name == "" {
 		SendError(ctx, fasthttp.StatusBadRequest, "id and name are required")
+		return
+	}
+	if h.disableDefaultTenant && req.ID == configstoreTables.DefaultTenantID {
+		SendError(ctx, fasthttp.StatusForbidden, "the 'default' tenant id is reserved and disabled on this cluster")
 		return
 	}
 	status := req.Status
@@ -111,6 +127,10 @@ func (h *PlatformTenantsHandler) get(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, "id is required")
 		return
 	}
+	if h.disableDefaultTenant && id == configstoreTables.DefaultTenantID {
+		SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
+		return
+	}
 	var row configstoreTables.TableTenant
 	if err := h.configStore.DB().WithContext(ctx).First(&row, "id = ?", id).Error; err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
@@ -127,6 +147,10 @@ func (h *PlatformTenantsHandler) update(ctx *fasthttp.RequestCtx) {
 	id, _ := ctx.UserValue("id").(string)
 	if id == "" {
 		SendError(ctx, fasthttp.StatusBadRequest, "id is required")
+		return
+	}
+	if h.disableDefaultTenant && id == configstoreTables.DefaultTenantID {
+		SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
 		return
 	}
 	var req tenantUpdateRequest
@@ -165,7 +189,14 @@ func (h *PlatformTenantsHandler) delete(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	if id == configstoreTables.DefaultTenantID {
-		SendError(ctx, fasthttp.StatusBadRequest, "cannot delete the default tenant")
+		// With the flag on, hide existence; without it, surface the
+		// original "cannot delete" guard so the operator gets a hint
+		// about WHY rather than a flat 404.
+		if h.disableDefaultTenant {
+			SendError(ctx, fasthttp.StatusNotFound, fmt.Sprintf("tenant %s not found", id))
+		} else {
+			SendError(ctx, fasthttp.StatusBadRequest, "cannot delete the default tenant")
+		}
 		return
 	}
 	if err := h.configStore.DB().WithContext(ctx).Delete(&configstoreTables.TableTenant{}, "id = ?", id).Error; err != nil {

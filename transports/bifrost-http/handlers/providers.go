@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -23,6 +24,26 @@ import (
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
+
+// allowPrivateNetwork OR-s the per-provider toggle with the cluster
+// wide BIFROST_ALLOW_PRIVATE_NETWORK env override. In a k8s deployment
+// every upstream model lives at *.svc.cluster.local (RFC 1918), so the
+// stored toggle on individual provider rows is irrelevant — the cluster
+// operator flips the env once and all provider URLs validate.
+//
+// Cloud-metadata (169.254.x.x), link-local (fe80::/10), and unspecified
+// (0.0.0.0, ::) addresses are still blocked unconditionally inside
+// ValidateExternalURL; this helper only relaxes the RFC 1918 check.
+func allowPrivateNetwork(perProviderToggle bool) bool {
+	if perProviderToggle {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BIFROST_ALLOW_PRIVATE_NETWORK"))) {
+	case "true", "1", "yes", "y", "on":
+		return true
+	}
+	return false
+}
 
 // ModelsManager defines the interface for managing provider models
 type ModelsManager interface {
@@ -282,21 +303,29 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
 			return
 		}
 		if payload.NetworkConfig.BaseURL != "" {
-			if err := bifrost.ValidateExternalURL(payload.NetworkConfig.BaseURL, payload.NetworkConfig.AllowPrivateNetwork); err != nil {
+			if err := bifrost.ValidateExternalURL(payload.NetworkConfig.BaseURL, allowPrivateNetwork(payload.NetworkConfig.AllowPrivateNetwork)); err != nil {
 				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid base URL: %v", err))
 				return
 			}
 		}
 	}
-	// Check if provider already exists
-	if _, err := h.inMemoryStore.GetProviderConfigRedacted(payload.Provider); err != nil {
-		if !errors.Is(err, lib.ErrNotFound) {
-			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to check provider config: %v", err))
+	// Tenant-scoped existence check: hit the DB via the tenant-scope
+	// GORM callback (h.dbStore.GetProviderConfig WHERE tenant_id = ctx
+	// tenant) instead of the global in-memory c.Providers map. The
+	// legacy in-memory check rejected creation if ANY tenant had the
+	// provider name configured — a multi-tenant correctness bug, since
+	// the DB carries composite (tenant_id, name) uniqueness so each
+	// tenant can independently register e.g. "anthropic".
+	if h.dbStore != nil {
+		if existing, err := h.dbStore.GetProviderConfig(ctx, payload.Provider); err != nil {
+			if !errors.Is(err, configstore.ErrNotFound) {
+				SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to check provider config: %v", err))
+				return
+			}
+		} else if existing != nil {
+			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for this tenant", payload.Provider))
 			return
 		}
-	} else {
-		SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists", payload.Provider))
-		return
 	}
 
 	// Construct ProviderConfig from individual fields
@@ -315,21 +344,49 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid custom provider config: %v", err))
 		return
 	}
-	// Add provider to store (env vars will be processed by store)
-	if err := h.inMemoryStore.AddProvider(ctx, payload.Provider, config); err != nil {
-		logger.Warn("Failed to add provider %s: %v", payload.Provider, err)
-		if errors.Is(err, lib.ErrAlreadyExists) {
-			SendError(ctx, fasthttp.StatusConflict, err.Error())
+	// DB write via the configstore (tenant-scoped via the GORM
+	// callback). Bypasses lib.Config.AddProvider's global in-memory
+	// existence check so a name already owned by another tenant in
+	// the shared c.Providers map does not 409 us.
+	if h.dbStore != nil {
+		if err := h.dbStore.AddProvider(ctx, payload.Provider, config); err != nil {
+			if errors.Is(err, configstore.ErrAlreadyExists) {
+				SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for this tenant", payload.Provider))
+				return
+			}
+			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
 			return
 		}
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
-		return
 	}
+	// Update the shared in-memory map best-effort so the legacy
+	// inference runtime can see the new provider for this process
+	// lifetime. Stage 2 will replace this with a tenant-keyed map;
+	// for now a clobber is acceptable since the DB is the source of
+	// truth and the inference runtime is shared across tenants anyway.
+	h.inMemoryStore.Mu.Lock()
+	if h.inMemoryStore.Providers == nil {
+		h.inMemoryStore.Providers = map[schemas.ModelProvider]configstore.ProviderConfig{}
+	}
+	h.inMemoryStore.Providers[payload.Provider] = config
+	h.inMemoryStore.Mu.Unlock()
 	logger.Info("Provider %s added successfully", payload.Provider)
 
 	if err := h.reloadProviderAfterCreate(ctx, payload.Provider); err != nil {
 		logger.Warn("Failed to reload provider %s after add: %v", payload.Provider, err)
-		if rollbackErr := h.inMemoryStore.RemoveProvider(context.Background(), payload.Provider); rollbackErr != nil {
+		// Rollback through dbStore directly so the DELETE flows the
+		// request ctx's tenant_id through the GORM tenant-scope
+		// callback (WHERE tenant_id = ?). Using context.Background()
+		// here would drop the predicate and risk wiping the same
+		// provider name from a sibling tenant.
+		var rollbackErr error
+		if h.dbStore != nil {
+			rollbackErr = h.dbStore.DeleteProvider(ctx, payload.Provider)
+		}
+		// Best-effort in-memory cleanup.
+		h.inMemoryStore.Mu.Lock()
+		delete(h.inMemoryStore.Providers, payload.Provider)
+		h.inMemoryStore.Mu.Unlock()
+		if rollbackErr != nil && !errors.Is(rollbackErr, configstore.ErrNotFound) {
 			logger.Error("Failed to rollback provider %s after reload failure: %v", payload.Provider, rollbackErr)
 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to initialize provider after add: %v (rollback failed: %v)", err, rollbackErr))
 			return
@@ -456,7 +513,7 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	if nc.BaseURL != "" {
-		if err := bifrost.ValidateExternalURL(nc.BaseURL, nc.AllowPrivateNetwork); err != nil {
+		if err := bifrost.ValidateExternalURL(nc.BaseURL, allowPrivateNetwork(nc.AllowPrivateNetwork)); err != nil {
 			SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid base URL: %v", err))
 			return
 		}

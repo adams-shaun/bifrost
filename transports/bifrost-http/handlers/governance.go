@@ -1998,6 +1998,21 @@ func (h *GovernanceHandler) createTeam(ctx *fasthttp.RequestCtx) {
 			return
 		}
 	}
+	// customer_id ownership: when set, the referenced customer MUST
+	// belong to the calling tenant. GetCustomer goes through
+	// ScopedDB(ctx) so a customer in another tenant returns ErrNotFound.
+	// Without this guard a tenant could create a team whose customer
+	// FK points outside its scope, leaving the row half-valid.
+	if req.CustomerID != nil && *req.CustomerID != "" {
+		if _, err := h.configStore.GetCustomer(ctx, *req.CustomerID); err != nil {
+			if errors.Is(err, configstore.ErrNotFound) {
+				SendError(ctx, 400, fmt.Sprintf("customer_id %s does not belong to the calling tenant", *req.CustomerID))
+				return
+			}
+			SendError(ctx, 500, fmt.Sprintf("Failed to validate customer_id: %s", err.Error()))
+			return
+		}
+	}
 	// Creating team in database
 	var team configstoreTables.TableTeam
 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
@@ -2113,6 +2128,20 @@ func (h *GovernanceHandler) updateTeam(ctx *fasthttp.RequestCtx) {
 		}
 		SendError(ctx, 500, "Failed to retrieve team")
 		return
+	}
+	// Same cross-tenant FK guard as createTeam — when the caller is
+	// reassigning customer_id to a non-empty value, the target customer
+	// must live in the same tenant. Empty-string clears the FK; nil
+	// means "don't touch", which is handled below.
+	if req.CustomerID != nil && *req.CustomerID != "" {
+		if _, cErr := h.configStore.GetCustomer(ctx, *req.CustomerID); cErr != nil {
+			if errors.Is(cErr, configstore.ErrNotFound) {
+				SendError(ctx, 400, fmt.Sprintf("customer_id %s does not belong to the calling tenant", *req.CustomerID))
+				return
+			}
+			SendError(ctx, 500, fmt.Sprintf("Failed to validate customer_id: %s", cErr.Error()))
+			return
+		}
 	}
 	// Updating team in database
 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
