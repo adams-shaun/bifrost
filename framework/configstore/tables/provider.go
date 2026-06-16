@@ -16,7 +16,11 @@ import (
 // That helps us detect changes between config file and database config
 type TableProvider struct {
 	ID                       uint      `gorm:"primaryKey;autoIncrement" json:"id"`
-	Name                     string    `gorm:"type:varchar(50);uniqueIndex;not null" json:"name"` // ModelProvider as string
+	Name                     string    `gorm:"type:varchar(50);uniqueIndex:idx_providers_tenant_name;not null" json:"name"` // ModelProvider as string; unique per (tenant_id, name)
+	// TenantID scopes this provider config to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Composite-unique with Name via
+	// idx_providers_tenant_name so two tenants can both register "openai".
+	TenantID                 string    `gorm:"type:varchar(255);not null;default:default;uniqueIndex:idx_providers_tenant_name" json:"tenant_id"`
 	NetworkConfigJSON        string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.NetworkConfig
 	ConcurrencyBufferJSON    string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ConcurrencyAndBufferSize
 	ProxyConfigJSON          string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ProxyConfig

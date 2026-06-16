@@ -22,6 +22,10 @@ type TableBudget struct {
 	ModelConfigID    *string `gorm:"type:varchar(255);index" json:"model_config_id,omitempty"`
 	CustomerID       *string `gorm:"type:varchar(255);index" json:"customer_id,omitempty"`
 
+	// TenantID scopes this budget to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Backfilled to DefaultTenantID on upgrade.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;index" json:"tenant_id"`
+
 	// Deprecated: set calendar_aligned on the parent access profile / VK / team
 	// instead. Kept for backward compatibility with older config.json files;
 	// the OSS applyV1Compat path and the enterprise access-profile reconciler

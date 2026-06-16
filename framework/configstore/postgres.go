@@ -32,9 +32,20 @@ func buildPostgresDSN(config *PostgresConfig) string {
 // using the shared bifrost logger. Used for both the throwaway migration pool
 // and the runtime pool.
 func openPostresConnection(dsn string, logger schemas.Logger) (*gorm.DB, error) {
-	return gorm.Open(postgres.New(postgres.Config{DSN: dsn}), &gorm.Config{
+	db, err := gorm.Open(postgres.New(postgres.Config{DSN: dsn}), &gorm.Config{
 		Logger: newGormLogger(logger),
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Tenant-scope callbacks — see tenant_scope.go for the contract.
+	// Registered here so the runtime AND throwaway-migration pools
+	// both honour the header-model invariants from the first query.
+	if err := RegisterTenantScopes(db); err != nil {
+		_ = db
+		return nil, err
+	}
+	return db, nil
 }
 
 // closeDbConn closes the *sql.DB backing a *gorm.DB, logging any error.

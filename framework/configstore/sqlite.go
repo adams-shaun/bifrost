@@ -34,6 +34,15 @@ func newSqliteConfigStore(ctx context.Context, config *SQLiteConfig, logger sche
 	if err != nil {
 		return nil, err
 	}
+	// Tenant-scope callbacks: every SELECT / UPDATE / DELETE against a
+	// model that has a tenant_id column gets an implicit
+	// WHERE tenant_id = ? from the request context; every INSERT
+	// populates the column from the same source.  See tenant_scope.go
+	// for the contract; without this hook the multi-tenant model is
+	// only a schema convention with no enforcement.
+	if err := RegisterTenantScopes(db); err != nil {
+		return nil, fmt.Errorf("register tenant scope callbacks: %w", err)
+	}
 	logger.Debug("db opened for configstore")
 	s := &RDBConfigStore{logger: logger}
 	s.db.Store(db)

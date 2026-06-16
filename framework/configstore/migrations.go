@@ -866,6 +866,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddModelConfigBudgetsFKConstraint(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddTenantsAndTenantIDColumns(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -9772,6 +9775,153 @@ func migrationAddCustomerBudgetsToBudgetsTable(ctx context.Context, db *gorm.DB)
 	}
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error running add_customer_budgets_to_budgets_table migration: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddTenantsAndTenantIDColumns is the consolidated multi-tenant
+// retrofit for the header-based tenancy model. It does the entire rollout in
+// a single gormigrate entry so any partial-apply on upgrade either leaves the
+// DB untouched or fully populated:
+//
+//  1. Creates the `tenants` table via AutoMigrate (so column defaults and the
+//     timestamp indexes from TableTenant struct tags land consistently across
+//     dialects).
+//  2. Seeds the default tenant (id="default", name="Default Tenant",
+//     status="active") with ON CONFLICT DO NOTHING so re-runs are idempotent.
+//  3. Adds tenant_id to every governance + per-tenant config table that needs
+//     it (customers, teams, virtual_keys, budgets, rate_limits, providers,
+//     keys, mcp_clients). AddColumn carries the "default" column default so
+//     existing rows get backfilled automatically on dialects that honor it.
+//  4. Runs an explicit backfill UPDATE per table for dialects that do not
+//     honor the default when ALTER-adding a NOT NULL column (older SQLite).
+//  5. For composite-uniqueness tables (virtual_keys, providers, keys,
+//     mcp_clients), drops the legacy single-column Name unique index and
+//     creates the new composite (tenant_id, name) unique index so two
+//     tenants can independently register entities with the same name.
+//
+// Children that transitively belong to a tenant via their owner (model
+// configs on a provider, oauth configs on an MCP client, VK provider/MCP
+// configs, etc.) are intentionally NOT touched — the query layer derives
+// tenant_id by joining to the owning entity. Logs are out of scope; that's
+// a separate logstore concern.
+//
+// Rollback is a no-op: undoing this without coordinated handler rollback
+// would corrupt the runtime tenant resolver.
+func migrationAddTenantsAndTenantIDColumns(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "2026_06_15_add_tenant_id",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			// 1. Create the tenants table.
+			if err := tx.AutoMigrate(&tables.TableTenant{}); err != nil {
+				return fmt.Errorf("failed to create tenants table: %w", err)
+			}
+
+			// 2. Seed the default tenant. ON CONFLICT DO NOTHING keeps the
+			//    migration idempotent across re-runs and dialects.
+			now := time.Now()
+			defaultTenant := &tables.TableTenant{
+				ID:          tables.DefaultTenantID,
+				Name:        "Default Tenant",
+				Status:      tables.TenantStatusActive,
+				Description: "Seeded by the consolidated tenant migration. Single-tenant deployments stay assigned to this tenant.",
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(defaultTenant).Error; err != nil {
+				return fmt.Errorf("failed to seed default tenant: %w", err)
+			}
+
+			// 3 + 4. Add tenant_id column and backfill on every table.
+			// Order is parents-first (customers, teams) so any FK-style
+			// integrity checks downstream see a populated tenant_id.
+			targets := []struct {
+				model     any
+				fieldName string
+				tableName string
+			}{
+				{&tables.TableCustomer{}, "TenantID", "governance_customers"},
+				{&tables.TableTeam{}, "TenantID", "governance_teams"},
+				{&tables.TableVirtualKey{}, "TenantID", "governance_virtual_keys"},
+				{&tables.TableBudget{}, "TenantID", "governance_budgets"},
+				{&tables.TableRateLimit{}, "TenantID", "governance_rate_limits"},
+				{&tables.TableProvider{}, "TenantID", "config_providers"},
+				{&tables.TableKey{}, "TenantID", "config_keys"},
+				{&tables.TableMCPClient{}, "TenantID", "config_mcp_clients"},
+			}
+			for _, t := range targets {
+				if !mig.HasColumn(t.model, "tenant_id") {
+					if err := mig.AddColumn(t.model, t.fieldName); err != nil {
+						return fmt.Errorf("failed to add tenant_id column to %s: %w", t.tableName, err)
+					}
+				}
+				// Idempotent backfill — only touches rows the AddColumn default missed.
+				if err := tx.Exec(
+					fmt.Sprintf(`UPDATE %s SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''`, t.tableName),
+					tables.DefaultTenantID,
+				).Error; err != nil {
+					return fmt.Errorf("failed to backfill %s.tenant_id: %w", t.tableName, err)
+				}
+			}
+
+			// 5. Composite-uniqueness flips. Drop the legacy single-column
+			//    Name unique indexes and create the new composite indexes.
+			//    GORM picks up the column set from the struct tags (both
+			//    Name and TenantID share the composite index name).
+			//
+			//    Legacy index names:
+			//      - virtual_keys:    idx_virtual_key_name (explicit struct tag)
+			//      - providers:       idx_config_providers_name (gorm default)
+			//      - keys:            idx_key_name (explicit struct tag)
+			//      - mcp_clients:     idx_config_mcp_clients_name (gorm default)
+			legacyDrops := []struct {
+				model   any
+				idxName string
+			}{
+				{&tables.TableVirtualKey{}, "idx_virtual_key_name"},
+				{&tables.TableProvider{}, "idx_config_providers_name"},
+				{&tables.TableKey{}, "idx_key_name"},
+				{&tables.TableMCPClient{}, "idx_config_mcp_clients_name"},
+			}
+			for _, d := range legacyDrops {
+				if mig.HasIndex(d.model, d.idxName) {
+					if err := mig.DropIndex(d.model, d.idxName); err != nil {
+						return fmt.Errorf("failed to drop legacy unique index %s: %w", d.idxName, err)
+					}
+				}
+			}
+
+			compositeCreates := []struct {
+				model   any
+				idxName string
+			}{
+				{&tables.TableVirtualKey{}, "idx_virtual_keys_tenant_name"},
+				{&tables.TableProvider{}, "idx_providers_tenant_name"},
+				{&tables.TableKey{}, "idx_key_tenant_name"},
+				{&tables.TableMCPClient{}, "idx_mcp_tenant_name"},
+			}
+			for _, c := range compositeCreates {
+				if !mig.HasIndex(c.model, c.idxName) {
+					if err := mig.CreateIndex(c.model, c.idxName); err != nil {
+						return fmt.Errorf("failed to create composite unique index %s: %w", c.idxName, err)
+					}
+				}
+			}
+
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			// Intentional no-op: rolling back the tenant column without
+			// reverting the handler-layer resolver would break inbound
+			// request routing. Operator must coordinate a code rollback.
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running 2026_06_15_add_tenant_id migration: %s", err.Error())
 	}
 	return nil
 }

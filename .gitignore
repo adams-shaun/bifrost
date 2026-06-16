@@ -183,4 +183,5 @@ examples/mcps/oauth-demo-server/oauth-demo-server
 
 # binaries
 tests/cmd/e2eseed/e2eseed
-tests/cmd/seedvks/seedvks
+tests/cmd/seedvks/seedvksgo.work.local
+go.work.local.sum

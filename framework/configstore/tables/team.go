@@ -16,6 +16,10 @@ type TableTeam struct {
 	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
 	SourceID    *string `gorm:"type:varchar(255);uniqueIndex" json:"source_id,omitempty"`
 
+	// TenantID scopes this team to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID for the rationale and backfill behavior.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;index" json:"tenant_id"`
+
 	// Relationships
 	Customer    *TableCustomer    `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`
 	Budgets     []TableBudget     `gorm:"foreignKey:TeamID;constraint:OnDelete:CASCADE" json:"budgets,omitempty"` // Multiple budgets with different reset intervals

@@ -23,6 +23,10 @@ type TableRateLimit struct {
 	RequestCurrentUsage  int64     `gorm:"default:0" json:"request_current_usage"`                   // Current request usage
 	RequestLastReset     time.Time `gorm:"index" json:"request_last_reset"`                          // Last time request counter was reset
 
+	// TenantID scopes this rate limit to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Backfilled to DefaultTenantID on upgrade.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;index" json:"tenant_id"`
+
 	// Deprecated: set calendar_aligned on the parent access profile / VK / team
 	// instead. Kept for backward compatibility with older config.json files;
 	// the OSS applyV1Compat path and the enterprise access-profile reconciler

@@ -1212,11 +1212,19 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
 	}
 	s.MCPServerHandler = mcpServerHandler
 	asyncHandler := handlers.NewAsyncHandler(s.Client, s.Config)
-	s.IntegrationHandler.RegisterRoutes(s.Router, middlewares...)
-	inferenceHandler.RegisterRoutes(s.Router, middlewares...)
-	asyncHandler.RegisterRoutes(s.Router, middlewares...)
-	mcpInferenceHandler.RegisterRoutes(s.Router, middlewares...)
-	s.MCPServerHandler.RegisterRoutes(s.Router, middlewares...)
+	// Header-model multi-tenancy: prepend the tenant-resolver
+	// middleware so every inference request that carries
+	// `x-f5xc-tenant` stamps the value on the request context
+	// BEFORE auth / governance / logging plugins see it.  Header
+	// absent → no stamp → configstore tenant-scope callback skips
+	// the implicit WHERE (single-tenant N=1 fallback).
+	tenantMW := handlers.TenantResolverMiddleware()
+	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
+	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
+	inferenceHandler.RegisterRoutes(s.Router, chained...)
+	asyncHandler.RegisterRoutes(s.Router, chained...)
+	mcpInferenceHandler.RegisterRoutes(s.Router, chained...)
+	s.MCPServerHandler.RegisterRoutes(s.Router, chained...)
 	return nil
 }
 
@@ -1278,6 +1286,25 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	sessionHandler := handlers.NewSessionHandler(s.Config.ConfigStore, s.WSTicketStore)
 	promptsHandler := handlers.NewPromptsHandler(s.Config.ConfigStore, promptsReloader)
 	featureFlagsHandler := handlers.NewFeatureFlagsHandler(s.Config.FeatureFlags, s.Config.ConfigStore)
+	// Header-model multi-tenancy: prepend the tenant-resolver
+	// middleware so every admin request that carries
+	// `x-f5xc-tenant` stamps the value on the request context
+	// BEFORE handler logic runs.  The configstore tenant-scope
+	// callback (framework/configstore/tenant_scope.go) reads from
+	// the same context to auto-filter every SELECT and auto-populate
+	// every INSERT against tenant-scoped tables.
+	tenantMW := handlers.TenantResolverMiddleware()
+	middlewares = append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
+	// Platform-admin: /api/platform/tenants for cross-tenant tenant
+	// directory management.  This surface is the ONE admin endpoint
+	// that is explicitly NOT per-tenant-scoped — the tenant-scope
+	// GORM callback skips it because the tenants table doesn't
+	// carry a tenant_id column.
+	platformTenantsHandler, err := handlers.NewPlatformTenantsHandler(s.Config.ConfigStore)
+	if err != nil {
+		return fmt.Errorf("failed to initialize platform tenants handler: %v", err)
+	}
+	platformTenantsHandler.RegisterRoutes(s.Router, middlewares...)
 	// Going ahead with API handlers
 	healthHandler.RegisterRoutes(s.Router, middlewares...)
 	providerHandler.RegisterRoutes(s.Router, middlewares...)
