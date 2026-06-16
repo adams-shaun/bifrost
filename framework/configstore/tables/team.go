@@ -11,14 +11,16 @@ import (
 // TableTeam represents a team entity with budget, rate limit and customer association
 type TableTeam struct {
 	ID          string  `gorm:"primaryKey;type:varchar(255)" json:"id"`
-	Name        string  `gorm:"type:varchar(255);not null;uniqueIndex" json:"name"`
+	Name        string  `gorm:"type:varchar(255);not null;uniqueIndex:idx_governance_teams_tenant_name" json:"name"`
 	CustomerID  *string `gorm:"type:varchar(255);index" json:"customer_id,omitempty"` // A team can belong to a customer
 	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
 	SourceID    *string `gorm:"type:varchar(255);uniqueIndex" json:"source_id,omitempty"`
 
 	// TenantID scopes this team to a tenant for multi-tenant deployments.
 	// See TableCustomer.TenantID for the rationale and backfill behavior.
-	TenantID string `gorm:"type:varchar(255);not null;default:default;index" json:"tenant_id"`
+	// Composite-unique with Name via idx_governance_teams_tenant_name so
+	// two tenants can both register a team called "engineering".
+	TenantID string `gorm:"type:varchar(255);not null;uniqueIndex:idx_governance_teams_tenant_name;default:default" json:"tenant_id"`
 
 	// Relationships
 	Customer    *TableCustomer    `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`

@@ -159,8 +159,15 @@ func schemaKeyFromTableKey(dbKey tables.TableKey) schemas.Key {
 // tableKeyFromSchemaKey converts a schema key to a database key.
 func tableKeyFromSchemaKey(provider tables.TableProvider, key schemas.Key) (tables.TableKey, error) {
 	dbKey := tables.TableKey{
-		Provider:           provider.Name,
-		ProviderID:         provider.ID,
+		Provider:   provider.Name,
+		ProviderID: provider.ID,
+		// Inherit the provider's tenant so the key lives in the same
+		// tenant scope.  The BeforeCreate GORM callback would also fill
+		// this in from ctx, but explicitly stamping from the resolved
+		// provider row is both clearer and safer against the case where
+		// CreateProviderKey is called from a code path without a tenant
+		// header on ctx (background sync, etc.).
+		TenantID:           provider.TenantID,
 		KeyID:              key.ID,
 		Name:               key.Name,
 		Value:              key.Value,
@@ -638,6 +645,12 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 		providerConfig := providers[providerName]
 		dbProvider := tables.TableProvider{
 			Name:                     string(providerName),
+			// Startup-time config sync runs with a background context
+			// that has no `x-f5xc-tenant` header, so the BeforeCreate
+			// tenant-scope callback can't infer one.  Explicitly stamp
+			// the default tenant here so the composite (tenant_id,
+			// name) upsert constraint matches.
+			TenantID:                 tables.DefaultTenantID,
 			NetworkConfig:            providerConfig.NetworkConfig,
 			ConcurrencyAndBufferSize: providerConfig.ConcurrencyAndBufferSize,
 			ProxyConfig:              providerConfig.ProxyConfig,
@@ -659,10 +672,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 			dbProvider.RateLimitID = existing.RateLimitID
 		}
 
-		// Upsert provider (create or update if exists).
+		// Upsert provider (create or update if exists).  Targets the
+		// composite (tenant_id, name) unique constraint introduced by
+		// the multi-tenant migration so two tenants can carry a
+		// provider with the same name without colliding.
 		if err := txDB.WithContext(ctx).Clauses(
 			clause.OnConflict{
-				Columns:   []clause.Column{{Name: "name"}},
+				Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "name"}},
 				UpdateAll: true,
 			},
 			clause.Returning{Columns: []clause.Column{{Name: "id"}}},
@@ -684,8 +700,14 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 				}
 			}
 			dbKey := tables.TableKey{
-				Provider:           dbProvider.Name,
-				ProviderID:         dbProvider.ID,
+				Provider:   dbProvider.Name,
+				ProviderID: dbProvider.ID,
+				// Inherit the provider's tenant.  Same reasoning as the
+				// dbProvider above: startup-time config sync has no
+				// request context to read from, so we stamp the default
+				// explicitly to satisfy the composite (tenant_id, name)
+				// upsert constraint.
+				TenantID:           dbProvider.TenantID,
 				KeyID:              key.ID,
 				Name:               key.Name,
 				Value:              key.Value,
@@ -764,8 +786,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 					return s.parseGormError(err)
 				}
 			} else if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-				// KeyID not found, try fallback lookup by Name (handles config reload with new UUID)
-				result = txDB.WithContext(ctx).Where("name = ?", dbKey.Name).First(&existingKey)
+				// KeyID not found, try fallback lookup by Name (handles config reload with new UUID).
+				// Scope the lookup to the same tenant we're about to write into — without
+				// this, a key created via the tenant-scoped admin API (e.g. tenant_id=acme)
+				// could be matched as the "existing" row for a config.json sync that
+				// writes tenant_id=default, then the Save() at line 801 trips the composite
+				// (tenant_id, name) unique with "API key names must be unique across providers".
+				result = txDB.WithContext(ctx).Where("tenant_id = ? AND name = ?", dbKey.TenantID, dbKey.Name).First(&existingKey)
 				if result.Error == nil {
 					// Found by name - update existing key, preserve original KeyID
 					dbKey.ID = existingKey.ID                             // Keep the same database ID

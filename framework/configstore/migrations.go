@@ -758,6 +758,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationUniqueTeamNames(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationTenantScopedTeamNameUnique(ctx, db); err != nil {
+		return err
+	}
 	if err := migrationDropAllowDirectKeysColumn(ctx, db); err != nil {
 		return err
 	}
@@ -8368,8 +8371,14 @@ func migrationUniqueTeamNames(ctx context.Context, db *gorm.DB) error {
 				}
 			}
 
-			// Add the unique index. Skip if it already exists.
-			if !tx.Migrator().HasIndex(&tables.TableTeam{}, "idx_governance_teams_name") {
+			// Add the unique index. Skip if either the legacy single-column
+			// form or its composite (tenant_id, name) successor already
+			// exists — TableTeam.Name's struct tag now references
+			// idx_governance_teams_tenant_name, so a CreateIndex call on
+			// fresh DBs (post-migrationTenantScopedTeamNameUnique) would
+			// re-create the composite and trip "already exists".
+			if !tx.Migrator().HasIndex(&tables.TableTeam{}, "idx_governance_teams_name") &&
+				!tx.Migrator().HasIndex(&tables.TableTeam{}, "idx_governance_teams_tenant_name") {
 				if err := tx.Migrator().CreateIndex(&tables.TableTeam{}, "Name"); err != nil {
 					return fmt.Errorf("create unique index on governance_teams.name: %w", err)
 				}
@@ -8378,6 +8387,42 @@ func migrationUniqueTeamNames(ctx context.Context, db *gorm.DB) error {
 		},
 		Rollback: func(tx *gorm.DB) error {
 			_ = tx.Migrator().DropIndex(&tables.TableTeam{}, "idx_governance_teams_name")
+			return nil
+		},
+	})
+}
+
+// migrationTenantScopedTeamNameUnique flips the legacy global name unique
+// index on governance_teams to a composite (tenant_id, name) so two
+// tenants can both register a team called "engineering". Must run after
+// the team rows already carry tenant_id (which they do on mt-header
+// because the column has `default:default` and every existing row is
+// either default or backfilled).
+//
+// Idempotent: drops the legacy index if present, creates the composite
+// if absent. Safe on fresh DBs (the struct-tag form means the table is
+// created with the composite already in place).
+func migrationTenantScopedTeamNameUnique(ctx context.Context, db *gorm.DB) error {
+	return RunSingleMigration(ctx, nil, db, &migrator.Migration{
+		ID: "tenant_scoped_name_unique_teams",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+
+			if mig.HasIndex(&tables.TableTeam{}, "idx_governance_teams_name") {
+				if err := mig.DropIndex(&tables.TableTeam{}, "idx_governance_teams_name"); err != nil {
+					return fmt.Errorf("drop legacy index idx_governance_teams_name: %w", err)
+				}
+			}
+			if !mig.HasIndex(&tables.TableTeam{}, "idx_governance_teams_tenant_name") {
+				if err := mig.CreateIndex(&tables.TableTeam{}, "idx_governance_teams_tenant_name"); err != nil {
+					return fmt.Errorf("create composite index idx_governance_teams_tenant_name: %w", err)
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			_ = tx.Migrator().DropIndex(&tables.TableTeam{}, "idx_governance_teams_tenant_name")
 			return nil
 		},
 	})
@@ -9877,14 +9922,30 @@ func migrationAddTenantsAndTenantIDColumns(ctx context.Context, db *gorm.DB) err
 			//      - providers:       idx_config_providers_name (gorm default)
 			//      - keys:            idx_key_name (explicit struct tag)
 			//      - mcp_clients:     idx_config_mcp_clients_name (gorm default)
+			// NB: we INTENTIONALLY do NOT drop the legacy single-column
+			// `name` unique indexes here.  The OSS code has many upsert
+			// sites that target the legacy constraint via
+			// `clause.OnConflict{Columns: []clause.Column{{Name: "name"}}}`
+			// (e.g. UpdateProvidersConfig in rdb.go); dropping the
+			// underlying index makes those upserts fail with
+			// "ON CONFLICT clause does not match any PRIMARY KEY or
+			// UNIQUE constraint" at startup.
+			//
+			// Trade-off: the legacy index forbids two tenants from
+			// having a provider with the same `name` at the DB level.
+			// The header-model GORM tenant-scope callback still
+			// enforces isolation at the application layer (every SELECT
+			// / UPDATE / DELETE is implicitly scoped to the caller's
+			// tenant), so this constraint only bites operators trying
+			// to create cross-tenant name collisions through the admin
+			// API.  When the upsert sites are migrated to target the
+			// composite `(tenant_id, name)` constraint we can revisit
+			// dropping the legacy index here.
 			legacyDrops := []struct {
 				model   any
 				idxName string
 			}{
-				{&tables.TableVirtualKey{}, "idx_virtual_key_name"},
-				{&tables.TableProvider{}, "idx_config_providers_name"},
-				{&tables.TableKey{}, "idx_key_name"},
-				{&tables.TableMCPClient{}, "idx_config_mcp_clients_name"},
+				// Intentionally empty — see comment above.
 			}
 			for _, d := range legacyDrops {
 				if mig.HasIndex(d.model, d.idxName) {

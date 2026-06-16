@@ -89,24 +89,45 @@ func hasTenantColumn(tx *gorm.DB) bool {
 // context by the tenant-resolver middleware, or empty when no header
 // was present (in which case the column default + lack of WHERE
 // predicate combine to give single-tenant semantics).
+//
+// The middleware stores the value under TWO forms because of
+// fasthttp + Go interface{} key semantics:
+//
+//   - the typed schemas.BifrostContextKey (preferred — used by
+//     BifrostContext.Value lookups on the inference path)
+//   - the stringified form (because fasthttp.RequestCtx.SetUserValue
+//     stores by interface{} equality, and a string key doesn't match
+//     a typed-string key on lookup; ctx.Value(typedKey) misses what
+//     ctx.SetUserValue(stringKey, ...) put there)
+//
+// Try the typed key first, fall back to the string form.
 func tenantFromContext(ctx context.Context) (string, bool) {
 	if ctx == nil {
 		return "", false
 	}
-	v := ctx.Value(multitenant.BifrostContextKeyTenantID)
-	if v == nil {
-		return "", false
+	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			return s, true
+		}
 	}
-	s, ok := v.(string)
-	if !ok || s == "" {
-		return "", false
+	if v := ctx.Value(string(multitenant.BifrostContextKeyTenantID)); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			return s, true
+		}
 	}
-	return s, true
+	return "", false
 }
 
 // scopeQueryByTenant is the SELECT / UPDATE / DELETE callback.  It
-// appends a `tenant_id = ?` predicate to the statement when the model
-// has a TenantID column AND the ctx has a tenant id.
+// appends a `<table>.tenant_id = ?` predicate to the statement when
+// the model has a TenantID column AND the ctx has a tenant id.
+//
+// The column is qualified with the primary table name so JOINs across
+// two tenant-scoped tables (e.g. config_keys -> config_providers,
+// both of which carry tenant_id) don't throw "ambiguous column name:
+// tenant_id" at the DB. The qualification falls back to bare
+// `tenant_id` only when the statement's primary table isn't known
+// (raw SQL paths that bypassed the schema parser).
 func scopeQueryByTenant(tx *gorm.DB) {
 	if tx.Error != nil || !hasTenantColumn(tx) {
 		return
@@ -115,7 +136,25 @@ func scopeQueryByTenant(tx *gorm.DB) {
 	if !ok {
 		return
 	}
-	tx.Statement.Where(tenantColumn+" = ?", tid)
+	tx.Statement.Where(qualifyTenantColumn(tx)+" = ?", tid)
+}
+
+// qualifyTenantColumn returns "<primary_table>.tenant_id" when the
+// statement's table can be resolved, falling back to bare "tenant_id"
+// otherwise. Centralised so future callbacks that need the same
+// JOIN-safe column ref reuse it.
+func qualifyTenantColumn(tx *gorm.DB) string {
+	if tx.Statement == nil {
+		return tenantColumn
+	}
+	table := tx.Statement.Table
+	if table == "" && tx.Statement.Schema != nil {
+		table = tx.Statement.Schema.Table
+	}
+	if table == "" {
+		return tenantColumn
+	}
+	return table + "." + tenantColumn
 }
 
 // populateTenantIDOnCreate is the INSERT callback.  Sets TenantID
