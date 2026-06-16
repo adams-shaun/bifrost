@@ -35,8 +35,17 @@ via the bifrost-aigw chart workflow. To pick up this commit:
 # from /home/sadams/projtmp/bifrost
 make clean-patches            # back to vanilla source
 make apply-patches            # re-applies the now-fixed patch2
-make test-k8s-image           # builds local/bifrost:f5g
+
+# Build the local-modules Docker image; emits `bifrost`, `bifrost:<sha>`,
+# `bifrost:latest`. LOCAL=1 routes through transports/Dockerfile.local so
+# the in-tree multitenant/ module + framework changes are linked in.
+make docker-image LOCAL=1
+
+# Retag for the helm chart (charts/bifrost values.yaml pins
+# repository=local/bifrost, tag=f5g) and import into the k3d cluster.
+docker tag bifrost:latest local/bifrost:f5g
 k3d image import local/bifrost:f5g -c bm
+
 kubectl -n bifrost-system rollout restart statefulset/bifrost
 kubectl -n bifrost-system rollout status statefulset/bifrost --timeout=120s
 ```
