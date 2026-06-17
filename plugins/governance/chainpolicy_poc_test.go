@@ -48,11 +48,26 @@ import (
 // --- Framework-level types (would graduate to multitenant/chainpolicy/) ---
 
 // ChainStep names a plugin and the variant the policy selected for THIS
-// request. Why is the rule name that picked this step — feeds the
+// request, plus an optional config map that the policy supplies to refine
+// the variant. Why is the rule name that picked this step — feeds the
 // per-request audit log.
+//
+// The hybrid named-variant + typed-config model (see chainpolicy_examples_test.go
+// for concrete plugins): the *headline decision* stays a named variant
+// (auditable, enumerable), and Config carries per-request overrides for the
+// variant's tunable knobs. Each plugin author owns:
+//   - the variant catalog
+//   - each variant's typed config schema
+//   - which keys are tenant-only (set at TenantLoader, immutable per request)
+//     vs. request-overridable (policy may supply via Config)
+//
+// At policy-load time, ValidatePolicyAgainstPlugins (see examples) decodes
+// each step's Config against the variant's schema — admins discover broken
+// configs at deploy, not at request time.
 type ChainStep struct {
 	Plugin  string
 	Variant string
+	Config  map[string]any
 	Why     string
 }
 
