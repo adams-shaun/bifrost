@@ -94,23 +94,29 @@ It is **not fine** if any worker ever does `gs.configStore.GetVirtualKeys(ctx)`
 proposal in §3 addresses this by deriving the tracker's worker context
 from a tenant-scoped parent.
 
-#### Constraint 2 — `Init` has 8 dependencies; the loader must satisfy them
+#### Constraint 2 — `Init` has 8 dependencies; the loader needs them all
 
 `governance.Init` takes
 `(ctx, *Config, logger, configStore, *GovernanceConfig, *modelCatalog, *mcpCatalog, InMemoryStore)`
 ([main.go:132-141](../../plugins/governance/main.go#L132-L141)). The
-`TenantLoader` at
+`TenantLoader` closure at
 [server/multitenant.go:104](../../transports/bifrost-http/server/multitenant.go#L104)
-already has `logger`, `configStore`, `modelCatalog`, `mcpCatalog` — those
-are process-globals it can pass through. It does NOT have `Config`,
-`GovernanceConfig`, or `InMemoryStore` ready at acquire-time; those come
-from the root runtime's pre-built plugin list today.
+is built over `s` (the `BifrostHTTPServer`), so it has access to every
+one of those handles via `s.Config` and friends — same as the root
+server.go path that constructs the singleton today. No abstraction
+needed; the loader just calls `governance.Init(scopedCtx, s.Config.GovernanceConfig, …)`
+inline.
 
-**Implication:** the loader needs either (a) a snapshot of the root
-runtime's plugin construction args, or (b) a **factory closure**
-captured at server startup that the loader calls per-tenant with the
-tenant id stamped on a tenant-scoped ctx. (b) is cleaner and proposed
-in §3.
+The only thing it doesn't have at construction time is `Config` (the
+plugin's own `*governance.Config` — boolean flags like `IsVkMandatory`,
+`IsEnterprise`). That comes from the root runtime's plugin-config map
+keyed by plugin name. Easy to look up; not a real constraint, just
+plumbing.
+
+**Implication:** direct in-loader construction is straightforward.
+There's no need to introduce a factory/closure abstraction or a new
+`BifrostConfig` field — the loader knows enough at acquire-time to call
+the constructor itself.
 
 #### Constraint 3 — `InMemoryStore` is currently shared via the shim
 
@@ -133,61 +139,57 @@ trade-off called out in §3.
 
 ## 3. Proposed wiring
 
-### 3.1 Interface change: `BifrostConfig.LLMPluginFactories`
+### 3.1 No OSS upstream interface change
 
-The minimum interface change is one optional field on `BifrostConfig`:
+Plugin instances are long-lived — one per tenant runtime, constructed at
+`multitenant.Manager.Acquire` time and torn down via `Cleanup()` at
+`EvictTenant`. That's the same lifetime as the runtime itself. There's
+no per-request construction in this design.
 
-```go
-// schemas/config.go
-type BifrostConfig struct {
-    // ... existing fields ...
+So the existing `BifrostConfig.LLMPlugins []schemas.LLMPlugin` field is
+sufficient. The TenantLoader already runs at the right lifecycle point
+(once per tenant, with a tenant-scoped runtime ctx in hand). It builds
+per-tenant plugin instances *directly* and passes them through the
+standard `LLMPlugins` field.
 
-    // LLMPluginFactories, when set, REPLACES LLMPlugins for the runtime
-    // being constructed. bifrost.Init calls each factory with the
-    // BifrostConfig's ctx and uses the returned plugin in the chain.
-    // When nil (default / OSS), Init falls back to LLMPlugins as today.
-    //
-    // The factory pattern lets the multitenant TenantLoader build
-    // per-tenant plugin instances at Acquire time without changing the
-    // LLMPlugin interface or the request-side hook signatures.
-    LLMPluginFactories []func(ctx context.Context) (schemas.LLMPlugin, error)
-}
-```
+**No `BifrostConfig` change. No new `bifrost.Init` code path. Zero OSS
+upstream surface to maintain.** The per-tenant model is achieved entirely
+by what the multitenant `TenantLoader` puts in `LLMPlugins`.
 
-`bifrost.Init` becomes:
+This is also why the `ShareLLMPlugins` shim
+([multitenant/plugin_share.go:61-82](../../multitenant/plugin_share.go#L61-L82))
+**goes away** for stateful plugins: it only existed to no-op `Cleanup()`
+so a per-tenant `bifrost.Shutdown()` couldn't kill the singleton's
+worker pool. With per-tenant instances, `Cleanup()` running on eviction
+is the *correct* behavior — it's how the per-tenant tracker flushes its
+in-memory budget snapshots back to the DB before the goroutine pool
+exits. (Today's `tracker.Cleanup` already does
+`DumpBudgets(context.Background(), nil)` at shutdown; per-tenant
+instances inherit that for free.)
 
-```go
-plugins := config.LLMPlugins
-if len(config.LLMPluginFactories) > 0 {
-    for _, factory := range config.LLMPluginFactories {
-        p, err := factory(bifrostCtx)
-        if err != nil {
-            return nil, fmt.Errorf("plugin factory: %w", err)
-        }
-        plugins = append(plugins, p)
-    }
-}
-```
+The shim still wraps any *stateless* shared plugins that genuinely want
+process-global lifetime (logging, otel, jsonparser, compat). The opt-in
+boundary is "is this plugin per-tenant or shared?" — set at TenantLoader
+construction time, not deep in the plugin interface.
 
-This is **additive** at the OSS upstream — `LLMPluginFactories` is a new
-optional field, existing callers (`LLMPlugins`) continue to work. The
-patch stays small + holds against upstream rebases.
-
-### 3.2 TenantLoader builds per-tenant factories
+### 3.2 TenantLoader builds per-tenant plugin instances directly
 
 In
 [`server/multitenant.go::newTenantLoader`](../../transports/bifrost-http/server/multitenant.go#L104),
-replace the current `LLMPlugins: ShareLLMPlugins(...)` line with:
+replace the current `LLMPlugins: ShareLLMPlugins(...)` line with a
+direct construction:
 
 ```go
+perTenantPlugins, err := s.buildPerTenantLLMPlugins(scopedCtx, tid)
+if err != nil {
+    return schemas.BifrostConfig{}, fmt.Errorf("multitenant: build per-tenant plugins for %q: %w", tid, err)
+}
+
 return schemas.BifrostConfig{
     Account:            acct,
     InitialPoolSize:    s.Config.ClientConfig.InitialPoolSize,
     DropExcessRequests: s.Config.ClientConfig.DropExcessRequests,
-    // Factories are called once per tenant inside bifrost.Init with
-    // the tenant-scoped ctx (scopedCtx already has tenant id on it
-    // via the dispatcher middleware).
-    LLMPluginFactories: s.buildPerTenantPluginFactories(scopedCtx, tid),
+    LLMPlugins:         perTenantPlugins,
     MCPPlugins:         multitenant.ShareMCPPlugins(s.Config.GetLoadedMCPPlugins()),
     OAuth2Provider:     s.Config.OAuthProvider,
     Logger:             logger,
@@ -195,13 +197,23 @@ return schemas.BifrostConfig{
 }, nil
 ```
 
-where `buildPerTenantPluginFactories` returns a closure per stateful
-plugin — for each entry in `s.Config.GetLoadedLLMPlugins()`, the server
-knows which constructor + args to use (it built the root instance the
-same way at startup, see [`server/plugins.go`](../../transports/bifrost-http/server/plugins.go)).
-The closures capture the process-global handles (logger, configStore,
-modelCatalog, mcpCatalog) and the tenant id; they're called once per
-tenant at first `Manager.Acquire` and again after every `EvictTenant`.
+`buildPerTenantLLMPlugins` is a small helper on the server that
+iterates `s.Config.GetLoadedLLMPlugins()` and, for each entry:
+
+- **Stateful & per-tenant** (governance, eventually prompts) — calls the
+  plugin's constructor directly (e.g.
+  `governance.Init(scopedCtx, cfg, logger, s.Config.ConfigStore, ...)`).
+  `scopedCtx` already carries the tenant id, so `loadFromDatabase` filters
+  via the GORM scope callback (patch2). Resulting instance goes into the
+  returned slice unwrapped.
+- **Stateless or singleton-OK** (logging, otel, semanticcache,
+  jsonparser, compat, mocker) — wraps the root's instance with
+  `ShareLLMPlugins`'s shim entry, same as today. `Cleanup` stays no-op
+  for these.
+
+The branching lives in `buildPerTenantLLMPlugins`. The classification is
+intentionally a small switch table; adding prompts later (after that
+plugin gets its own per-tenant constructor parity) is a one-line addition.
 
 ### 3.3 Constraint 1 fix: derive the tracker ctx from the plugin ctx
 
@@ -262,21 +274,28 @@ prompts is the natural second. Telemetry / maxim are deferred.
 
 ## 5. Patch series outline
 
-Roughly three patches, in order:
+Two patches, in order:
 
-- **patch17 — `plugin-factory-shim`**: add
-  `BifrostConfig.LLMPluginFactories` to `core/schemas/config.go` and the
-  factory iteration in `core/bifrost.go::Init`. Pure additive change;
-  zero existing-call-site impact. Unit-tested in isolation.
-- **patch18 — `governance-tenant-init`**: tracker ctx derivation
-  (Constraint 1 fix), per-tenant `InMemoryStore` (Constraint 3
-  decision), no TenantLoader wiring yet. Validates the plugin can be
-  rebuilt cleanly per tenant.
-- **patch19 — `tenant-loader-governance-factory`**: wire
-  `buildPerTenantPluginFactories` into
-  `server/multitenant.go::newTenantLoader`. Flips the singleton model
-  to per-tenant for governance. Closes I10 for governance specifically.
-  Same loader pattern can later be extended to prompts.
+- **patch17 — `governance-tenant-init`**: tracker ctx derivation
+  (Constraint 1 fix at [`tracker.go:63`](../../plugins/governance/tracker.go#L63)),
+  per-tenant `InMemoryStore` (Constraint 3 decision). All-plugin-side;
+  no TenantLoader wiring yet. The OSS single-tenant path stays
+  bit-identical (tracker parent ctx is still `context.Background()`
+  when called from server.go's root construction). Unit-tested by
+  extending [tenant_isolation_poc_test.go](../../plugins/governance/tenant_isolation_poc_test.go)
+  with a tracker-ctx-cancellation assertion (cancel the parent → workers
+  exit).
+- **patch18 — `tenant-loader-per-tenant-governance`**: add
+  `buildPerTenantLLMPlugins` to
+  `server/multitenant.go`, switch `newTenantLoader` to use it. The
+  classifier wraps stateless plugins via `ShareLLMPlugins` (today's
+  behaviour) and constructs stateful plugins via direct `Init` calls
+  with the tenant-scoped ctx. Flips the singleton model to per-tenant
+  for governance specifically; closes I10 for governance. Same
+  classifier extends to prompts later.
+
+No OSS upstream interface change in either patch — both modifications
+stay inside the f5xc multitenant layer + the governance plugin.
 
 Each patch follows the established overlay convention (source effects
 committed to `f5xc-mt-overlay` + `f5xc-patches/patchN/` for downstream

@@ -112,7 +112,8 @@ func TestPluginIsolationPOC_TwoTenantsSameBudgetID(t *testing.T) {
 // is wired together. This is the "would the design doc's TenantLoader-built
 // per-tenant plugin model actually work?" check.
 //
-// Constraints surfaced while writing this:
+// Constraints surfaced while writing this — each spelled out in the
+// design doc at docs/multi-tenant-f5/06-plugin-isolation.md:
 //
 //   1. NewUsageTracker (tracker.go:63) creates its background context with
 //      context.Background() — NOT derived from the plugin's tenant-scoped
@@ -120,26 +121,26 @@ func TestPluginIsolationPOC_TwoTenantsSameBudgetID(t *testing.T) {
 //      the workers themselves run with an UNSCOPED context. If/when the
 //      tracker workers do reads through configStore (e.g. the periodic
 //      reset worker), those reads won't have a tenant on ctx, so the GORM
-//      scope callback won't filter. This is fine in the per-tenant model
-//      ONLY IF the worker's DB scope is bounded by the budget id it's
-//      operating on (which is unique-by-tenant). Spelled out in the design
-//      doc as Constraint #3.
+//      scope callback won't filter. The design doc proposes a one-line fix
+//      (Constraint 1 in §2 of the doc; remediation in §3.3).
 //
 //   2. GovernancePlugin.Cleanup() is per-instance — calling it on instance
 //      A doesn't touch B. So a TenantLoader-built per-tenant plugin can be
 //      cleanly torn down when its owning tenant runtime is evicted by
 //      multitenant.Manager. No ShareLLMPlugins shim needed for this lane.
 //      That's a real win — the shim only existed to NO-OP Cleanup so a
-//      per-tenant Shutdown couldn't kill the singleton's worker pool.
+//      per-tenant Shutdown couldn't kill the singleton's worker pool. It's
+//      why the doc proposes the TenantLoader construct per-tenant
+//      instances directly (no factory abstraction) and pass them through
+//      the standard LLMPlugins field, unwrapped.
 //
-//   3. The plugin's Init call signature is heavy (8 args including a config
-//      store, a model catalog, an MCP catalog, an in-memory store). For a
-//      TenantLoader to build per-tenant instances, it needs all of those
-//      handles. Most are already process-globals the loader has (logger,
-//      configStore, modelCatalog) — but the inMemoryStore is currently
-//      shared via ShareLLMPlugins. Whether per-tenant instances need their
-//      own inMemoryStore vs sharing the root's is an open question
-//      surfaced in the doc.
+//   3. governance.Init has an 8-arg surface (config store, model catalog,
+//      MCP catalog, in-memory store, …). The TenantLoader closure has all
+//      of those via s.Config (the BifrostHTTPServer it's built over), so
+//      calling Init inline is straightforward — no factory, no
+//      BifrostConfig change. The one open decision is whether the
+//      per-tenant instance should get its own InMemoryStore (recommended,
+//      per §3.4 of the doc) or share the root's; today's shim shares it.
 func TestPluginIsolationPOC_FullPluginInstances(t *testing.T) {
 	logger := NewMockLogger()
 	ctx := context.Background()
