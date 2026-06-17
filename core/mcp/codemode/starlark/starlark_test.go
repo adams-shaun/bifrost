@@ -31,7 +31,7 @@ func (m *testClientManager) GetClientForTool(toolName string) *schemas.MCPClient
 	return nil
 }
 
-func (m *testClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
+func (m *testClientManager) GetClientByName(_ /*tenantID*/, clientName string) *schemas.MCPClientState {
 	return m.clients[clientName]
 }
 

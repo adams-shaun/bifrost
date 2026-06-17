@@ -234,7 +234,7 @@ func (s *StarlarkCodeMode) executeCode(ctx *schemas.BifrostContext, code string)
 	s.logger.Debug("%s GetToolPerClient returned %d clients", codemcp.CodeModeLogPrefix, len(availableToolsPerClient))
 
 	for clientName, tools := range availableToolsPerClient {
-		client := s.clientManager.GetClientByName(clientName)
+		client := s.clientManager.GetClientByName("", clientName)
 		if client == nil {
 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
 			continue

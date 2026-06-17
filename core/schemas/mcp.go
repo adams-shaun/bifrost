@@ -190,6 +190,13 @@ const (
 type MCPClientConfig struct {
 	ID                  string            `json:"client_id"`                       // Client ID
 	Name                string            `json:"name"`                            // Client name
+	// TenantID scopes this client to a tenant in MT-mode deployments. The OSS
+	// single-tenant path leaves this empty; the f5xc loader fills it from the
+	// configstore's tenant_id column so two tenants can register the same
+	// Name without colliding in the manager's name-collision check. Hidden
+	// from the public JSON contract (tag "-") so the wire shape stays
+	// upstream-compatible — admin handlers stamp it from the BifrostContext.
+	TenantID            string            `json:"-"`
 	IsCodeModeClient    bool              `json:"is_code_mode_client"`             // Whether the client is a code mode client
 	ConnectionType      MCPConnectionType `json:"connection_type"`                 // How to connect (HTTP, STDIO, SSE, or InProcess)
 	ConnectionString    *EnvVar           `json:"connection_string,omitempty"`     // HTTP or SSE URL (required for HTTP or SSE connections)
@@ -410,7 +417,8 @@ const (
 // MCPClientState represents a connected MCP client with its configuration and tools.
 // It is used internally by the MCP manager to track the state of a connected MCP client.
 type MCPClientState struct {
-	Name            string                   // Unique name for this client
+	Name            string                   // Unique name for this client (within a tenant scope, when MT is enabled)
+	TenantID        string                   // Owning tenant id in MT-mode; empty for the OSS single-tenant path. Set by AddClient from ExecutionConfig.TenantID.
 	Conn            *client.Client           // Active MCP client connection
 	ExecutionConfig *MCPClientConfig         // Tool filtering settings
 	ToolMap         map[string]ChatTool      // Available tools mapped by name

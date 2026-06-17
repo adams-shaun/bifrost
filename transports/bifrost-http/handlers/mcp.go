@@ -556,6 +556,7 @@ func (h *MCPHandler) addMCPClient(ctx *fasthttp.RequestCtx) {
 		pendingConfig := schemas.MCPClientConfig{
 			ID:                    req.ClientID,
 			Name:                  req.Name,
+			TenantID:              TenantIDFromCtx(ctx), // f5xc MT scope — survives OAuth flow into the runtime AddMCPClient call
 			IsCodeModeClient:      req.IsCodeModeClient,
 			IsPingAvailable:       &isPingAvailable,
 			ToolSyncInterval:      toolSyncInterval,
@@ -648,6 +649,7 @@ func (h *MCPHandler) addMCPClient(ctx *fasthttp.RequestCtx) {
 		pendingConfig := schemas.MCPClientConfig{
 			ID:                    req.ClientID,
 			Name:                  req.Name,
+			TenantID:              TenantIDFromCtx(ctx), // f5xc MT scope — survives OAuth flow into the runtime AddMCPClient call
 			IsCodeModeClient:      req.IsCodeModeClient,
 			IsPingAvailable:       req.IsPingAvailable,
 			ToolSyncInterval:      toolSyncInterval,
@@ -707,10 +709,15 @@ func (h *MCPHandler) addMCPClient(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// Convert to schemas.MCPClientConfig for runtime bifrost client (without tool_pricing)
+	// Convert to schemas.MCPClientConfig for runtime bifrost client (without tool_pricing).
+	// f5xc MT: stamp TenantID from the request ctx so the MCPManager's
+	// (tenantID, name) collision check (see core/mcp/utils.go::GetClientByName)
+	// only fights names within the same tenant. In OSS single-tenant mode
+	// TenantIDFromCtx returns "" — preserving the upstream global-name rule.
 	schemasConfig := &schemas.MCPClientConfig{
 		ID:                    req.ClientID,
 		Name:                  req.Name,
+		TenantID:              TenantIDFromCtx(ctx),
 		IsCodeModeClient:      req.IsCodeModeClient,
 		ConnectionType:        schemas.MCPConnectionType(req.ConnectionType),
 		ConnectionString:      req.ConnectionString,

@@ -1575,6 +1575,7 @@ func (s *RDBConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig, 
 				clientConfigs[i] = &schemas.MCPClientConfig{
 					ID:                        dbClient.ClientID,
 					Name:                      dbClient.Name,
+					TenantID:                  dbClient.TenantID, // f5xc MT scope — see core/mcp/utils.go::GetClientByName
 					IsCodeModeClient:          dbClient.IsCodeModeClient,
 					ConnectionType:            schemas.MCPConnectionType(dbClient.ConnectionType),
 					ConnectionString:          dbClient.ConnectionString,
@@ -1615,6 +1616,7 @@ func (s *RDBConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig, 
 		clientConfigs[i] = &schemas.MCPClientConfig{
 			ID:                        dbClient.ClientID,
 			Name:                      dbClient.Name,
+			TenantID:                  dbClient.TenantID, // f5xc MT scope — see core/mcp/utils.go::GetClientByName
 			IsCodeModeClient:          dbClient.IsCodeModeClient,
 			ConnectionType:            schemas.MCPConnectionType(dbClient.ConnectionType),
 			ConnectionString:          dbClient.ConnectionString,
@@ -1700,6 +1702,7 @@ func (s *RDBConfigStore) GetMCPClientConfigByID(ctx context.Context, id string) 
 	return &schemas.MCPClientConfig{
 		ID:                        dbClient.ClientID,
 		Name:                      dbClient.Name,
+		TenantID:                  dbClient.TenantID, // f5xc MT scope — see core/mcp/utils.go::GetClientByName
 		IsCodeModeClient:          dbClient.IsCodeModeClient,
 		ConnectionType:            schemas.MCPConnectionType(dbClient.ConnectionType),
 		ConnectionString:          dbClient.ConnectionString,

@@ -138,6 +138,7 @@ func NewMCPManager(ctx context.Context, config schemas.MCPConfig, oauth2Provider
 					if _, exists := manager.clientMap[clientConfig.ID]; !exists {
 						manager.clientMap[clientConfig.ID] = &schemas.MCPClientState{
 							Name:            clientConfig.Name,
+							TenantID:        clientConfig.TenantID,
 							ExecutionConfig: clientConfig,
 							State:           schemas.MCPConnectionStateDisconnected,
 							ToolMap:         make(map[string]schemas.ChatTool),

@@ -97,7 +97,7 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 	matchCount := 0
 
 	for clientName, tools := range availableToolsPerClient {
-		client := s.clientManager.GetClientByName(clientName)
+		client := s.clientManager.GetClientByName("", clientName)
 		if client == nil {
 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
 			continue
@@ -168,7 +168,7 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 			if bindingLevel == schemas.CodeModeBindingLevelServer {
 				availableFiles = append(availableFiles, fmt.Sprintf("servers/%s.pyi", name))
 			} else {
-				client := s.clientManager.GetClientByName(name)
+				client := s.clientManager.GetClientByName("", name)
 				if client != nil && client.ExecutionConfig.IsCodeModeClient {
 					if tools, ok := availableToolsPerClient[name]; ok {
 						for _, tool := range tools {

@@ -19,7 +19,10 @@ import (
 
 // ClientManager interface for accessing MCP clients and tools
 type ClientManager interface {
-	GetClientByName(clientName string) *schemas.MCPClientState
+	// GetClientByName resolves a client by (tenantID, name). Pass "" for
+	// tenantID to fall back to the OSS single-tenant lookup ("any tenant"
+	// match), which is what most CodeMode call sites do today.
+	GetClientByName(tenantID, clientName string) *schemas.MCPClientState
 	GetClientForTool(toolName string) *schemas.MCPClientState
 	GetToolPerClient(ctx context.Context) map[string][]schemas.ChatTool
 	GetPluginPipeline() PluginPipeline
@@ -183,10 +186,11 @@ func (m *ToolsManager) GetAvailableTools(ctx *schemas.BifrostContext) []schemas.
 	// Track tool names to prevent duplicates
 	seenToolNames := make(map[string]bool)
 
+	tenantID := TenantIDFromBifrostContext(ctx)
 	for clientName, clientTools := range availableToolsPerClient {
-		client := m.clientManager.GetClientByName(clientName)
+		client := m.clientManager.GetClientByName(tenantID, clientName)
 		if client == nil {
-			m.logger.Warn("%s Client %s not found, skipping", MCPLogPrefix, clientName)
+			m.logger.Warn("%s Client %s (tenant=%q) not found, skipping", MCPLogPrefix, clientName, tenantID)
 			continue
 		}
 		if client.ExecutionConfig.IsCodeModeClient {

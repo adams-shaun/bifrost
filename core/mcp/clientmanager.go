@@ -96,8 +96,11 @@ func (m *MCPManager) AddClient(config *schemas.MCPClientConfig) error {
 	// Make a copy of the config to use after unlocking
 	configCopy := config
 
-	// Check if a client with the same name already exists (GetClientByName has its own lock)
-	if client := m.GetClientByName(config.Name); client != nil {
+	// Check if a client with the same name already exists in this tenant's
+	// scope (GetClientByName has its own lock). The tenant id is filled by
+	// the loader / admin handler from the BifrostContext — in OSS mode it's
+	// empty and falls back to the upstream global-name semantics.
+	if client := m.GetClientByName(config.TenantID, config.Name); client != nil {
 		return fmt.Errorf("MCP client with name '%s' already exists", config.Name)
 	}
 
@@ -112,6 +115,7 @@ func (m *MCPManager) AddClient(config *schemas.MCPClientConfig) error {
 	if config.Disabled {
 		clientState := &schemas.MCPClientState{
 			Name:            config.Name,
+			TenantID:        config.TenantID,
 			ExecutionConfig: config,
 			State:           schemas.MCPConnectionStateDisabled,
 			ToolMap:         make(map[string]schemas.ChatTool),
@@ -138,6 +142,7 @@ func (m *MCPManager) AddClient(config *schemas.MCPClientConfig) error {
 	// Create placeholder entry
 	m.clientMap[config.ID] = &schemas.MCPClientState{
 		Name:            config.Name,
+		TenantID:        config.TenantID,
 		ExecutionConfig: config,
 		ToolMap:         make(map[string]schemas.ChatTool),
 		ToolNameMapping: make(map[string]string),
@@ -881,6 +886,7 @@ func (m *MCPManager) connectToMCPClient(config *schemas.MCPClientConfig) error {
 	// during connection attempts; it transitions to Connected only on success.
 	m.clientMap[config.ID] = &schemas.MCPClientState{
 		Name:            config.Name,
+		TenantID:        config.TenantID,
 		ExecutionConfig: config,
 		State:           schemas.MCPConnectionStateDisconnected,
 		ToolMap:         make(map[string]schemas.ChatTool),

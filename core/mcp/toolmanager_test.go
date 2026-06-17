@@ -17,7 +17,7 @@ type mockToolClientManager struct {
 	tools []schemas.ChatTool
 }
 
-func (m *mockToolClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
+func (m *mockToolClientManager) GetClientByName(_ /*tenantID*/, clientName string) *schemas.MCPClientState {
 	if clientName == "test-client" {
 		return &schemas.MCPClientState{
 			Name: "test-client",

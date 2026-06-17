@@ -228,6 +228,15 @@ const (
 	CacheNoStoreKey   schemas.BifrostContextKey = "semantic_cache-no_store"   // bool. Skip writing the response to cache (still served from cache on hit).
 )
 
+// f5xc multi-tenant: when the request carries a tenant id on the
+// Bifrost context, prepend it to the resolved cache key so cache
+// buckets are tenant-isolated. We re-declare the typed key here with
+// the same string value used by multitenant.BifrostContextKeyTenantID
+// to avoid importing the multitenant package from the plugin —
+// interface{} equality on schemas.BifrostContextKey holds across
+// packages because BifrostContextKey is a defined string type.
+const tenantContextKey schemas.BifrostContextKey = "x-f5xc-tenant"
+
 type CacheType string
 
 const (
@@ -450,14 +459,26 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 
 // resolveCacheKey returns the per-request cache key (or the configured default)
 // and a bool indicating whether the caller should proceed with caching.
+//
+// f5xc multi-tenant: if the BifrostContext carries a non-empty tenant id
+// under tenantContextKey, the returned key is prefixed with "<tenant>:" so
+// every tenant gets its own cache bucket — both for direct lookups and as a
+// metadata property on semantic-search results. Without this prefix, two
+// tenants sharing the same DefaultCacheKey (or the same per-request key)
+// would read each other's cached responses.
 func (plugin *Plugin) resolveCacheKey(ctx *schemas.BifrostContext) (string, bool) {
+	base := ""
 	if cacheKey, ok := ctx.Value(CacheKey).(string); ok && cacheKey != "" {
-		return cacheKey, true
+		base = cacheKey
+	} else if plugin.config.DefaultCacheKey != "" {
+		base = plugin.config.DefaultCacheKey
+	} else {
+		return "", false
 	}
-	if plugin.config.DefaultCacheKey != "" {
-		return plugin.config.DefaultCacheKey, true
+	if tid, ok := ctx.Value(tenantContextKey).(string); ok && tid != "" {
+		return tid + ":" + base, true
 	}
-	return "", false
+	return base, true
 }
 
 // resolveCacheTypes returns whether direct and semantic search paths should

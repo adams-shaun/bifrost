@@ -9,6 +9,18 @@ LOG_STYLE ?= json
 LOG_LEVEL ?= info
 TEST_REPORTS_DIR ?= test-reports
 GOTESTSUM_FORMAT ?= standard-verbose
+COVERAGE_DIR ?= coverage_out
+# Go module roots covered by `make cmd-unittest`.
+# multitenant ships in-tree on this branch (not vanilla upstream), so include it.
+GO_COVER_MODULES ?= core framework multitenant $(patsubst %/,%,$(dir $(wildcard plugins/*/go.mod))) transports/bifrost-http cli
+# Packages EXCLUDED from `make cmd-unittest`: live-integration suites that need
+# provider API keys or running services (Redis/Weaviate/Qdrant/MCP servers/
+# upstream LLMs). The CI test stage runs without those secrets; run them
+# locally via the `make test-*` targets with $(EXPOSE_ENV). The
+# transports/bifrost-http ROOT package is excluded for its service-dependent
+# TestMain + `//go:embed all:ui` (UI is built separately); its /handlers and
+# /lib subpackages (including the F5XC patch tests) still run.
+GO_COVER_EXCLUDE ?= /core/providers/|/core/internal/llmtests|/core/internal/mcptests|/framework/vectorstore|/transports/bifrost-http$$
 FLOW ?=
 VERSION ?= dev-build
 LOCAL ?=
@@ -66,7 +78,7 @@ define EXPOSE_ENV
 	fi
 endef
 
-.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches verify-patches
+.PHONY: all help dev dev-pulse build-ui build build-cli run run-cli install-air install-pulse clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed run-e2e-api format ui install-newman run-provider-harness-test run-cli-harness-test test-semantic-cache test-semantic-cache-complete _test-semantic-cache-complete-inner apply-patches clean-patches verify-patches cmd-setup-workspace-ci cmd-unittest coverage-all-bl
 
 all: help
 
@@ -345,6 +357,66 @@ clean-patches: ## Reverse F5XC patch overlays (restore vanilla source)
 
 verify-patches: ## Strictly validate the F5XC patch series via `git am` (catches hand-edited / corrupt / drifted .patch files that apply-patches --recount would hide). Run before every commit/push that touches f5xc-patches/.
 	@bash f5xc-patches/verify.sh
+
+# ============================================================================
+# Unit / component tests for CI (the deterministic subset)
+#
+# This branch (f5xc-mt-overlay) ships the FULL patched source in-tree — the
+# `f5xc-patches/` overlay is the downstream-consumable description of those
+# changes, not a precondition for tests. So cmd-unittest does NOT depend on
+# apply-patches: it runs `go test` directly against the already-patched
+# checkout via go.work.local. Downstream consumers (e.g. vesdev) keep using
+# `make apply-patches` first because they start from vanilla source.
+#
+# Mirrors vesdev's cmd-unittest contract:
+#   - GO_COVER_MODULES iterates each module in turn (go list -e tolerates
+#     load errors so one bad package can't blank the whole module)
+#   - GO_COVER_EXCLUDE drops live-integration suites (Redis/Weaviate/etc) +
+#     the bifrost-http root (//go:embed all:ui)
+#   - Per-module JUnit lands in $(TEST_REPORTS_DIR), per-module coverage
+#     profile in $(COVERAGE_DIR)/coverage-<mod>-bl
+#   - `coverage-all-bl` merges the profiles into one HTML + Cobertura report
+# ============================================================================
+cmd-setup-workspace-ci: ## Set up go.work for CI builds (resolves local module deps)
+	@$(ECHO) "$(GREEN)Setting up Go workspace for CI build...$(NC)"
+	@rm -f go.work go.work.sum || true
+	@go work init ./cli ./core ./framework ./multitenant ./transports
+	@for plugin_dir in ./plugins/*/; do \
+		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
+			go work use "$$plugin_dir"; \
+		fi; \
+	done
+	@# Intentionally NOT running `go work sync`: it propagates MVS-resolved
+	@# versions back into every module's go.mod/go.sum, which is a noisy
+	@# maintenance change that belongs in its own commit. CI cares about
+	@# `use`-list resolution, not sync. Run `go work sync` manually when
+	@# you actually want to bump pinned deps across the workspace.
+	@$(ECHO) "$(GREEN)Go workspace ready$(NC)"
+
+cmd-unittest: cmd-setup-workspace-ci install-gotestsum ## Run deterministic Go unit tests against the (already-patched) tree; writes per-module coverage_out/coverage-<mod>-bl profiles + JUnit. Pair with `coverage-all-bl`.
+	@mkdir -p $(TEST_REPORTS_DIR) $(COVERAGE_DIR)
+	@fail=0; \
+	for mod in $(GO_COVER_MODULES); do \
+		[ -d "$$mod" ] || { $(ECHO) "$(YELLOW)>>> $$mod: directory missing, skipping$(NC)"; continue; }; \
+		name=$$(echo $$mod | sed 's#/#-#g'); \
+		pkgs=$$(cd $$mod && go list -e ./... 2>/dev/null | grep -vE "$(GO_COVER_EXCLUDE)"); \
+		if [ -z "$$pkgs" ]; then $(ECHO) "$(YELLOW)>>> $$mod: no unit packages after exclude, skipping$(NC)"; continue; fi; \
+		$(ECHO) "$(GREEN)>>> unittest: $$mod$(NC)"; \
+		( cd $$mod && gotestsum --format=$(GOTESTSUM_FORMAT) \
+			--junitfile=$(CURDIR)/$(TEST_REPORTS_DIR)/coverage-$$name.xml \
+			-- -covermode=atomic -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/coverage-$$name-bl $$pkgs ) || fail=1; \
+	done; \
+	exit $$fail
+
+coverage-all-bl: ## Merge cmd-unittest per-module profiles -> coverage_out/coverage.html + Cobertura + total %
+	@command -v gocovmerge >/dev/null 2>&1 || go install github.com/wadey/gocovmerge@latest
+	@command -v gocover-cobertura >/dev/null 2>&1 || go install github.com/boumenot/gocover-cobertura@latest
+	@$(ECHO) "$(GREEN)>>> Merge coverage for all packages >>>$(NC)"
+	@ls -ltr $(COVERAGE_DIR)/*-bl 2>/dev/null || { $(ECHO) "$(RED)no -bl coverage profiles in $(COVERAGE_DIR)/ (run cmd-unittest first)$(NC)"; exit 1; }
+	gocovmerge $(COVERAGE_DIR)/*-bl > $(COVERAGE_DIR)/cover-all-bl
+	go tool cover -html=$(COVERAGE_DIR)/cover-all-bl -o $(COVERAGE_DIR)/coverage.html
+	gocover-cobertura < $(COVERAGE_DIR)/cover-all-bl > $(COVERAGE_DIR)/coverage.cobertura.xml || $(ECHO) "$(YELLOW)cobertura generation skipped$(NC)"
+	go tool cover -func $(COVERAGE_DIR)/cover-all-bl | tail -1
 
 build-ui: install-ui ## Build ui
 	@$(ECHO) "$(GREEN)Building ui...$(NC)"

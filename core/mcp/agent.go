@@ -586,9 +586,10 @@ func buildAllowedAutoExecutionTools(ctx *schemas.BifrostContext, clientManager C
 	allowedTools := make(map[string][]string)
 	availableToolsPerClient := clientManager.GetToolPerClient(ctx)
 	allClientNames := []string{}
+	tenantID := TenantIDFromBifrostContext(ctx)
 
 	for clientName := range availableToolsPerClient {
-		client := clientManager.GetClientByName(clientName)
+		client := clientManager.GetClientByName(tenantID, clientName)
 		if client == nil {
 			continue
 		}

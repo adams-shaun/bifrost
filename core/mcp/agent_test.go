@@ -69,7 +69,7 @@ func (m *MockClientManager) GetClientForTool(toolName string) *schemas.MCPClient
 	return nil // Return nil to simulate no client found
 }
 
-func (m *MockClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
+func (m *MockClientManager) GetClientByName(_, clientName string) *schemas.MCPClientState {
 	return nil
 }
 
@@ -551,7 +551,7 @@ func (m *MockAutoClientManager) GetClientForTool(toolName string) *schemas.MCPCl
 	}
 }
 
-func (m *MockAutoClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
+func (m *MockAutoClientManager) GetClientByName(_, clientName string) *schemas.MCPClientState {
 	return nil
 }
 

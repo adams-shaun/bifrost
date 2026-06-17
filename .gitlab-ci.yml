@@ -1,0 +1,67 @@
+# =============================================================================
+# f5xc-mt-overlay CI — unit-test gate for the multi-tenant patch series.
+#
+# Scope: one job, `test-go`, runs `make cmd-unittest` + `make coverage-all-bl`
+# against the in-tree (already-patched) source. The deterministic subset is
+# controlled by GO_COVER_EXCLUDE in the Makefile and drops live-integration
+# suites (Redis/Weaviate/Qdrant/MCP STDIO subprocesses) that need credentials
+# or running services. Run those locally via `make test-*` + $(EXPOSE_ENV).
+#
+# Runs on EVERY commit — no merge-request gate, no branch allowlist. This
+# branch is the source of truth for the multi-tenant patches; we want a green
+# signal on every push so regressions surface immediately rather than waiting
+# for a downstream MR.
+#
+# Deliberately NOT included:
+#   - f5/volterra cicd-deployment templates (.build, .release, .container,
+#     manifests, upload, security-scan) — they target the production
+#     bifrost-aigw shipping pipeline; this overlay branch isn't shipping.
+#   - test-ui (vitest) — the UI lives in ui/ but its build isn't on the MT
+#     critical path; add later when needed.
+#   - integration-tests (kind/k8s) — needs the f5 internal runner image +
+#     resource_group; out of scope for the patch series itself.
+# =============================================================================
+
+workflow:
+  rules:
+    # Run on every commit/branch + every MR.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  GOTOOLCHAIN: auto
+
+default:
+  interruptible: true
+
+stages:
+  - test
+
+test-go:
+  stage: test
+  # Public golang image is enough — this branch has no private deps
+  # (no gopkg.volterra.us / no gitlab.com/f5 fetches).
+  image: golang:1.26
+  variables:
+    # framework/configstore tests use gorm's sqlite driver (mattn/go-sqlite3 -> cgo)
+    CGO_ENABLED: "1"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev
+    - export PATH="$PATH:$(go env GOPATH)/bin"
+  script:
+    - |
+      make cmd-unittest || UNIT_FAILED=1
+      make coverage-all-bl
+      test -z "$UNIT_FAILED"
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - test-reports/
+      - coverage_out/
+    reports:
+      junit: test-reports/*.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage_out/coverage.cobertura.xml

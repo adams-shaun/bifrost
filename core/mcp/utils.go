@@ -30,6 +30,29 @@ var DefaultRetryConfig = RetryConfig{
 	MaxBackoff:     30 * time.Second,
 }
 
+// tenantContextKey mirrors multitenant.BifrostContextKeyTenantID. The mcp
+// package can't import the multitenant package (would create an import
+// cycle via core/bifrost.go), so we re-declare the same typed key with the
+// same string value — interface{} equality on the underlying defined type
+// holds across packages. See plugins/semanticcache/main.go for the same
+// pattern.
+const tenantContextKey schemas.BifrostContextKey = "x-f5xc-tenant"
+
+// TenantIDFromBifrostContext extracts the f5xc tenant id from the
+// BifrostContext, returning "" when no tenant is set (OSS single-tenant
+// path). Centralised so call sites don't re-derive the key string.
+func TenantIDFromBifrostContext(ctx *schemas.BifrostContext) string {
+	if ctx == nil {
+		return ""
+	}
+	v := ctx.Value(tenantContextKey)
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
 // GetClientForTool safely finds a client that has the specified tool.
 // Returns a copy of the client state to avoid data races. Callers should be aware
 // that fields like Conn and ToolMap are still shared references and may be modified
@@ -118,28 +141,39 @@ func (m *MCPManager) GetToolPerClient(ctx context.Context) map[string][]schemas.
 	return tools
 }
 
-// GetClientByName returns a client by name.
+// GetClientByName returns a client by (tenantID, name).
+//
+// Multi-tenant scope (f5xc): when tenantID is non-empty, only clients
+// whose TenantID matches are eligible — two tenants can register the same
+// client name without colliding. When tenantID is empty (OSS single-tenant
+// path and most CodeMode call sites that don't have a tenant context),
+// MATCH falls back to "any tenant" — preserving upstream behaviour.
 //
 // Parameters:
-//   - clientName: Name of the client to get
+//   - tenantID:   Owning tenant id; empty = "any tenant" (OSS fallback).
+//   - clientName: Name of the client to get.
 //
 // Returns:
-//   - *schemas.MCPClientState: Client state if found, nil otherwise
-func (m *MCPManager) GetClientByName(clientName string) *schemas.MCPClientState {
+//   - *schemas.MCPClientState: Client state if found, nil otherwise.
+func (m *MCPManager) GetClientByName(tenantID, clientName string) *schemas.MCPClientState {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	m.logger.Debug("%s GetClientByName: Looking for client '%s' among %d clients", MCPLogPrefix, clientName, len(m.clientMap))
+	m.logger.Debug("%s GetClientByName: Looking for client '%s' (tenant=%q) among %d clients", MCPLogPrefix, clientName, tenantID, len(m.clientMap))
 	for _, client := range m.clientMap {
-		m.logger.Debug("%s Checking client with Name: %s, ID: %s", MCPLogPrefix, client.ExecutionConfig.Name, client.ExecutionConfig.ID)
-		if client.ExecutionConfig.Name == clientName {
-			// Return a copy to prevent TOCTOU race conditions
-			// The caller receives a snapshot of the client state at this point in time
-			m.logger.Debug("%s Found client '%s' with IsCodeModeClient=%v", MCPLogPrefix, clientName, client.ExecutionConfig.IsCodeModeClient)
-			clientCopy := *client
-			return &clientCopy
+		m.logger.Debug("%s Checking client with Name: %s, ID: %s, TenantID: %s", MCPLogPrefix, client.ExecutionConfig.Name, client.ExecutionConfig.ID, client.TenantID)
+		if client.ExecutionConfig.Name != clientName {
+			continue
 		}
+		if tenantID != "" && client.TenantID != "" && client.TenantID != tenantID {
+			continue
+		}
+		// Return a copy to prevent TOCTOU race conditions
+		// The caller receives a snapshot of the client state at this point in time
+		m.logger.Debug("%s Found client '%s' (tenant=%q) with IsCodeModeClient=%v", MCPLogPrefix, clientName, client.TenantID, client.ExecutionConfig.IsCodeModeClient)
+		clientCopy := *client
+		return &clientCopy
 	}
-	m.logger.Debug("%s Client '%s' not found", MCPLogPrefix, clientName)
+	m.logger.Debug("%s Client '%s' (tenant=%q) not found", MCPLogPrefix, clientName, tenantID)
 	return nil
 }
 
