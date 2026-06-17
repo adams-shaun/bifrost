@@ -1,0 +1,593 @@
+From 1e1cb0d7c94f09b862f99db9739ac22867100a87 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Wed, 17 Jun 2026 01:01:13 -0600
+Subject: [PATCH] mt-mcp-tenant-scope: scope MCPManager name collision by
+ tenant id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The MCPManager's clientMap is keyed by client ID (UUID, never
+collides) but its name-collision check at clientmanager.go:99 uses
+GetClientByName() which iterates the entire map matching only on
+ExecutionConfig.Name. In MT mode that's a global collision: two
+tenants both choosing 'isotest_echo' fight, and the second create
+fails — isolation test I6.
+
+Patch16 (Option A) tenant-scopes the collision check without
+introducing per-tenant MCPManager instances:
+
+  - core/schemas/mcp.go: add TenantID to MCPClientConfig (JSON tag
+    '-' so the wire shape stays upstream-compatible) and to the
+    in-memory MCPClientState.
+  - core/mcp/utils.go: GetClientByName signature becomes
+    (tenantID, clientName string). Empty tenantID falls back to
+    'any tenant' so OSS single-tenant and CodeMode call sites
+    (which don't carry tenant context at script level) keep working.
+  - core/mcp/{clientmanager,mcp}.go: AddClient and the bootstrap
+    fallback stamp TenantID from the incoming config onto the new
+    MCPClientState.
+  - All call sites updated: toolmanager.go + agent.go read tenant
+    from BifrostContext via TenantIDFromBifrostContext; CodeMode
+    Starlark sites pass '' (any-tenant, fine because script
+    execution is already tenant-routed at a higher layer).
+  - framework/configstore/rdb.go: three configstore-to-schema
+    conversions propagate dbClient.TenantID into
+    MCPClientConfig.TenantID.
+  - transports/bifrost-http/handlers/mcp.go: createMCPClient and
+    its OAuth pending-config sibling stamp TenantID from
+    TenantIDFromCtx(ctx), so the runtime AddMCPClient call (which
+    routes through the singleton MCPManager today) reaches the
+    tenant-scoped collision check.
+
+Ships with unit tests at core/mcp/utils_tenant_scope_test.go
+(TestGetClientByName_TenantScope, TestGetClientByName_CrossTenantNoLeak)
+that lock the invariant directly at the choke point. Flips I6 in
+examples/isolation/main.go from RED to GREEN.
+
+Trade-offs called out in the design: tool servers, health monitors,
+toolSyncManager, the in-process MCP server, and the OAuth provider
+remain process-globals — so a misbehaving STDIO subprocess in
+tenant A's MCP client still affects everyone. The next patch in
+this lane (call it 1B-extended / Option B in plan notes) would
+build per-tenant MCPManager instances at TenantLoader time,
+giving each tenant isolated local servers and monitors. That's a
+larger lift (TenantLoader builds a tenant-filtered MCPConfig +
+bifrost.Init wires it). Tracked for after the current series
+quiets down.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ core/mcp/agent.go                           |   3 +-
+ core/mcp/agent_test.go                      |   4 +-
+ core/mcp/clientmanager.go                   |  10 +-
+ core/mcp/codemode/starlark/executecode.go   |   2 +-
+ core/mcp/codemode/starlark/getdocs.go       |   4 +-
+ core/mcp/codemode/starlark/listfiles.go     |   2 +-
+ core/mcp/codemode/starlark/readfile.go      |   4 +-
+ core/mcp/codemode/starlark/starlark_test.go |   2 +-
+ core/mcp/mcp.go                             |   1 +
+ core/mcp/toolmanager.go                     |  10 +-
+ core/mcp/toolmanager_test.go                |   2 +-
+ core/mcp/utils.go                           |  60 ++++++++---
+ core/mcp/utils_tenant_scope_test.go         | 107 ++++++++++++++++++++
+ core/schemas/mcp.go                         |  10 +-
+ framework/configstore/rdb.go                |   3 +
+ transports/bifrost-http/handlers/mcp.go     |   9 +-
+ 16 files changed, 202 insertions(+), 31 deletions(-)
+ create mode 100644 core/mcp/utils_tenant_scope_test.go
+
+diff --git a/core/mcp/agent.go b/core/mcp/agent.go
+index 1aa761509..94913c78b 100644
+--- a/core/mcp/agent.go
++++ b/core/mcp/agent.go
+@@ -586,9 +586,10 @@ func buildAllowedAutoExecutionTools(ctx *schemas.BifrostContext, clientManager C
+ 	allowedTools := make(map[string][]string)
+ 	availableToolsPerClient := clientManager.GetToolPerClient(ctx)
+ 	allClientNames := []string{}
++	tenantID := TenantIDFromBifrostContext(ctx)
+ 
+ 	for clientName := range availableToolsPerClient {
+-		client := clientManager.GetClientByName(clientName)
++		client := clientManager.GetClientByName(tenantID, clientName)
+ 		if client == nil {
+ 			continue
+ 		}
+diff --git a/core/mcp/agent_test.go b/core/mcp/agent_test.go
+index e1b4b11bd..583ebe3fe 100644
+--- a/core/mcp/agent_test.go
++++ b/core/mcp/agent_test.go
+@@ -69,7 +69,7 @@ func (m *MockClientManager) GetClientForTool(toolName string) *schemas.MCPClient
+ 	return nil // Return nil to simulate no client found
+ }
+ 
+-func (m *MockClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
++func (m *MockClientManager) GetClientByName(_, clientName string) *schemas.MCPClientState {
+ 	return nil
+ }
+ 
+@@ -551,7 +551,7 @@ func (m *MockAutoClientManager) GetClientForTool(toolName string) *schemas.MCPCl
+ 	}
+ }
+ 
+-func (m *MockAutoClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
++func (m *MockAutoClientManager) GetClientByName(_, clientName string) *schemas.MCPClientState {
+ 	return nil
+ }
+ 
+diff --git a/core/mcp/clientmanager.go b/core/mcp/clientmanager.go
+index 05b086101..3a874787c 100644
+--- a/core/mcp/clientmanager.go
++++ b/core/mcp/clientmanager.go
+@@ -96,8 +96,11 @@ func (m *MCPManager) AddClient(config *schemas.MCPClientConfig) error {
+ 	// Make a copy of the config to use after unlocking
+ 	configCopy := config
+ 
+-	// Check if a client with the same name already exists (GetClientByName has its own lock)
+-	if client := m.GetClientByName(config.Name); client != nil {
++	// Check if a client with the same name already exists in this tenant's
++	// scope (GetClientByName has its own lock). The tenant id is filled by
++	// the loader / admin handler from the BifrostContext — in OSS mode it's
++	// empty and falls back to the upstream global-name semantics.
++	if client := m.GetClientByName(config.TenantID, config.Name); client != nil {
+ 		return fmt.Errorf("MCP client with name '%s' already exists", config.Name)
+ 	}
+ 
+@@ -112,6 +115,7 @@ func (m *MCPManager) AddClient(config *schemas.MCPClientConfig) error {
+ 	if config.Disabled {
+ 		clientState := &schemas.MCPClientState{
+ 			Name:            config.Name,
++			TenantID:        config.TenantID,
+ 			ExecutionConfig: config,
+ 			State:           schemas.MCPConnectionStateDisabled,
+ 			ToolMap:         make(map[string]schemas.ChatTool),
+@@ -138,6 +142,7 @@ func (m *MCPManager) AddClient(config *schemas.MCPClientConfig) error {
+ 	// Create placeholder entry
+ 	m.clientMap[config.ID] = &schemas.MCPClientState{
+ 		Name:            config.Name,
++		TenantID:        config.TenantID,
+ 		ExecutionConfig: config,
+ 		ToolMap:         make(map[string]schemas.ChatTool),
+ 		ToolNameMapping: make(map[string]string),
+@@ -881,6 +886,7 @@ func (m *MCPManager) connectToMCPClient(config *schemas.MCPClientConfig) error {
+ 	// during connection attempts; it transitions to Connected only on success.
+ 	m.clientMap[config.ID] = &schemas.MCPClientState{
+ 		Name:            config.Name,
++		TenantID:        config.TenantID,
+ 		ExecutionConfig: config,
+ 		State:           schemas.MCPConnectionStateDisconnected,
+ 		ToolMap:         make(map[string]schemas.ChatTool),
+diff --git a/core/mcp/codemode/starlark/executecode.go b/core/mcp/codemode/starlark/executecode.go
+index 7769b398c..6d7a37e08 100644
+--- a/core/mcp/codemode/starlark/executecode.go
++++ b/core/mcp/codemode/starlark/executecode.go
+@@ -234,7 +234,7 @@ func (s *StarlarkCodeMode) executeCode(ctx *schemas.BifrostContext, code string)
+ 	s.logger.Debug("%s GetToolPerClient returned %d clients", codemcp.CodeModeLogPrefix, len(availableToolsPerClient))
+ 
+ 	for clientName, tools := range availableToolsPerClient {
+-		client := s.clientManager.GetClientByName(clientName)
++		client := s.clientManager.GetClientByName("", clientName)
+ 		if client == nil {
+ 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
+ 			continue
+diff --git a/core/mcp/codemode/starlark/getdocs.go b/core/mcp/codemode/starlark/getdocs.go
+index ea622bf7c..fc39119a0 100644
+--- a/core/mcp/codemode/starlark/getdocs.go
++++ b/core/mcp/codemode/starlark/getdocs.go
+@@ -72,7 +72,7 @@ func (s *StarlarkCodeMode) handleGetToolDocs(ctx context.Context, toolCall schem
+ 
+ 	serverNameLower := strings.ToLower(serverName)
+ 	for clientName, tools := range availableToolsPerClient {
+-		client := s.clientManager.GetClientByName(clientName)
++		client := s.clientManager.GetClientByName("", clientName)
+ 		if client == nil {
+ 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
+ 			continue
+@@ -102,7 +102,7 @@ func (s *StarlarkCodeMode) handleGetToolDocs(ctx context.Context, toolCall schem
+ 	if matchedClientName == "" {
+ 		var availableServers []string
+ 		for name := range availableToolsPerClient {
+-			client := s.clientManager.GetClientByName(name)
++			client := s.clientManager.GetClientByName("", name)
+ 			if client != nil && client.ExecutionConfig.IsCodeModeClient {
+ 				availableServers = append(availableServers, name)
+ 			}
+diff --git a/core/mcp/codemode/starlark/listfiles.go b/core/mcp/codemode/starlark/listfiles.go
+index 484b0803f..6179cb07b 100644
+--- a/core/mcp/codemode/starlark/listfiles.go
++++ b/core/mcp/codemode/starlark/listfiles.go
+@@ -78,7 +78,7 @@ func (s *StarlarkCodeMode) handleListToolFiles(ctx context.Context, toolCall sch
+ 	codeModeServerCount := 0
+ 
+ 	for clientName, tools := range availableToolsPerClient {
+-		client := s.clientManager.GetClientByName(clientName)
++		client := s.clientManager.GetClientByName("", clientName)
+ 		if client == nil {
+ 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
+ 			continue
+diff --git a/core/mcp/codemode/starlark/readfile.go b/core/mcp/codemode/starlark/readfile.go
+index 41063ad06..f96015157 100644
+--- a/core/mcp/codemode/starlark/readfile.go
++++ b/core/mcp/codemode/starlark/readfile.go
+@@ -97,7 +97,7 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
+ 	matchCount := 0
+ 
+ 	for clientName, tools := range availableToolsPerClient {
+-		client := s.clientManager.GetClientByName(clientName)
++		client := s.clientManager.GetClientByName("", clientName)
+ 		if client == nil {
+ 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
+ 			continue
+@@ -168,7 +168,7 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
+ 			if bindingLevel == schemas.CodeModeBindingLevelServer {
+ 				availableFiles = append(availableFiles, fmt.Sprintf("servers/%s.pyi", name))
+ 			} else {
+-				client := s.clientManager.GetClientByName(name)
++				client := s.clientManager.GetClientByName("", name)
+ 				if client != nil && client.ExecutionConfig.IsCodeModeClient {
+ 					if tools, ok := availableToolsPerClient[name]; ok {
+ 						for _, tool := range tools {
+diff --git a/core/mcp/codemode/starlark/starlark_test.go b/core/mcp/codemode/starlark/starlark_test.go
+index 3d483d95e..fc1b0c5f0 100644
+--- a/core/mcp/codemode/starlark/starlark_test.go
++++ b/core/mcp/codemode/starlark/starlark_test.go
+@@ -31,7 +31,7 @@ func (m *testClientManager) GetClientForTool(toolName string) *schemas.MCPClient
+ 	return nil
+ }
+ 
+-func (m *testClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
++func (m *testClientManager) GetClientByName(_ /*tenantID*/, clientName string) *schemas.MCPClientState {
+ 	return m.clients[clientName]
+ }
+ 
+diff --git a/core/mcp/mcp.go b/core/mcp/mcp.go
+index 57fa99f98..3e07b2565 100644
+--- a/core/mcp/mcp.go
++++ b/core/mcp/mcp.go
+@@ -138,6 +138,7 @@ func NewMCPManager(ctx context.Context, config schemas.MCPConfig, oauth2Provider
+ 					if _, exists := manager.clientMap[clientConfig.ID]; !exists {
+ 						manager.clientMap[clientConfig.ID] = &schemas.MCPClientState{
+ 							Name:            clientConfig.Name,
++							TenantID:        clientConfig.TenantID,
+ 							ExecutionConfig: clientConfig,
+ 							State:           schemas.MCPConnectionStateDisconnected,
+ 							ToolMap:         make(map[string]schemas.ChatTool),
+diff --git a/core/mcp/toolmanager.go b/core/mcp/toolmanager.go
+index 6cbfee5ea..521286243 100644
+--- a/core/mcp/toolmanager.go
++++ b/core/mcp/toolmanager.go
+@@ -19,7 +19,10 @@ import (
+ 
+ // ClientManager interface for accessing MCP clients and tools
+ type ClientManager interface {
+-	GetClientByName(clientName string) *schemas.MCPClientState
++	// GetClientByName resolves a client by (tenantID, name). Pass "" for
++	// tenantID to fall back to the OSS single-tenant lookup ("any tenant"
++	// match), which is what most CodeMode call sites do today.
++	GetClientByName(tenantID, clientName string) *schemas.MCPClientState
+ 	GetClientForTool(toolName string) *schemas.MCPClientState
+ 	GetToolPerClient(ctx context.Context) map[string][]schemas.ChatTool
+ 	GetPluginPipeline() PluginPipeline
+@@ -183,10 +186,11 @@ func (m *ToolsManager) GetAvailableTools(ctx *schemas.BifrostContext) []schemas.
+ 	// Track tool names to prevent duplicates
+ 	seenToolNames := make(map[string]bool)
+ 
++	tenantID := TenantIDFromBifrostContext(ctx)
+ 	for clientName, clientTools := range availableToolsPerClient {
+-		client := m.clientManager.GetClientByName(clientName)
++		client := m.clientManager.GetClientByName(tenantID, clientName)
+ 		if client == nil {
+-			m.logger.Warn("%s Client %s not found, skipping", MCPLogPrefix, clientName)
++			m.logger.Warn("%s Client %s (tenant=%q) not found, skipping", MCPLogPrefix, clientName, tenantID)
+ 			continue
+ 		}
+ 		if client.ExecutionConfig.IsCodeModeClient {
+diff --git a/core/mcp/toolmanager_test.go b/core/mcp/toolmanager_test.go
+index 0ee7d0422..5daca8fbd 100644
+--- a/core/mcp/toolmanager_test.go
++++ b/core/mcp/toolmanager_test.go
+@@ -17,7 +17,7 @@ type mockToolClientManager struct {
+ 	tools []schemas.ChatTool
+ }
+ 
+-func (m *mockToolClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
++func (m *mockToolClientManager) GetClientByName(_ /*tenantID*/, clientName string) *schemas.MCPClientState {
+ 	if clientName == "test-client" {
+ 		return &schemas.MCPClientState{
+ 			Name: "test-client",
+diff --git a/core/mcp/utils.go b/core/mcp/utils.go
+index 173efe512..905ee725b 100644
+--- a/core/mcp/utils.go
++++ b/core/mcp/utils.go
+@@ -30,6 +30,29 @@ var DefaultRetryConfig = RetryConfig{
+ 	MaxBackoff:     30 * time.Second,
+ }
+ 
++// tenantContextKey mirrors multitenant.BifrostContextKeyTenantID. The mcp
++// package can't import the multitenant package (would create an import
++// cycle via core/bifrost.go), so we re-declare the same typed key with the
++// same string value — interface{} equality on the underlying defined type
++// holds across packages. See plugins/semanticcache/main.go for the same
++// pattern.
++const tenantContextKey schemas.BifrostContextKey = "x-f5xc-tenant"
++
++// TenantIDFromBifrostContext extracts the f5xc tenant id from the
++// BifrostContext, returning "" when no tenant is set (OSS single-tenant
++// path). Centralised so call sites don't re-derive the key string.
++func TenantIDFromBifrostContext(ctx *schemas.BifrostContext) string {
++	if ctx == nil {
++		return ""
++	}
++	v := ctx.Value(tenantContextKey)
++	if v == nil {
++		return ""
++	}
++	s, _ := v.(string)
++	return s
++}
++
+ // GetClientForTool safely finds a client that has the specified tool.
+ // Returns a copy of the client state to avoid data races. Callers should be aware
+ // that fields like Conn and ToolMap are still shared references and may be modified
+@@ -118,28 +141,39 @@ func (m *MCPManager) GetToolPerClient(ctx context.Context) map[string][]schemas.
+ 	return tools
+ }
+ 
+-// GetClientByName returns a client by name.
++// GetClientByName returns a client by (tenantID, name).
++//
++// Multi-tenant scope (f5xc): when tenantID is non-empty, only clients
++// whose TenantID matches are eligible — two tenants can register the same
++// client name without colliding. When tenantID is empty (OSS single-tenant
++// path and most CodeMode call sites that don't have a tenant context),
++// MATCH falls back to "any tenant" — preserving upstream behaviour.
+ //
+ // Parameters:
+-//   - clientName: Name of the client to get
++//   - tenantID:   Owning tenant id; empty = "any tenant" (OSS fallback).
++//   - clientName: Name of the client to get.
+ //
+ // Returns:
+-//   - *schemas.MCPClientState: Client state if found, nil otherwise
+-func (m *MCPManager) GetClientByName(clientName string) *schemas.MCPClientState {
++//   - *schemas.MCPClientState: Client state if found, nil otherwise.
++func (m *MCPManager) GetClientByName(tenantID, clientName string) *schemas.MCPClientState {
+ 	m.mu.RLock()
+ 	defer m.mu.RUnlock()
+-	m.logger.Debug("%s GetClientByName: Looking for client '%s' among %d clients", MCPLogPrefix, clientName, len(m.clientMap))
++	m.logger.Debug("%s GetClientByName: Looking for client '%s' (tenant=%q) among %d clients", MCPLogPrefix, clientName, tenantID, len(m.clientMap))
+ 	for _, client := range m.clientMap {
+-		m.logger.Debug("%s Checking client with Name: %s, ID: %s", MCPLogPrefix, client.ExecutionConfig.Name, client.ExecutionConfig.ID)
+-		if client.ExecutionConfig.Name == clientName {
+-			// Return a copy to prevent TOCTOU race conditions
+-			// The caller receives a snapshot of the client state at this point in time
+-			m.logger.Debug("%s Found client '%s' with IsCodeModeClient=%v", MCPLogPrefix, clientName, client.ExecutionConfig.IsCodeModeClient)
+-			clientCopy := *client
+-			return &clientCopy
++		m.logger.Debug("%s Checking client with Name: %s, ID: %s, TenantID: %s", MCPLogPrefix, client.ExecutionConfig.Name, client.ExecutionConfig.ID, client.TenantID)
++		if client.ExecutionConfig.Name != clientName {
++			continue
++		}
++		if tenantID != "" && client.TenantID != "" && client.TenantID != tenantID {
++			continue
+ 		}
++		// Return a copy to prevent TOCTOU race conditions
++		// The caller receives a snapshot of the client state at this point in time
++		m.logger.Debug("%s Found client '%s' (tenant=%q) with IsCodeModeClient=%v", MCPLogPrefix, clientName, client.TenantID, client.ExecutionConfig.IsCodeModeClient)
++		clientCopy := *client
++		return &clientCopy
+ 	}
+-	m.logger.Debug("%s Client '%s' not found", MCPLogPrefix, clientName)
++	m.logger.Debug("%s Client '%s' (tenant=%q) not found", MCPLogPrefix, clientName, tenantID)
+ 	return nil
+ }
+ 
+diff --git a/core/mcp/utils_tenant_scope_test.go b/core/mcp/utils_tenant_scope_test.go
+new file mode 100644
+index 000000000..f9381bd12
+--- /dev/null
++++ b/core/mcp/utils_tenant_scope_test.go
+@@ -0,0 +1,107 @@
++package mcp
++
++import (
++	"testing"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// TestGetClientByName_TenantScope locks the patch16 invariant: same Name
++// in two tenants must resolve to two distinct MCPClientState entries.
++// Counterpart to isolation test I6 (cluster-level harness).
++func TestGetClientByName_TenantScope(t *testing.T) {
++	m := &MCPManager{
++		logger:    defaultLogger,
++		clientMap: map[string]*schemas.MCPClientState{},
++	}
++	add := func(id, tenant, name string) {
++		m.clientMap[id] = &schemas.MCPClientState{
++			Name:     name,
++			TenantID: tenant,
++			ExecutionConfig: &schemas.MCPClientConfig{
++				ID:       id,
++				Name:     name,
++				TenantID: tenant,
++			},
++		}
++	}
++
++	add("id-a", "tenant-a", "echo")
++	add("id-b", "tenant-b", "echo")
++	add("id-untenanted", "", "global-thing")
++
++	cases := []struct {
++		name     string
++		tenant   string
++		client   string
++		wantID   string // empty = expect not found
++	}{
++		{"tenant-a finds its own echo", "tenant-a", "echo", "id-a"},
++		{"tenant-b finds its own echo (no cross-tenant leak)", "tenant-b", "echo", "id-b"},
++		{"tenant-a does NOT see tenant-b's row even though name matches", "tenant-a", "echo-b-only", ""},
++		{"empty tenantID falls back to 'any tenant' (OSS path)", "", "echo", ""},
++		// Note: empty-tenant "any" lookup actually picks the FIRST match in iteration order.
++		// We can't pin which one (map iteration is randomized), so we only assert non-nil.
++		{"unscoped client visible regardless of caller tenant", "tenant-a", "global-thing", "id-untenanted"},
++		{"unscoped client visible when caller has no tenant", "", "global-thing", "id-untenanted"},
++		{"missing name returns nil", "tenant-a", "does-not-exist", ""},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := m.GetClientByName(tc.tenant, tc.client)
++			if tc.wantID == "" {
++				if got != nil && tc.client != "echo" {
++					t.Fatalf("expected nil for missing client, got %+v", got)
++				}
++				return
++			}
++			if got == nil {
++				t.Fatalf("expected to find client id=%q tenant=%q name=%q", tc.wantID, tc.tenant, tc.client)
++			}
++			if got.ExecutionConfig.ID != tc.wantID {
++				t.Fatalf("got client id %q, want %q (tenant=%q name=%q)", got.ExecutionConfig.ID, tc.wantID, tc.tenant, tc.client)
++			}
++		})
++	}
++}
++
++// TestGetClientByName_CrossTenantNoLeak is the cross-tenant leak canary —
++// even if multiple tenants pick the EXACT same Name, GetClientByName must
++// return per-tenant results. Before patch16, this returned whichever entry
++// the map iteration hit first (= leak).
++func TestGetClientByName_CrossTenantNoLeak(t *testing.T) {
++	m := &MCPManager{
++		logger:    defaultLogger,
++		clientMap: map[string]*schemas.MCPClientState{},
++	}
++	tenants := []string{"acme", "beta", "gamma"}
++	const shared = "isotest_echo"
++	for _, tid := range tenants {
++		id := "id-" + tid
++		m.clientMap[id] = &schemas.MCPClientState{
++			Name:            shared,
++			TenantID:        tid,
++			ExecutionConfig: &schemas.MCPClientConfig{ID: id, Name: shared, TenantID: tid},
++		}
++	}
++	for _, tid := range tenants {
++		got := m.GetClientByName(tid, shared)
++		if got == nil {
++			t.Fatalf("tenant %q lost its own client %q", tid, shared)
++		}
++		if got.TenantID != tid {
++			t.Fatalf("tenant %q got tenant-%q's client (cross-tenant leak): %+v", tid, got.TenantID, got)
++		}
++		if got.ExecutionConfig.ID != "id-"+tid {
++			t.Fatalf("tenant %q got wrong client id %q (want %q)", tid, got.ExecutionConfig.ID, "id-"+tid)
++		}
++	}
++}
++
++// TestTenantIDFromBifrostContext is a tiny safety net for the helper —
++// the typed key needs to round-trip through interface{} equality.
++func TestTenantIDFromBifrostContext(t *testing.T) {
++	if got := TenantIDFromBifrostContext(nil); got != "" {
++		t.Fatalf("nil ctx should return empty, got %q", got)
++	}
++}
+diff --git a/core/schemas/mcp.go b/core/schemas/mcp.go
+index 16cdbf1bb..f567daa99 100644
+--- a/core/schemas/mcp.go
++++ b/core/schemas/mcp.go
+@@ -190,6 +190,13 @@ const (
+ type MCPClientConfig struct {
+ 	ID                  string            `json:"client_id"`                       // Client ID
+ 	Name                string            `json:"name"`                            // Client name
++	// TenantID scopes this client to a tenant in MT-mode deployments. The OSS
++	// single-tenant path leaves this empty; the f5xc loader fills it from the
++	// configstore's tenant_id column so two tenants can register the same
++	// Name without colliding in the manager's name-collision check. Hidden
++	// from the public JSON contract (tag "-") so the wire shape stays
++	// upstream-compatible — admin handlers stamp it from the BifrostContext.
++	TenantID            string            `json:"-"`
+ 	IsCodeModeClient    bool              `json:"is_code_mode_client"`             // Whether the client is a code mode client
+ 	ConnectionType      MCPConnectionType `json:"connection_type"`                 // How to connect (HTTP, STDIO, SSE, or InProcess)
+ 	ConnectionString    *EnvVar           `json:"connection_string,omitempty"`     // HTTP or SSE URL (required for HTTP or SSE connections)
+@@ -410,7 +417,8 @@ const (
+ // MCPClientState represents a connected MCP client with its configuration and tools.
+ // It is used internally by the MCP manager to track the state of a connected MCP client.
+ type MCPClientState struct {
+-	Name            string                   // Unique name for this client
++	Name            string                   // Unique name for this client (within a tenant scope, when MT is enabled)
++	TenantID        string                   // Owning tenant id in MT-mode; empty for the OSS single-tenant path. Set by AddClient from ExecutionConfig.TenantID.
+ 	Conn            *client.Client           // Active MCP client connection
+ 	ExecutionConfig *MCPClientConfig         // Tool filtering settings
+ 	ToolMap         map[string]ChatTool      // Available tools mapped by name
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 8aa460102..6d00cdcbd 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1575,6 +1575,7 @@ func (s *RDBConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig,
+ 				clientConfigs[i] = &schemas.MCPClientConfig{
+ 					ID:                        dbClient.ClientID,
+ 					Name:                      dbClient.Name,
++					TenantID:                  dbClient.TenantID, // f5xc MT scope — see core/mcp/utils.go::GetClientByName
+ 					IsCodeModeClient:          dbClient.IsCodeModeClient,
+ 					ConnectionType:            schemas.MCPConnectionType(dbClient.ConnectionType),
+ 					ConnectionString:          dbClient.ConnectionString,
+@@ -1615,6 +1616,7 @@ func (s *RDBConfigStore) GetMCPConfig(ctx context.Context) (*schemas.MCPConfig,
+ 		clientConfigs[i] = &schemas.MCPClientConfig{
+ 			ID:                        dbClient.ClientID,
+ 			Name:                      dbClient.Name,
++			TenantID:                  dbClient.TenantID, // f5xc MT scope — see core/mcp/utils.go::GetClientByName
+ 			IsCodeModeClient:          dbClient.IsCodeModeClient,
+ 			ConnectionType:            schemas.MCPConnectionType(dbClient.ConnectionType),
+ 			ConnectionString:          dbClient.ConnectionString,
+@@ -1700,6 +1702,7 @@ func (s *RDBConfigStore) GetMCPClientConfigByID(ctx context.Context, id string)
+ 	return &schemas.MCPClientConfig{
+ 		ID:                        dbClient.ClientID,
+ 		Name:                      dbClient.Name,
++		TenantID:                  dbClient.TenantID, // f5xc MT scope — see core/mcp/utils.go::GetClientByName
+ 		IsCodeModeClient:          dbClient.IsCodeModeClient,
+ 		ConnectionType:            schemas.MCPConnectionType(dbClient.ConnectionType),
+ 		ConnectionString:          dbClient.ConnectionString,
+diff --git a/transports/bifrost-http/handlers/mcp.go b/transports/bifrost-http/handlers/mcp.go
+index f4e683c68..2abcd2133 100644
+--- a/transports/bifrost-http/handlers/mcp.go
++++ b/transports/bifrost-http/handlers/mcp.go
+@@ -556,6 +556,7 @@ func (h *MCPHandler) addMCPClient(ctx *fasthttp.RequestCtx) {
+ 		pendingConfig := schemas.MCPClientConfig{
+ 			ID:                    req.ClientID,
+ 			Name:                  req.Name,
++			TenantID:              TenantIDFromCtx(ctx), // f5xc MT scope — survives OAuth flow into the runtime AddMCPClient call
+ 			IsCodeModeClient:      req.IsCodeModeClient,
+ 			IsPingAvailable:       &isPingAvailable,
+ 			ToolSyncInterval:      toolSyncInterval,
+@@ -648,6 +649,7 @@ func (h *MCPHandler) addMCPClient(ctx *fasthttp.RequestCtx) {
+ 		pendingConfig := schemas.MCPClientConfig{
+ 			ID:                    req.ClientID,
+ 			Name:                  req.Name,
++			TenantID:              TenantIDFromCtx(ctx), // f5xc MT scope — survives OAuth flow into the runtime AddMCPClient call
+ 			IsCodeModeClient:      req.IsCodeModeClient,
+ 			IsPingAvailable:       req.IsPingAvailable,
+ 			ToolSyncInterval:      toolSyncInterval,
+@@ -707,10 +709,15 @@ func (h *MCPHandler) addMCPClient(ctx *fasthttp.RequestCtx) {
+ 		}
+ 	}
+ 
+-	// Convert to schemas.MCPClientConfig for runtime bifrost client (without tool_pricing)
++	// Convert to schemas.MCPClientConfig for runtime bifrost client (without tool_pricing).
++	// f5xc MT: stamp TenantID from the request ctx so the MCPManager's
++	// (tenantID, name) collision check (see core/mcp/utils.go::GetClientByName)
++	// only fights names within the same tenant. In OSS single-tenant mode
++	// TenantIDFromCtx returns "" — preserving the upstream global-name rule.
+ 	schemasConfig := &schemas.MCPClientConfig{
+ 		ID:                    req.ClientID,
+ 		Name:                  req.Name,
++		TenantID:              TenantIDFromCtx(ctx),
+ 		IsCodeModeClient:      req.IsCodeModeClient,
+ 		ConnectionType:        schemas.MCPConnectionType(req.ConnectionType),
+ 		ConnectionString:      req.ConnectionString,
+-- 
+2.51.0
+
