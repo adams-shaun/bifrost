@@ -1,0 +1,220 @@
+From 7c4db28d5f9b9766a39de2fb0081dc45bce17917 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Wed, 17 Jun 2026 00:24:57 -0600
+Subject: [PATCH] mt-semanticcache-tenant-scope: prefix cache key with tenant
+ id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The semantic-cache plugin's resolveCacheKey was returning the raw
+per-request CacheKey (or DefaultCacheKey) with no awareness of the
+multi-tenant Bifrost context. With per-tenant runtimes sharing the
+same VectorStore namespace (the plugin instance is global by design
+— see [[multi-tenant-audit-checklist]]), two tenants whose VK or
+default config produced the same cache key would read each other's
+cached responses.
+
+Fix: when the BifrostContext carries a non-empty tenant id under
+the f5xc tenant key (multitenant.BifrostContextKeyTenantID), prefix
+the resolved key with '<tenant>:'. The typed key is re-declared in
+the plugin (same string value, same schemas.BifrostContextKey type)
+to avoid importing the multitenant package — interface{} equality
+on a defined string type holds across packages.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ plugins/semanticcache/main.go                 |  29 +++-
+ .../semanticcache/plugin_tenant_scope_test.go | 129 ++++++++++++++++++
+ 2 files changed, 154 insertions(+), 4 deletions(-)
+ create mode 100644 plugins/semanticcache/plugin_tenant_scope_test.go
+
+diff --git a/plugins/semanticcache/main.go b/plugins/semanticcache/main.go
+index 7dbad109d..5d5374a96 100644
+--- a/plugins/semanticcache/main.go
++++ b/plugins/semanticcache/main.go
+@@ -228,6 +228,15 @@ const (
+ 	CacheNoStoreKey   schemas.BifrostContextKey = "semantic_cache-no_store"   // bool. Skip writing the response to cache (still served from cache on hit).
+ )
+ 
++// f5xc multi-tenant: when the request carries a tenant id on the
++// Bifrost context, prepend it to the resolved cache key so cache
++// buckets are tenant-isolated. We re-declare the typed key here with
++// the same string value used by multitenant.BifrostContextKeyTenantID
++// to avoid importing the multitenant package from the plugin —
++// interface{} equality on schemas.BifrostContextKey holds across
++// packages because BifrostContextKey is a defined string type.
++const tenantContextKey schemas.BifrostContextKey = "x-f5xc-tenant"
++
+ type CacheType string
+ 
+ const (
+@@ -450,14 +459,26 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
+ 
+ // resolveCacheKey returns the per-request cache key (or the configured default)
+ // and a bool indicating whether the caller should proceed with caching.
++//
++// f5xc multi-tenant: if the BifrostContext carries a non-empty tenant id
++// under tenantContextKey, the returned key is prefixed with "<tenant>:" so
++// every tenant gets its own cache bucket — both for direct lookups and as a
++// metadata property on semantic-search results. Without this prefix, two
++// tenants sharing the same DefaultCacheKey (or the same per-request key)
++// would read each other's cached responses.
+ func (plugin *Plugin) resolveCacheKey(ctx *schemas.BifrostContext) (string, bool) {
++	base := ""
+ 	if cacheKey, ok := ctx.Value(CacheKey).(string); ok && cacheKey != "" {
+-		return cacheKey, true
++		base = cacheKey
++	} else if plugin.config.DefaultCacheKey != "" {
++		base = plugin.config.DefaultCacheKey
++	} else {
++		return "", false
+ 	}
+-	if plugin.config.DefaultCacheKey != "" {
+-		return plugin.config.DefaultCacheKey, true
++	if tid, ok := ctx.Value(tenantContextKey).(string); ok && tid != "" {
++		return tid + ":" + base, true
+ 	}
+-	return "", false
++	return base, true
+ }
+ 
+ // resolveCacheTypes returns whether direct and semantic search paths should
+diff --git a/plugins/semanticcache/plugin_tenant_scope_test.go b/plugins/semanticcache/plugin_tenant_scope_test.go
+new file mode 100644
+index 000000000..22c1c33e5
+--- /dev/null
++++ b/plugins/semanticcache/plugin_tenant_scope_test.go
+@@ -0,0 +1,129 @@
++package semanticcache
++
++import (
++	"context"
++	"testing"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// TestResolveCacheKey_TenantScope locks the patch15 invariant: when the
++// BifrostContext carries a non-empty tenant id under the f5xc tenant key,
++// resolveCacheKey returns "<tenant>:<base>" so two tenants cannot share a
++// cache bucket — even when they pick the same per-request CacheKey or share
++// the same DefaultCacheKey. This is the unit-level counterpart of isolation
++// test I7.
++func TestResolveCacheKey_TenantScope(t *testing.T) {
++	// Re-declare the typed tenant key locally so this test compiles against
++	// the upstream main.go (where the const is unexported). The value MUST
++	// match multitenant.BifrostContextKeyTenantID — see the comment block in
++	// main.go above the const declaration.
++	const tenantKey schemas.BifrostContextKey = "x-f5xc-tenant"
++
++	newCtx := func(tenant, perRequestCacheKey string) *schemas.BifrostContext {
++		c := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
++		if perRequestCacheKey != "" {
++			c = c.WithValue(CacheKey, perRequestCacheKey)
++		}
++		if tenant != "" {
++			c = c.WithValue(tenantKey, tenant)
++		}
++		return c
++	}
++
++	cases := []struct {
++		name             string
++		tenant           string
++		perRequestKey    string
++		defaultCacheKey  string
++		wantKey          string
++		wantOK           bool
++	}{
++		{
++			name:          "no tenant, per-request key only",
++			tenant:        "",
++			perRequestKey: "feature-x",
++			wantKey:       "feature-x",
++			wantOK:        true,
++		},
++		{
++			name:            "no tenant, default key only",
++			tenant:          "",
++			defaultCacheKey: "global-default",
++			wantKey:         "global-default",
++			wantOK:          true,
++		},
++		{
++			name:          "tenant + per-request key → prefixed",
++			tenant:        "acme",
++			perRequestKey: "feature-x",
++			wantKey:       "acme:feature-x",
++			wantOK:        true,
++		},
++		{
++			name:            "tenant + default key → prefixed",
++			tenant:          "acme",
++			defaultCacheKey: "global-default",
++			wantKey:         "acme:global-default",
++			wantOK:          true,
++		},
++		{
++			name:    "no tenant, no per-request key, no default → disabled",
++			wantOK:  false,
++			wantKey: "",
++		},
++		{
++			name:    "tenant set but no key + no default → still disabled",
++			tenant:  "acme",
++			wantOK:  false,
++			wantKey: "",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			p := &Plugin{config: &Config{DefaultCacheKey: tc.defaultCacheKey}}
++			got, ok := p.resolveCacheKey(newCtx(tc.tenant, tc.perRequestKey))
++			if ok != tc.wantOK {
++				t.Fatalf("ok = %v, want %v (key=%q)", ok, tc.wantOK, got)
++			}
++			if got != tc.wantKey {
++				t.Fatalf("key = %q, want %q", got, tc.wantKey)
++			}
++		})
++	}
++}
++
++// TestResolveCacheKey_TenantsDoNotShareBuckets is the cross-tenant leak
++// canary: two tenants picking the SAME explicit CacheKey must produce
++// DIFFERENT resolved keys. Before patch15 this returned equal strings
++// (= the bug). Single property; if it ever regresses, I7 also flips red.
++func TestResolveCacheKey_TenantsDoNotShareBuckets(t *testing.T) {
++	const tenantKey schemas.BifrostContextKey = "x-f5xc-tenant"
++
++	p := &Plugin{config: &Config{}}
++	ctxA := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline).
++		WithValue(CacheKey, "shared-feature").
++		WithValue(tenantKey, "tenant-a")
++	ctxB := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline).
++		WithValue(CacheKey, "shared-feature").
++		WithValue(tenantKey, "tenant-b")
++
++	keyA, okA := p.resolveCacheKey(ctxA)
++	keyB, okB := p.resolveCacheKey(ctxB)
++
++	if !okA || !okB {
++		t.Fatalf("both ctxs should resolve a key; got okA=%v okB=%v", okA, okB)
++	}
++	if keyA == keyB {
++		t.Fatalf("cross-tenant cache key MUST differ; both returned %q (cross-tenant leak)", keyA)
++	}
++	// Sanity: both keys end with the shared base.
++	if !endsWith(keyA, ":shared-feature") || !endsWith(keyB, ":shared-feature") {
++		t.Fatalf("expected '<tenant>:shared-feature' shape; got %q and %q", keyA, keyB)
++	}
++}
++
++func endsWith(s, suffix string) bool {
++	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
++}
+-- 
+2.51.0
+
