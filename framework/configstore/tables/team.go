@@ -11,10 +11,18 @@ import (
 // TableTeam represents a team entity with budget, rate limit and customer association
 type TableTeam struct {
 	ID          string  `gorm:"primaryKey;type:varchar(255)" json:"id"`
-	Name        string  `gorm:"type:varchar(255);not null;uniqueIndex" json:"name"`
+	Name        string  `gorm:"type:varchar(255);not null;uniqueIndex:idx_governance_teams_tenant_name" json:"name"`
 	CustomerID  *string `gorm:"type:varchar(255);index" json:"customer_id,omitempty"` // A team can belong to a customer
 	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
 	SourceID    *string `gorm:"type:varchar(255);uniqueIndex" json:"source_id,omitempty"`
+
+	// TenantID scopes this team to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Composite-unique with Name via
+	// idx_governance_teams_tenant_name so two tenants can both register a
+	// team called "engineering" — the legacy idx_governance_teams_name
+	// single-column unique was dropped by migrationTenantScopedTeamNameUnique
+	// for the same reason.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;uniqueIndex:idx_governance_teams_tenant_name" json:"tenant_id"`
 
 	// Relationships
 	Customer    *TableCustomer    `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`
@@ -114,4 +122,14 @@ func (t *TableTeam) AfterFind(tx *gorm.DB) error {
 		t.RateLimit.IsCalendarAligned = t.CalendarAligned
 	}
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableTeam) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "governance_teams")
 }

@@ -1,7 +1,7 @@
-From 2cb5c2589888151c37f5d7a6660c4966a589cc32 Mon Sep 17 00:00:00 2001
+From 986eebecf98fb7a2bed3360003959e5201743bbe Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 14:01:39 -0600
-Subject: [PATCH] mt-http-resolver: tenant-resolver middleware +
+Subject: [PATCH 3/6] mt-http-resolver: tenant-resolver middleware +
  /api/platform/tenants + VK bearer auth
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -47,10 +47,10 @@ etc. handlers tenant-scoped.
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
  .../bifrost-http/handlers/middlewares.go      |  14 ++
- .../bifrost-http/handlers/platform_tenants.go | 207 ++++++++++++++++++
- .../bifrost-http/handlers/tenant_resolver.go  | 122 +++++++++++
- transports/bifrost-http/server/server.go      |  51 ++++-
- 4 files changed, 389 insertions(+), 5 deletions(-)
+ .../bifrost-http/handlers/platform_tenants.go | 223 ++++++++++++++++++
+ .../bifrost-http/handlers/tenant_resolver.go  | 151 ++++++++++++
+ transports/bifrost-http/server/server.go      |  51 +++-
+ 4 files changed, 434 insertions(+), 5 deletions(-)
  create mode 100644 transports/bifrost-http/handlers/platform_tenants.go
  create mode 100644 transports/bifrost-http/handlers/tenant_resolver.go
 
@@ -88,18 +88,23 @@ index 46b4d2254..41c90eb56 100644
  				// Verify the session
 diff --git a/transports/bifrost-http/handlers/platform_tenants.go b/transports/bifrost-http/handlers/platform_tenants.go
 new file mode 100644
-index 000000000..fa22898cb
+index 000000000..683b37557
 --- /dev/null
 +++ b/transports/bifrost-http/handlers/platform_tenants.go
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,223 @@
 +// Package handlers — platform_tenants.go.
 +//
-+// /api/platform/tenants — cross-tenant admin CRUD for managing the
-+// tenant directory itself.  This is the ONE surface in the API that
-+// is explicitly NOT tenant-scoped (a platform admin reading the
-+// list of tenants can't filter by their own tenant; they need to
-+// see them all).  The tenant-scope GORM callback skips it because
-+// the `tenants` table doesn't carry a `tenant_id` column.
++// /api/tenants — cross-tenant admin CRUD for managing the tenant
++// directory itself.  This is the ONE surface in the API that is
++// explicitly NOT tenant-scoped (a platform admin reading the list of
++// tenants can't filter by their own tenant; they need to see them
++// all).  The tenant-scope GORM callback skips it because the
++// `tenants` table doesn't carry a `tenant_id` column.
++//
++// Earlier shipped as /api/platform/tenants. Moved to /api/tenants
++// for URL cleanliness; the resolver's isAdminPath now exempts both
++// `/api/platform/*` (legacy) and `/api/tenants*` from the disable-
++// default-tenant write block so the chicken-and-egg fix still holds.
 +//
 +// Auth is platform-admin only.  In single-tenant deployments the
 +// default seeded tenant is the only row; the surface still works.
@@ -139,10 +144,21 @@ index 000000000..fa22898cb
 +	return &PlatformTenantsHandler{configStore: configStore, disableDefaultTenant: disableDefaultTenant}, nil
 +}
 +
-+// RegisterRoutes mounts /api/platform/tenants{,/:id} under the
-+// supplied middleware chain.  Callers should mount platform-admin
-+// auth on top so non-admin requests get rejected.
++// RegisterRoutes mounts /api/tenants{,/:id} under the supplied
++// middleware chain (with /api/platform/tenants{,/:id} kept as
++// backward-compatible aliases until UI clients are off the old
++// URL). Callers should mount platform-admin auth on top so non-admin
++// requests get rejected.
 +func (h *PlatformTenantsHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
++	// New canonical surface.
++	r.GET("/api/tenants", lib.ChainMiddlewares(h.list, middlewares...))
++	r.POST("/api/tenants", lib.ChainMiddlewares(h.create, middlewares...))
++	r.GET("/api/tenants/{id}", lib.ChainMiddlewares(h.get, middlewares...))
++	r.PUT("/api/tenants/{id}", lib.ChainMiddlewares(h.update, middlewares...))
++	r.DELETE("/api/tenants/{id}", lib.ChainMiddlewares(h.delete, middlewares...))
++	// Legacy aliases — same handlers, same disable-default exemption
++	// via the resolver's isAdminPath. Safe to remove once the UI's
++	// tenantsApi.ts has been updated and rolled out.
 +	r.GET("/api/platform/tenants", lib.ChainMiddlewares(h.list, middlewares...))
 +	r.POST("/api/platform/tenants", lib.ChainMiddlewares(h.create, middlewares...))
 +	r.GET("/api/platform/tenants/{id}", lib.ChainMiddlewares(h.get, middlewares...))
@@ -301,10 +317,10 @@ index 000000000..fa22898cb
 +}
 diff --git a/transports/bifrost-http/handlers/tenant_resolver.go b/transports/bifrost-http/handlers/tenant_resolver.go
 new file mode 100644
-index 000000000..24d0c1661
+index 000000000..de97a0ddc
 --- /dev/null
 +++ b/transports/bifrost-http/handlers/tenant_resolver.go
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,151 @@
 +// Package handlers — tenant_resolver.go.
 +//
 +// The middleware that turns the `x-f5xc-tenant` request header into a
@@ -396,13 +412,15 @@ index 000000000..24d0c1661
 +// isAdminPath returns true for the per-tenant admin surfaces where a
 +// "default tenant write" is in scope of the disable flag.
 +//
-+// /api/platform/* is intentionally NOT a tenant-scoped surface — the
-+// tenants table itself has no tenant_id column, and the only way for
-+// an operator sitting on the seeded `default` tenant to provision
-+// their first real tenant is to call POST /api/platform/tenants. If
-+// the resolver blocked that based on the caller's header, the flag
-+// would be a chicken-and-egg trap: you can't get off `default` without
-+// already being off `default`.
++// /api/tenants* and /api/platform/* are intentionally NOT tenant-
++// scoped surfaces — the tenants table itself has no tenant_id column,
++// and the only way for an operator sitting on the seeded `default`
++// tenant to provision their first real tenant is to POST to one of
++// those endpoints. If the resolver blocked that based on the caller's
++// header, the flag would be a chicken-and-egg trap: you can't get off
++// `default` without already being off `default`. (Both prefixes are
++// exempt — `/api/tenants` is the canonical surface; `/api/platform/*`
++// is the legacy alias retained until UI clients have migrated.)
 +//
 +// Inference (/v1/*) is also excluded — governance owns admit/deny
 +// there. So the flag only fires on /api/<entity>/... (providers,
@@ -412,6 +430,9 @@ index 000000000..24d0c1661
 +		return false
 +	}
 +	if strings.HasPrefix(path, "/api/platform/") {
++		return false
++	}
++	if path == "/api/tenants" || strings.HasPrefix(path, "/api/tenants/") {
 +		return false
 +	}
 +	return true
@@ -426,6 +447,30 @@ index 000000000..24d0c1661
 +		return true
 +	}
 +	return false
++}
++
++// TenantIDFromCtx is the read side of the resolver — handlers use it to
++// stamp `TenantID:` on every tenant-scoped struct they construct,
++// belt-and-braces with the GORM tenant-scope callback in framework/
++// configstore. Returns the tenant id stashed by TenantResolverMiddleware,
++// or "" when the request didn't carry the `x-f5xc-tenant` header.
++//
++// Why handlers stamp explicitly when the GORM callback already
++// stamps from ctx: the callback's reflection path failed silently in
++// production (the `default:default` GORM tag pre-fills "default" and
++// the callback respected it). Explicit stamping at construction is
++// the reliable source of truth; the callback is the safety net for
++// any future code path that forgets.
++func TenantIDFromCtx(ctx *fasthttp.RequestCtx) string {
++	if ctx == nil {
++		return ""
++	}
++	if v := ctx.UserValue(string(multitenant.BifrostContextKeyTenantID)); v != nil {
++		if s, ok := v.(string); ok {
++			return s
++		}
++	}
++	return ""
 +}
 diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
 index fe81ea986..7dd89e85d 100644

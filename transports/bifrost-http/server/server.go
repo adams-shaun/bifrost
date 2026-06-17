@@ -25,6 +25,7 @@ import (
 	dynamicPlugins "github.com/maximhq/bifrost/framework/plugins"
 	"github.com/maximhq/bifrost/framework/temptoken"
 	"github.com/maximhq/bifrost/framework/tracing"
+	"github.com/maximhq/bifrost/multitenant"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/logging"
 	"github.com/maximhq/bifrost/plugins/prompts"
@@ -125,7 +126,14 @@ type BifrostHTTPServer struct {
 	AsyncJobCleaner *logstore.AsyncJobCleaner
 
 	Client *bifrost.Bifrost
-	Config *lib.Config
+	// Manager owns the per-tenant *bifrost.Bifrost runtimes when the
+	// header model is active. Lazy-loaded via Acquire on the first
+	// inference request from a given tenant, evicted when an admin
+	// write to that tenant's providers/keys lands. nil before
+	// initialization; once set, BifrostFor handles the dispatch with
+	// a fallback to the root Client on no-tenant requests.
+	Manager *multitenant.Manager
+	Config  *lib.Config
 
 	Server *fasthttp.Server
 	Router *router.Router
@@ -149,6 +157,18 @@ var logger schemas.Logger
 // SetLogger sets the logger for the server.
 func SetLogger(l schemas.Logger) {
 	logger = l
+}
+
+// envBool returns true when the named env var is set to a recognised
+// truthy value (true / 1 / yes / y / on, case-insensitive). Used to
+// gate header-model multi-tenancy policy toggles like
+// BIFROST_DISABLE_DEFAULT_TENANT_CONFIG without pulling a flag library.
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "true", "1", "yes", "y", "on":
+		return true
+	}
+	return false
 }
 
 // NewBifrostHTTPServer creates a new instance of BifrostHTTPServer.
@@ -1095,11 +1115,32 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
 	}
 	s.MCPServerHandler = mcpServerHandler
 	asyncHandler := handlers.NewAsyncHandler(s.Client, s.Config)
-	s.IntegrationHandler.RegisterRoutes(s.Router, middlewares...)
-	inferenceHandler.RegisterRoutes(s.Router, middlewares...)
-	asyncHandler.RegisterRoutes(s.Router, middlewares...)
-	mcpInferenceHandler.RegisterRoutes(s.Router, middlewares...)
-	s.MCPServerHandler.RegisterRoutes(s.Router, middlewares...)
+	// Wire the per-tenant dispatcher into async so its background closure
+	// can Acquire a fresh refcount that survives past request return —
+	// the sync inference path relies on the middleware's defer release,
+	// but async submit-and-forget jobs outlive the request handler.
+	asyncHandler.SetDispatcher(s)
+	// Header-model multi-tenancy: prepend the tenant-resolver middleware
+	// so every inference request that carries `x-f5xc-tenant` stamps the
+	// value on the request context BEFORE auth / governance / logging
+	// plugins see it. Header absent → no stamp → configstore tenant-scope
+	// callback skips the implicit WHERE (single-tenant N=1 fallback).
+	//
+	// Stage 2 follow-up: prepend ALSO TenantDispatcherMiddleware so each
+	// inference request gets the per-tenant *bifrost.Bifrost stashed on
+	// ctx. Handlers fetch it via lib.BifrostClientFromCtx and fall back
+	// to their constructor-time client when nil. Middleware order is
+	// resolver-then-dispatcher: dispatcher reads the tid the resolver
+	// just stamped.
+	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
+	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
+	dispatchMW := handlers.TenantDispatcherMiddleware(s)
+	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW, dispatchMW}, middlewares...)
+	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
+	inferenceHandler.RegisterRoutes(s.Router, chained...)
+	asyncHandler.RegisterRoutes(s.Router, chained...)
+	mcpInferenceHandler.RegisterRoutes(s.Router, chained...)
+	s.MCPServerHandler.RegisterRoutes(s.Router, chained...)
 	return nil
 }
 
@@ -1160,6 +1201,27 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	sessionHandler := handlers.NewSessionHandler(s.Config.ConfigStore, s.WSTicketStore)
 	promptsHandler := handlers.NewPromptsHandler(s.Config.ConfigStore, promptsReloader)
 	featureFlagsHandler := handlers.NewFeatureFlagsHandler(s.Config.FeatureFlags, s.Config.ConfigStore)
+	// Header-model multi-tenancy: prepend the tenant-resolver middleware
+	// to the admin chain so every /api/* request that carries
+	// `x-f5xc-tenant` stamps the value on the request context BEFORE
+	// handler logic runs. The configstore tenant-scope callback
+	// (framework/configstore/tenant_scope.go) reads from the same
+	// context to auto-filter every SELECT and auto-populate every
+	// INSERT against tenant-scoped tables.
+	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
+	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
+	middlewares = append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
+	// Platform-admin: /api/platform/tenants for cross-tenant tenant
+	// directory management. This surface is the ONE admin endpoint that
+	// is explicitly NOT per-tenant-scoped — the tenant-scope GORM
+	// callback skips it because the tenants table doesn't carry a
+	// tenant_id column. When disableDefaultTenant is true the seeded
+	// `default` tenant is hidden from list/get/update/delete responses.
+	platformTenantsHandler, err := handlers.NewPlatformTenantsHandler(s.Config.ConfigStore, disableDefaultTenant)
+	if err != nil {
+		return fmt.Errorf("failed to initialize platform tenants handler: %v", err)
+	}
+	platformTenantsHandler.RegisterRoutes(s.Router, middlewares...)
 	// Going ahead with API handlers
 	healthHandler.RegisterRoutes(s.Router, middlewares...)
 	providerHandler.RegisterRoutes(s.Router, middlewares...)
@@ -1396,6 +1458,15 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	// Sync plugin execution order from config to core (defensive — Init receives sorted list,
 	// but this ensures order consistency if the loading path changes in the future)
 	s.Client.ReorderPlugins(s.Config.GetPluginOrder())
+	// Stage 2 runtime isolation: stand up the per-tenant runtime
+	// Manager that BifrostFor / EvictTenantRuntime dispatch through.
+	// Single-tenant deployments still reach inference via the root
+	// s.Client (BifrostFor returns it when the request has no tenant
+	// header). See multitenant.go for the loader + share-shim
+	// rationale.
+	if err := s.initializeManager(ctx); err != nil {
+		return fmt.Errorf("failed to initialize multitenant manager: %v", err)
+	}
 	// List all models and add to model catalog with per-provider status tracking
 	logger.Info("listing all models and adding to model catalog")
 	if s.Config.ModelCatalog != nil {

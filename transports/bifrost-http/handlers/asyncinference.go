@@ -20,6 +20,13 @@ type AsyncHandler struct {
 	executor     *logstore.AsyncJobExecutor
 	handlerStore lib.HandlerStore
 	config       *lib.Config
+	// dispatcher resolves per-tenant runtimes. Async closures run in a
+	// goroutine that outlives the request, so unlike the sync inference
+	// path (where the dispatch middleware's defer release fires after
+	// the handler returns) we must acquire a fresh refcount here and
+	// release it from inside the closure. nil dispatcher = single-tenant
+	// fallback (uses h.client directly).
+	dispatcher BifrostDispatcher
 }
 
 // AsyncPathToTypeMapping maps exact paths to request types (only for non-parameterized paths)
@@ -59,6 +66,32 @@ func NewAsyncHandler(client *bifrost.Bifrost, config *lib.Config) *AsyncHandler 
 		handlerStore: config,
 		config:       config,
 	}
+}
+
+// SetDispatcher wires a BifrostDispatcher so async closures route to
+// per-tenant runtimes. Optional; nil dispatcher = single-tenant
+// fallback (uses h.client directly). Server bootstrap calls this after
+// the Manager is initialized.
+func (h *AsyncHandler) SetDispatcher(d BifrostDispatcher) {
+	h.dispatcher = d
+}
+
+// acquireBifrost picks the runtime for an async job and returns a
+// release function the closure MUST defer. For single-tenant deployments
+// (no dispatcher, empty tid) it returns h.client with a no-op release.
+// For multi-tenant: holds a refcount on the per-tenant runtime so eviction
+// blocks until the closure completes.
+func (h *AsyncHandler) acquireBifrost(ctx *fasthttp.RequestCtx) (*bifrost.Bifrost, func()) {
+	noop := func() {}
+	if h.dispatcher == nil {
+		return h.client, noop
+	}
+	tid := TenantIDFromCtx(ctx)
+	bf, release := h.dispatcher.BifrostFor(ctx, tid)
+	if bf == nil {
+		return h.client, noop
+	}
+	return bf, release
 }
 
 // RegisterRoutes registers async job endpoints.
@@ -120,15 +153,18 @@ func (h *AsyncHandler) asyncTextCompletion(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.TextCompletionRequest(bgCtx, bifrostTextReq)
+			defer release()
+			return bf.TextCompletionRequest(bgCtx, bifrostTextReq)
 		},
 		schemas.TextCompletionRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}
@@ -157,15 +193,18 @@ func (h *AsyncHandler) asyncChatCompletion(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ChatCompletionRequest(bgCtx, bifrostChatReq)
+			defer release()
+			return bf.ChatCompletionRequest(bgCtx, bifrostChatReq)
 		},
 		schemas.ChatCompletionRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -194,15 +233,18 @@ func (h *AsyncHandler) asyncResponses(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ResponsesRequest(bgCtx, bifrostResponsesReq)
+			defer release()
+			return bf.ResponsesRequest(bgCtx, bifrostResponsesReq)
 		},
 		schemas.ResponsesRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Failed to create async job: %v", err))
 		return
 	}
@@ -227,15 +269,18 @@ func (h *AsyncHandler) asyncEmbeddings(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.EmbeddingRequest(bgCtx, bifrostEmbeddingReq)
+			defer release()
+			return bf.EmbeddingRequest(bgCtx, bifrostEmbeddingReq)
 		},
 		schemas.EmbeddingRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -264,15 +309,18 @@ func (h *AsyncHandler) asyncSpeech(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.SpeechRequest(bgCtx, bifrostSpeechReq)
+			defer release()
+			return bf.SpeechRequest(bgCtx, bifrostSpeechReq)
 		},
 		schemas.SpeechRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -301,15 +349,18 @@ func (h *AsyncHandler) asyncTranscription(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.TranscriptionRequest(bgCtx, bifrostTranscriptionReq)
+			defer release()
+			return bf.TranscriptionRequest(bgCtx, bifrostTranscriptionReq)
 		},
 		schemas.TranscriptionRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -338,15 +389,18 @@ func (h *AsyncHandler) asyncImageGeneration(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ImageGenerationRequest(bgCtx, bifrostReq)
+			defer release()
+			return bf.ImageGenerationRequest(bgCtx, bifrostReq)
 		},
 		schemas.ImageGenerationRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -375,15 +429,18 @@ func (h *AsyncHandler) asyncImageEdit(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ImageEditRequest(bgCtx, bifrostReq)
+			defer release()
+			return bf.ImageEditRequest(bgCtx, bifrostReq)
 		},
 		schemas.ImageEditRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -407,15 +464,18 @@ func (h *AsyncHandler) asyncImageVariation(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.ImageVariationRequest(bgCtx, bifrostReq)
+			defer release()
+			return bf.ImageVariationRequest(bgCtx, bifrostReq)
 		},
 		schemas.ImageVariationRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
 	}
@@ -439,15 +499,18 @@ func (h *AsyncHandler) asyncRerank(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.RerankRequest(bgCtx, bifrostReq)
+			defer release()
+			return bf.RerankRequest(bgCtx, bifrostReq)
 		},
 		schemas.RerankRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}
@@ -471,15 +534,18 @@ func (h *AsyncHandler) asyncOCR(ctx *fasthttp.RequestCtx) {
 
 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
 
+	bf, release := h.acquireBifrost(ctx)
 	job, err := h.executor.SubmitJob(
 		bifrostCtx,
 		resultTTL,
 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
-			return h.client.OCRRequest(bgCtx, bifrostReq)
+			defer release()
+			return bf.OCRRequest(bgCtx, bifrostReq)
 		},
 		schemas.OCRRequest,
 	)
 	if err != nil {
+		release()
 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}

@@ -12,9 +12,33 @@ import (
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
 	"github.com/maximhq/bifrost/framework/streaming"
+	"github.com/maximhq/bifrost/multitenant"
 )
 
 const realtimeMissingTranscriptText = "[Audio transcription unavailable]"
+
+// tenantIDFromContext extracts the tenant id stamped onto ctx by the
+// HTTP transport's tenant-resolver middleware. Returns "" when the
+// request didn't carry the `x-f5xc-tenant` header — single-tenant
+// fallback. Tries both the typed BifrostContextKey and the
+// stringified form because fasthttp.RequestCtx.SetUserValue stores
+// by interface{} equality so the two key shapes don't collide.
+func tenantIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	if v := ctx.Value(string(multitenant.BifrostContextKeyTenantID)); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
 
 // insertInitialLogEntry creates a new log entry in the database using GORM
 func (p *LoggerPlugin) insertInitialLogEntry(

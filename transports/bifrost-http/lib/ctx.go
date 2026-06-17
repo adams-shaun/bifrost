@@ -16,12 +16,33 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/maxim"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
 	"github.com/valyala/fasthttp"
 )
+
+// BifrostClientFromCtx returns the per-request *bifrost.Bifrost stashed
+// by TenantDispatcherMiddleware (Stage 2 runtime isolation). Returns
+// nil when no middleware ran or in single-tenant deployments — callers
+// MUST fall back to their constructor-time client in that case. Idiom:
+//
+//	bf := lib.BifrostClientFromCtx(ctx)
+//	if bf == nil { bf = h.client }
+//	resp, err := bf.ChatCompletionRequest(bifrostCtx, req)
+//
+// or use the (h *X) bf(ctx) helper many handlers define for brevity.
+func BifrostClientFromCtx(ctx *fasthttp.RequestCtx) *bifrost.Bifrost {
+	if ctx == nil {
+		return nil
+	}
+	if v, ok := ctx.UserValue(FastHTTPUserValueBifrostClient).(*bifrost.Bifrost); ok {
+		return v
+	}
+	return nil
+}
 
 const (
 	// FastHTTPUserValueBifrostContext stores the active *schemas.BifrostContext on fasthttp.RequestCtx.
@@ -36,6 +57,13 @@ const (
 	// set by prepare*Request functions when a provider was auto-resolved. Picked up
 	// centrally in ConvertToBifrostContext to add the routing engine log.
 	FastHTTPUserValueModelCatalogResolution = "__bifrost_model_catalog_resolution"
+	// FastHTTPUserValueBifrostClient stores the per-request *bifrost.Bifrost
+	// the inference dispatch should use. The TenantDispatcherMiddleware
+	// stashes this so handlers don't have to know about the per-tenant
+	// runtime Manager — they just call BifrostClientFromCtx(ctx) and get
+	// the right runtime (per-tenant for header-bound requests, root
+	// Client for single-tenant fallback).
+	FastHTTPUserValueBifrostClient = "__bifrost_client"
 )
 
 // ModelCatalogResolution carries the result of an automatic provider lookup so

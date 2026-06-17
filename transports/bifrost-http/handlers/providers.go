@@ -225,6 +225,13 @@ func (h *ProviderHandler) getProvider(ctx *fasthttp.RequestCtx) {
 // addProvider handles POST /api/providers - Add a new provider
 // NOTE: This only gets called when a new custom provider is added
 func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
+	// Per-tenant runtime caches a snapshot of providers + keys taken at
+	// Acquire time. Any mutation invalidates that snapshot for this
+	// tenant — evict so the next inference re-loads from the DB.
+	// Fires on error paths too: an over-eager evict just costs one
+	// reload on the next request, which is identical to startup behavior.
+	defer EvictTenant(ctx)
+
 	var payload providerCreatePayload
 	if err := sonic.Unmarshal(ctx.PostBody(), &payload); err != nil {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
@@ -272,15 +279,23 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
 			return
 		}
 	}
-	// Check if provider already exists
-	if _, err := h.inMemoryStore.GetProviderConfigRedacted(payload.Provider); err != nil {
-		if !errors.Is(err, lib.ErrNotFound) {
-			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to check provider config: %v", err))
+	// Tenant-scoped existence check: hit the DB via the tenant-scope
+	// GORM callback (h.dbStore.GetProviderConfig WHERE tenant_id = ctx
+	// tenant) instead of the global in-memory c.Providers map. The
+	// legacy in-memory check rejected creation if ANY tenant had the
+	// provider name configured — a multi-tenant correctness bug, since
+	// the DB carries composite (tenant_id, name) uniqueness so each
+	// tenant can independently register e.g. "anthropic".
+	if h.dbStore != nil {
+		if existing, err := h.dbStore.GetProviderConfig(ctx, payload.Provider); err != nil {
+			if !errors.Is(err, configstore.ErrNotFound) {
+				SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to check provider config: %v", err))
+				return
+			}
+		} else if existing != nil {
+			SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for this tenant", payload.Provider))
 			return
 		}
-	} else {
-		SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists", payload.Provider))
-		return
 	}
 
 	// Construct ProviderConfig from individual fields
@@ -299,21 +314,49 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid custom provider config: %v", err))
 		return
 	}
-	// Add provider to store (env vars will be processed by store)
-	if err := h.inMemoryStore.AddProvider(ctx, payload.Provider, config); err != nil {
-		logger.Warn("Failed to add provider %s: %v", payload.Provider, err)
-		if errors.Is(err, lib.ErrAlreadyExists) {
-			SendError(ctx, fasthttp.StatusConflict, err.Error())
+	// DB write via the configstore (tenant-scoped via the GORM
+	// callback). Bypasses lib.Config.AddProvider's global in-memory
+	// existence check so a name already owned by another tenant in
+	// the shared c.Providers map does not 409 us.
+	if h.dbStore != nil {
+		if err := h.dbStore.AddProvider(ctx, payload.Provider, config); err != nil {
+			if errors.Is(err, configstore.ErrAlreadyExists) {
+				SendError(ctx, fasthttp.StatusConflict, fmt.Sprintf("Provider %s already exists for this tenant", payload.Provider))
+				return
+			}
+			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
 			return
 		}
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to add provider: %v", err))
-		return
 	}
+	// Update the shared in-memory map best-effort so the legacy
+	// inference runtime can see the new provider for this process
+	// lifetime. Stage 2 will replace this with a tenant-keyed map;
+	// for now a clobber is acceptable since the DB is the source of
+	// truth and the inference runtime is shared across tenants anyway.
+	h.inMemoryStore.Mu.Lock()
+	if h.inMemoryStore.Providers == nil {
+		h.inMemoryStore.Providers = map[schemas.ModelProvider]configstore.ProviderConfig{}
+	}
+	h.inMemoryStore.Providers[payload.Provider] = config
+	h.inMemoryStore.Mu.Unlock()
 	logger.Info("Provider %s added successfully", payload.Provider)
 
 	if err := h.reloadProviderAfterCreate(ctx, payload.Provider); err != nil {
 		logger.Warn("Failed to reload provider %s after add: %v", payload.Provider, err)
-		if rollbackErr := h.inMemoryStore.RemoveProvider(context.Background(), payload.Provider); rollbackErr != nil {
+		// Rollback through dbStore directly so the DELETE flows the
+		// request ctx's tenant_id through the GORM tenant-scope callback
+		// (WHERE tenant_id = ?). Using context.Background() here would
+		// drop the predicate and risk wiping the same provider name
+		// from a sibling tenant.
+		var rollbackErr error
+		if h.dbStore != nil {
+			rollbackErr = h.dbStore.DeleteProvider(ctx, payload.Provider)
+		}
+		// Best-effort in-memory cleanup.
+		h.inMemoryStore.Mu.Lock()
+		delete(h.inMemoryStore.Providers, payload.Provider)
+		h.inMemoryStore.Mu.Unlock()
+		if rollbackErr != nil && !errors.Is(rollbackErr, configstore.ErrNotFound) {
 			logger.Error("Failed to rollback provider %s after reload failure: %v", payload.Provider, rollbackErr)
 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to initialize provider after add: %v (rollback failed: %v)", err, rollbackErr))
 			return
@@ -353,6 +396,8 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
 // The frontend should send the complete provider configuration.
 // This flow upserts the config
 func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+	defer EvictTenant(ctx) // see addProvider for rationale
+
 	provider, err := getProviderFromCtx(ctx)
 	if err != nil {
 		// If not found, then first we create and then update
@@ -397,9 +442,26 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		oldRedactedConfig = &configstore.ProviderConfig{}
 	}
 
-	// Construct ProviderConfig from individual fields (keys are managed separately via /keys endpoints)
+	// Construct ProviderConfig from individual fields (keys are managed separately via /keys endpoints).
+	//
+	// CRITICAL: re-fetch Keys from the tenant-scoped dbStore rather than reusing
+	// oldConfigRaw.Keys (which came from the global in-memory c.Providers map).
+	// In multi-tenant deployments c.Providers is shared across tenants, so the
+	// in-memory keys may belong to a DIFFERENT tenant than the caller. When
+	// UpdateProvider downstream diffs the request's Keys against the tenant-
+	// scoped DB lookup, it treats the wrong-tenant keys as new rows and tries
+	// INSERT — which trips the GLOBAL idx_key_id unique constraint with
+	// "a record with this key id already exists". Refetching scoped keys here
+	// makes the diff a no-op (every key already matches DB by key_id) so the
+	// update touches only provider metadata, which is what the admin UI wants.
+	keys := oldConfigRaw.Keys
+	if h.dbStore != nil {
+		if dbKeys, err := h.dbStore.GetProviderKeys(ctx, provider); err == nil {
+			keys = dbKeys
+		}
+	}
 	config := configstore.ProviderConfig{
-		Keys:                     oldConfigRaw.Keys,
+		Keys:                     keys,
 		NetworkConfig:            oldConfigRaw.NetworkConfig,
 		ConcurrencyAndBufferSize: oldConfigRaw.ConcurrencyAndBufferSize,
 		ProxyConfig:              oldConfigRaw.ProxyConfig,
@@ -546,6 +608,8 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 
 // deleteProvider handles DELETE /api/providers/{provider} - Remove provider
 func (h *ProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
+	defer EvictTenant(ctx) // see addProvider for rationale
+
 	provider, err := getProviderFromCtx(ctx)
 	if err != nil {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid provider: %v", err))

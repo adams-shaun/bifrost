@@ -23,6 +23,10 @@ type TableRateLimit struct {
 	RequestCurrentUsage  int64     `gorm:"default:0" json:"request_current_usage"`                   // Current request usage
 	RequestLastReset     time.Time `gorm:"index" json:"request_last_reset"`                          // Last time request counter was reset
 
+	// TenantID scopes this rate limit to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Backfilled to DefaultTenantID on upgrade.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;index" json:"tenant_id"`
+
 	// Deprecated: set calendar_aligned on the parent access profile / VK / team
 	// instead. Kept for backward compatibility with older config.json files;
 	// the OSS applyV1Compat path and the enterprise access-profile reconciler
@@ -84,4 +88,14 @@ func (rl *TableRateLimit) BeforeSave(tx *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableRateLimit) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "governance_rate_limits")
 }

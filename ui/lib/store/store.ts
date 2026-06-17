@@ -1,6 +1,6 @@
 import { configureStore } from "@reduxjs/toolkit";
 import { baseApi } from "./apis/baseApi";
-import { appReducer, pluginReducer, providerReducer } from "./slices";
+import { appReducer, pluginReducer, providerReducer, tenantReducer } from "./slices";
 import { reducers as enterpriseReducers, type EnterpriseState } from "@enterprise/lib/store/slices";
 // Importing enterprise APIs triggers their self-injection into baseApi
 import "@enterprise/lib/store/apis";
@@ -15,6 +15,10 @@ export const store = configureStore({
 		provider: providerReducer,
 		// Plugin state slice
 		plugin: pluginReducer,
+		// Tenant state slice — selected tenant id for the header-model
+		// multi-tenant story. baseApi.prepareHeaders reads from this
+		// slice to stamp `x-f5xc-tenant` on every outgoing request.
+		tenant: tenantReducer,
 		// Enterprise reducers (if available)
 		...enterpriseReducers,
 	},

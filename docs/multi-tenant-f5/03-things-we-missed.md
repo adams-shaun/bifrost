@@ -1,0 +1,399 @@
+# Things we missed on first pass
+
+Running retrospective of every multi-tenant correctness bug the initial
+patch series (patches 1-6) did not catch, and the follow-up patches /
+seed-program workarounds that closed each one. Living document — append
+new entries as new misses surface.
+
+**Audience:** anyone touching multi-tenant code in this fork.
+**Use:** before adding a new tenant-scoped surface (new table, new
+handler, new GORM query), scan this list for the failure modes it might
+recreate. Several of these were caught only by the end-to-end seed
+tester (`/home/sadams/projtmp/go-bifrost-ai/examples/seed`) running
+against a live cluster — unit tests alone did not surface them.
+
+---
+
+## Quick reference
+
+| # | Miss | Original patch | Fix patch / workaround | Found by |
+|---|---|---|---|---|
+| 1 | Stage 2: inference dispatch shared root runtime across tenants | n/a (deferred design) | patch7 `mt-runtime-isolation` | docs/multi-tenant-f5/00-review-and-plan.md §"Concerns / debt" |
+| 2 | Tenant DELETE didn't cascade child rows → orphans 409'd next create | patch3 `mt-http-resolver` (platform_tenants.go) | patch8 `mt-tenant-cascade-delete` | seed bootstrap |
+| 3 | GORM scope-callback fired AFTER strict BeforeCreate → child rows 500'd | patch2 `mt-data-scope-callback` | patch9 `mt-scope-callback-order` | seed bootstrap (`createCustomer` 500 inside transaction on the budget INSERT) |
+| 4 | `GetProviderKeys` JOIN returned cross-tenant keys | patch2 `mt-data-scope-callback` | patch10 `mt-getproviderkeys-scope` | seed assertion phase (`shaun`'s `keys count = 6 (want 3)`) |
+| 5 | `createVirtualKey/Team/Customer` handlers didn't stamp TenantID → strict-mode 500 | patch3 + patch4 | inlined into patch4 series during session (explicit stamps) | runtime in cluster |
+| 6 | `tableKeyFromSchemaKey` lost provider.TenantID → keys landed unstamped on AddProvider/UpdateProvider | patch4 | inlined into patch4 (key TenantID propagated) | runtime in cluster |
+| 7 | `UpdateProvider` handler writes via `h.inMemoryStore` (not tenant-safe) → second-tenant update of `openai` trips global `idx_key_id` | patch4 | **not yet patched**; seed skips provider update | seed UPDATE phase |
+| 8 | Legacy global `idx_key_name` on `config_keys.name` left in place by design → two tenants can't share a key NAME | patch1 (intentional) | **not yet patched**; seed tenant-prefixes key names | seed setup |
+| 9 | MCPManager registry is per-process, not tenant-scoped at runtime → cross-tenant name collision survives DB cascade | patch1 design | **not yet patched**; seed currently skips MCP entirely | seed MCP phase |
+| 10 | `TestConfigSchemaSync` fails — Stage 1 added `tenant_id` / `source_id` fields not in `config.schema.json` | patch1 | **not yet patched**; needs `excludedGoFields` update or schema update | local test run |
+
+Plus several seed-surface quirks (not bugs, just gateway behaviors the seed had to learn):
+
+| Quirk | Discovered |
+|---|---|
+| VK can only bind to ONE of team / customer / access-profile (gateway 400) | seed VK phase, first iteration |
+| `/api/governance/users` not exposed in this gateway fork (405) | seed user phase, first iteration — dropped |
+| MCP client name validation rejects hyphens ("echo-mcp" → 400; use "echo_mcp") | seed MCP phase |
+| Provider key model whitelist: `*` cannot coexist with explicit model names | seed key phase |
+| `schemas.Key.BlacklistedModels` (json `blacklisted_models`, no `omitempty`) — nil slice serializes to `null`, admin UI "Edit key" dialog rejects "Blocked Models — This field is required" | manual UI inspection after seed |
+
+---
+
+## Detailed write-ups
+
+### #2 — Tenant DELETE cascade (patch8)
+
+**Symptom.** `DELETE /api/tenants/{id}` returned 200 but left every child
+row (providers, keys, VKs, teams, customers, budgets, rate-limits,
+mcp-clients) intact. Re-creating a tenant with the same `id` and then
+re-seeding it failed with 409 `Provider gemini already exists for this
+tenant` — the "previous" run's orphans now belonged to the "new" tenant
+that re-claimed the id.
+
+**Root cause.** [platform_tenants.go:218](../../transports/bifrost-http/handlers/platform_tenants.go#L218)
+(pre-patch8) did `db.Delete(&TableTenant{}, "id = ?", id)` and nothing
+else. The cascade-delete the schema implies (because every child row
+carries `tenant_id`) was not implemented anywhere.
+
+**Why we missed it.** patch3 added the tenant CRUD as a new admin surface
+and the reviewer's mental model was "tenant is just a directory entry";
+the implicit lifecycle relationship to all the tenant-scoped child
+tables wasn't on the checklist. There was no test that created a tenant,
+seeded it, deleted the tenant, then re-created with the same id.
+
+**Fix.** patch8 wraps DELETEs of all 8 child tables + the parent in a
+single transaction, parents-before-children for FK safety
+(`config_keys` → `config_providers`, `virtual_keys` →
+`teams/customers`).
+
+**Lesson.** Any new tenant-scoped table needs to be added to the
+cascade-delete list. There's no compile-time check.
+
+### #3 — Scope callback ordering (patch9)
+
+**Symptom.** With `BIFROST_ASSERT_TENANT_ON_INSERT=true` (strict mode),
+`POST /api/governance/customers` returned 500 `failed to create
+customer`. Server logs only had the generic message (the handler
+swallowed the wrapped tx error). Customer rows weren't getting inserted
+even though the handler explicitly stamped
+`customer.TenantID = TenantIDFromCtx(ctx)`.
+
+**Root cause.** The handler nests budget + rate-limit INSERTs inside the
+same transaction as the customer INSERT, and only stamps tenant on the
+customer row (not the nested rows). The GORM scope-callback (Layer 2)
+is supposed to backfill `tenant_id` from ctx on the nested rows, but
+the strict BeforeCreate hooks (Layer 3) fire FIRST and reject the
+empty value. The scope callback was registered
+`Before("gorm:create")` — GORM's `gorm:before_create` step runs before
+`gorm:create`, so the BeforeCreate hooks see the field empty.
+
+**Why we missed it.** Strict mode (`BIFROST_ASSERT_TENANT_ON_INSERT`)
+was added late in the session as a safety belt. The original design
+relied on per-handler explicit stamps (Layer 1) and the scope callback
+(Layer 2); the strict assertion hook (Layer 3) was added without
+re-verifying the GORM callback ordering. Tests that ran under the
+non-strict default never tripped the ordering issue.
+
+**Fix.** patch9 re-registers as
+`Before("gorm:before_create")`.
+
+**Lesson.** When stacking GORM callbacks at different points in the
+lifecycle (Create → BeforeCreate → BeforeSave → ...), pin the
+ordering explicitly. Document the ordering invariant in the registration
+site so future contributors don't move it.
+
+### #4 — `GetProviderKeys` cross-tenant leak (patch10)
+
+**Symptom.** `GET /api/providers/openai/keys` with header
+`x-f5xc-tenant: shaun` returned 6 keys: 3 from shaun PLUS 3 from acme
+(any tenant that had also created an `openai` provider). Direct,
+silent, cross-tenant data leak.
+
+**Root cause.** The handler calls
+`h.dbStore.GetProviderKeys(ctx, provider)`, which issues a JOIN:
+
+```go
+s.DB().WithContext(ctx).
+    Table("config_providers").
+    Select("config_keys.*").
+    Joins("LEFT JOIN config_keys ON config_keys.provider_id = config_providers.id").
+    Where("config_providers.name = ?", string(provider)).
+    Scan(&dbKeys)
+```
+
+GORM sets `Statement.Schema` from the Scan dest (`[]TableKey`), so
+`hasTenantColumn` is true. `qualifyTenantColumn` uses
+`Statement.Table` which IS `config_providers`, so the callback's WHERE
+becomes `config_providers.tenant_id = ?`. That correctly restricts
+which providers match — yet the leak still happened in practice. Most
+likely: the qualified WHERE was applied to a sub-expression that didn't
+constrain the JOIN's right side, OR the callback wasn't reached at all
+for this Scan path. Either way the JOIN returned `config_keys` rows
+whose own `tenant_id` did not match the request.
+
+**Why we missed it.** The callback was designed and tested against
+single-table queries (Find, First, Save). JOINs spanning two
+tenant-scoped tables were never explicitly exercised. No test asserted
+"tenant A's listKeys returns ONLY tenant A's keys" with two tenants in
+the DB.
+
+**Fix.** patch10 adds an explicit
+`Where("config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL", tid)`
+predicate to GetProviderKeys when ctx has a tenant. Belt-and-suspenders
+— the callback's WHERE is still there too.
+
+**Lesson.** Any JOIN spanning two tenant-scoped tables needs the
+predicate explicitly on the JOINed side. Don't trust the scope callback
+to follow the join. (See sibling audit — there may be more.)
+
+### #7 — `UpdateProvider` not tenant-safe on the `inMemoryStore` write path
+
+**Symptom.** When the second tenant updates `openai`, 500
+`a record with this key id already exists`.
+
+**Root cause.** [providers.go:563](../../transports/bifrost-http/handlers/providers.go#L563)
+calls `h.inMemoryStore.UpdateProviderConfig(ctx, provider, config)`.
+The `inMemoryStore` is the shared `lib.Config` BaseAccount — its
+`Providers` map is GLOBAL (not tenant-keyed). When the second tenant
+updates `openai`, the write triggers a downstream "sync keys to DB"
+path that tries to INSERT key rows whose `key_id` already exists under
+a different tenant — the global `idx_key_id` unique constraint trips.
+
+The lines just above (457-462) DO refetch keys from the tenant-scoped
+`h.dbStore`, but the subsequent
+`h.inMemoryStore.UpdateProviderConfig` re-enters the legacy
+in-memory + sync path. patch4's tenant-routing migration is
+**incomplete** on this code path — should be `h.dbStore.UpdateProviderConfig`.
+
+**Fix.** Not yet patched. Seed workaround: skip the provider-update
+step in the lifecycle test.
+
+### #8 — Legacy global `idx_key_name` left in place (design tradeoff)
+
+**Symptom.** Two tenants cannot create keys with the same NAME (e.g.
+both `openai-main`) — 500 `API key names must be unique across providers`.
+
+**Root cause.** [migrations.go:1529](../../framework/configstore/migrations.go#L1529)
+creates the single-column unique index `idx_key_name` on
+`config_keys(name)`. patch1's tenant migration ADDED a composite
+`(tenant_id, name)` index but explicitly left the legacy global index
+in place because "OSS upsert sites still target it" (per
+[00-review-and-plan.md](./00-review-and-plan.md)).
+
+**Fix.** Not yet patched. Seed workaround: tenant-prefix all key
+names (`acme_openai-main`, `shaun_openai-main`). The proper fix is to
+drop `idx_key_name` AND update OSS upsert sites to target the composite
+index instead.
+
+### #9 — MCPManager registry per-process, not tenant-scoped
+
+**Symptom.** Two tenants creating an MCP client with the same name
+collide in the in-memory `MCPManager` registry, even though the DB
+rows are correctly tenant-scoped. Tenant DELETE cascade nukes the DB
+row but leaves the registry entry, so a future re-seed under the
+recreated tenant hits "client with name X already exists".
+
+**Fix.** Not yet patched. Seed currently skips MCP entirely. Proper
+fix: tenant-scope the MCPManager registry (or evict on tenant delete /
+mcp delete via runtime hook similar to patch7's `TenantEvict`).
+
+### #10 — `TestConfigSchemaSync` failing
+
+**Symptom.** `lib` test package: `TestConfigSchemaSync` fails with
+6 schema errors:
+
+```
+[governance.budgets]      Field 'tenant_id' in tables.TableBudget but missing from schema
+[governance.customers]    Field 'tenant_id' in tables.TableCustomer but missing from schema
+[governance.rate_limits]  Field 'tenant_id' in tables.TableRateLimit but missing from schema
+[governance.teams]        Field 'source_id' in tables.TableTeam but missing from schema
+[governance.teams]        Field 'tenant_id' in tables.TableTeam but missing from schema
+[governance.virtual_keys] Field 'tenant_id' in tables.TableVirtualKey but missing from schema
+```
+
+**Root cause.** patch1 added `tenant_id` to 5 governance tables (and
+`source_id` to teams) but didn't update the OSS `config.schema.json`
+or the `excludedGoFields` list in `lib/config_test.go`.
+
+**Fix.** Not yet patched. Either add the fields to the schema (and the
+schema deserves to know about tenant_id) or extend
+`excludedGoFields`.
+
+---
+
+### #11 — `Key.BlacklistedModels` serializes to `null`, UI rejects
+
+**Symptom.** After a clean seed run, opening any key in the admin UI's
+"Edit key" dialog shows "Blocked Models" with red text "This field is
+required" — Save is blocked. The same key created/edited entirely
+through the UI works fine.
+
+**Root cause.** `schemas.Key.BlacklistedModels` is declared with json
+tag `blacklisted_models` and NO `omitempty`. The seed (and any SDK
+caller) that omits the field leaves it as `nil`, which Go marshals to
+literal `null`. The gateway stores it as-is (NULL in SQLite), and on
+GET the response is `"blacklisted_models": null`. The admin UI's
+edit-key validator interprets `null` as "missing" and renders the
+required-field error. Either `[]` or `null` is functionally equivalent
+to the gateway, but the UI doesn't know that.
+
+**Why we missed it.** The seed was driven entirely from the API; we
+never opened the UI's edit dialog after the run.
+
+**Fix.** Two-layer:
+- SDK normalization (`go-bifrost-ai/providers/providers.go::normalizeKeyListFields`
+  applied inside `CreateKey` and `UpdateKey`): nil → empty slice
+  before marshal. Defensive — any caller is safe.
+- Seed explicitly sets `BlacklistedModels: schemas.BlackList{}` at
+  the call site with an inline comment so future readers see the
+  intent.
+
+A deeper fix lives in the gateway / UI: either add `omitempty` to the
+schema tag and treat null/empty as identical in the validator, or fix
+the UI to accept null. Not in scope for this fork's patch series.
+
+**Lesson.** SDK boundary is a good place to normalize known-quirky
+wire shapes — but document the normalization at the SDK site so it's
+discoverable, and double-stamp at the seed/caller site so the intent
+is visible in code review.
+
+---
+
+## Sibling JOINs with the same risk class (audit 2026-06-16)
+
+Audit triggered after patch10. Searched every `.Joins(...)` in
+`framework/configstore/` for the same pattern (two tenant-scoped
+tables joined, primary-table-only WHERE filter from the scope
+callback). Three more candidates found:
+
+### #4a — `getProviderKeyByName` (HIGH, not yet patched)
+
+[rdb.go:1307-1320](../../framework/configstore/rdb.go#L1307)
+
+```go
+Table("config_keys").
+    Joins("JOIN config_providers ON config_providers.id = config_keys.provider_id").
+    Where("config_providers.name = ? AND config_keys.key_id = ?", string(provider), keyID).
+    First(&dbKey)
+```
+
+Primary table here is `config_keys`, so the scope callback's WHERE
+becomes `config_keys.tenant_id = ?` — which happens to work for this
+specific query (it correctly restricts the key side). But the pattern
+is fragile: any refactor that flips the primary to `config_providers`
+re-opens the leak. **Fix:** add explicit
+`AND config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL`
+predicate so the scope is independent of which side GORM treats as
+primary. Same shape as patch10.
+
+**Exposure:** `GetProviderKey` → `GET /api/providers/{p}/keys/{kid}`.
+
+### #4b — `GetVirtualKeyMCPConfigsByMCPClientStringIDs` (HIGH, not yet patched)
+
+[rdb.go:3090-3104](../../framework/configstore/rdb.go#L3090)
+
+```go
+DB().WithContext(ctx).
+    Joins("JOIN config_mcp_clients ON config_mcp_clients.id = governance_virtual_key_mcp_configs.mcp_client_id").
+    Where("config_mcp_clients.client_id IN ?", clientIDs).
+    Find(...)
+```
+
+No explicit `.Model()` or `.Table()` — primary table is inferred from
+the Find dest. The scope callback adds
+`governance_virtual_key_mcp_configs.tenant_id = ?`. `config_mcp_clients`
+is NOT scoped. A caller that knows another tenant's MCP `client_id`
+(a public-ish string) could enumerate cross-tenant VK→MCP wiring.
+**Fix:** add `AND config_mcp_clients.tenant_id = ?` and pin the
+primary table with `.Model(&tables.TableVirtualKeyMCPConfig{})`.
+
+**Exposure:** MCP client handlers in `handlers/mcp.go`.
+
+### #4c — `GetVirtualKeysPaginated` budget subquery (LOW)
+
+[rdb.go:2555-2564](../../framework/configstore/rdb.go#L2555)
+
+```go
+query = query.Joins(`LEFT JOIN (
+    SELECT virtual_key_id, MAX(current_usage) AS total_usage
+    FROM governance_budgets
+    WHERE virtual_key_id IS NOT NULL
+    GROUP BY virtual_key_id
+) AS vk_budget_totals ON vk_budget_totals.virtual_key_id = governance_virtual_keys.id`)
+```
+
+The outer `governance_virtual_keys` IS tenant-scoped (the base
+`query` is built via `ScopedDB(ctx)`). The subquery aggregates ALL
+budget rows for ALL VKs across tenants, but the outer JOIN
+condition (`vk_budget_totals.virtual_key_id = governance_virtual_keys.id`)
+self-limits to in-scope VKs — the cross-tenant budget rows have
+`virtual_key_id` values that don't match any of the requesting
+tenant's VKs. **Risk is self-limiting today** but a refactor that
+weakens the outer JOIN condition could expose it. **Fix
+(belt-and-suspenders):** add `WHERE governance_budgets.tenant_id = ?`
+inside the subquery.
+
+### Source warning we missed
+
+`tenant_scope.go:133-142` explicitly says:
+
+> The column is qualified with the primary table name so JOINs across
+> two tenant-scoped tables don't throw "ambiguous column name" at
+> the DB. **The qualification falls back to bare `tenant_id` only
+> when the statement's primary table isn't known.**
+
+That warning was in the codebase the whole time. The lesson:
+the qualified-WHERE pattern was designed for the *correctness of the
+SQL* (no ambiguous column errors), not for *enforcement of tenant
+scope on the joined side*. Two separate concerns.
+
+---
+
+## Standing audit / lessons-learned checklist
+
+Before adding new tenant-scoped surface to this fork, walk this list:
+
+1. **DELETE cascade.** Does your new table need to be added to
+   [platform_tenants.go::delete](../../transports/bifrost-http/handlers/platform_tenants.go)
+   cascade list? If it carries `tenant_id` and child rows belong to a
+   tenant, YES.
+
+2. **INSERT path stamps tenant_id.** Three layers: handler stamps
+   explicitly (Layer 1), GORM scope callback backfills (Layer 2),
+   per-model `BeforeCreate` strict assert (Layer 3). All three need to
+   line up — and Layer 2 MUST run before Layer 3 (see patch9).
+
+3. **JOINs that span two tenant-scoped tables.** Always add an explicit
+   `WHERE <joined>.tenant_id = ?` predicate on the joined side. Don't
+   trust the scope callback to follow the join. (See #4 / patch10.)
+
+4. **Don't write via `h.inMemoryStore` in multi-tenant code paths.**
+   The in-memory store is a shared cache that triggers cross-tenant
+   collisions on global unique indexes. Use `h.dbStore.*` and evict
+   the per-tenant runtime via `handlers.EvictTenant(ctx)` instead.
+
+5. **In-memory registries.** If your component holds a per-process
+   registry of named objects (MCPManager, plugin registry, etc.),
+   either tenant-scope the registry OR wire a `TenantEvict`-style
+   cleanup hook. The DB cascade alone won't reach an in-memory
+   registry.
+
+6. **Test with two tenants in the same DB.** Single-tenant tests pass
+   for code that's broken under multi-tenant; the
+   `go-bifrost-ai/examples/seed` driver runs a full
+   `seed → UPDATE on tenant B → DELETE on tenant C → assert` cycle and
+   has caught most of these. Add new assertions there when the
+   gateway gains new tenant-scoped surface.
+
+7. **Composite (tenant_id, X) unique indexes.** When adding new
+   uniqueness constraints, create a composite — not a single-column
+   global. See #8 for why; the legacy `idx_key_name` is on the
+   "should-be-dropped" list precisely because it forces global
+   uniqueness in defiance of the tenant model.
+
+8. **Strict-mode env flag.** Production deployments run with
+   `BIFROST_ASSERT_TENANT_ON_INSERT=true`. Test under both modes —
+   things that pass under the auto-fill-"default" default may explode
+   in strict mode if a write site forgot Layer 1.

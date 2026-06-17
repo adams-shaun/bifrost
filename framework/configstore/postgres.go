@@ -133,6 +133,15 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 
 	d := &RDBConfigStore{logger: logger}
 	d.db.Store(db)
+	// Header-model multi-tenancy: register the GORM callbacks that turn
+	// every existing SELECT/UPDATE/DELETE on a tenant-scoped table into
+	// `WHERE tenant_id = ?` (from request context) and stamp tenant_id on
+	// every INSERT. No-op for models without a TenantID column. See
+	// framework/configstore/tenant_scope.go.
+	if err := RegisterTenantScopes(db); err != nil {
+		closeDbConn(db, logger)
+		return nil, fmt.Errorf("failed to register tenant-scope callbacks: %w", err)
+	}
 
 	// migrateOnFreshFn: downstream consumers (e.g. bifrost-enterprise) run
 	// their migrations via this hook on a throwaway pool that closes after fn.

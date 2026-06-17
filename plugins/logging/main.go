@@ -1113,6 +1113,18 @@ func (p *LoggerPlugin) Cleanup() error {
 // retrieval by Inject(), or enqueues directly if no traceID is available (Go SDK path).
 // Multiple entries per traceID are supported (e.g. fallback/retry attempts within the same trace).
 func (p *LoggerPlugin) storeOrEnqueueEntry(ctx *schemas.BifrostContext, entry *logstore.Log, callback func(entry *logstore.Log)) {
+	// Stamp the tenant from BifrostContext so /api/logs filters
+	// correctly. MUST happen at this chokepoint (rather than at the
+	// dozen-ish entry construction sites above) and MUST happen
+	// BEFORE enqueue, because the batchWriter writes with the plugin
+	// root context (p.ctx) — it has no per-request tenant to read.
+	// The logstore tenant-scope callback's INSERT hook would
+	// otherwise be the only stamp source and it sees nothing on
+	// p.ctx, so the row falls back to the column's `default` schema
+	// default and every tenant's logs get bucketed as 'default'.
+	if entry != nil && entry.TenantID == "" {
+		entry.TenantID = tenantIDFromContext(ctx)
+	}
 	traceID, _ := ctx.Value(schemas.BifrostContextKeyTraceID).(string)
 	if traceID != "" {
 		// Append to slice for Inject() to pick up — supports multiple attempts per trace

@@ -127,6 +127,12 @@ type SearchStats struct {
 type Log struct {
 	ID                      string    `gorm:"primaryKey;type:varchar(255)" json:"id"`
 	ParentRequestID         *string   `gorm:"type:varchar(255);index" json:"parent_request_id"`
+	// TenantID scopes this log row to a tenant for multi-tenant
+	// deployments. Set by the logging plugin from BifrostContext when
+	// the HTTP transport's tenant-resolver middleware stamped one.
+	// Defaults to "default" via the schema default so single-tenant
+	// deployments (and any pre-existing log row) keep working.
+	TenantID                string    `gorm:"type:varchar(255);not null;default:default;index:idx_logs_tenant_id" json:"tenant_id"`
 	Timestamp               time.Time `gorm:"index;index:idx_logs_ts_provider_status,priority:1;not null" json:"timestamp"`
 	Object                  string    `gorm:"type:varchar(255);index;not null;column:object_type" json:"object"` // text.completion, chat.completion, or embedding
 	Provider                string    `gorm:"type:varchar(255);index;index:idx_logs_ts_provider_status,priority:2;not null" json:"provider"`

@@ -1,7 +1,7 @@
-From 078b217e30dfc4190e635a0dca6e8358ec938116 Mon Sep 17 00:00:00 2001
+From e053bc1fb8e1037edd7a9d92748df8b920ab9894 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 13:47:57 -0600
-Subject: [PATCH 2/5] mt-data-scope-callback: GORM tenant-scope callbacks + rdb
+Subject: [PATCH 2/6] mt-data-scope-callback: GORM tenant-scope callbacks + rdb
  tenant-scoped fallback + team composite uniqueness
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -46,14 +46,14 @@ Installs the back-end half of the header-model multi-tenant story:
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
- framework/configstore/migrations.go        |  49 ++++-
+ framework/configstore/migrations.go        |  49 +++-
  framework/configstore/postgres.go          |   9 +
- framework/configstore/rdb.go               |  19 +-
+ framework/configstore/rdb.go               |  53 +++-
  framework/configstore/sqlite.go            |   8 +
  framework/configstore/tables/team.go       |  10 +-
- framework/configstore/tenant_scope.go      | 211 +++++++++++++++++++++
- framework/configstore/tenant_scope_test.go | 105 ++++++++++
- 7 files changed, 404 insertions(+), 7 deletions(-)
+ framework/configstore/tenant_scope.go      | 320 +++++++++++++++++++++
+ framework/configstore/tenant_scope_test.go | 105 +++++++
+ 7 files changed, 544 insertions(+), 10 deletions(-)
  create mode 100644 framework/configstore/tenant_scope.go
  create mode 100644 framework/configstore/tenant_scope_test.go
 
@@ -149,10 +149,36 @@ index ef6ba0eb1..ab66bca32 100644
  	// migrateOnFreshFn: downstream consumers (e.g. bifrost-enterprise) run
  	// their migrations via this hook on a throwaway pool that closes after fn.
 diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
-index de67cd722..8c47df2bb 100644
+index de67cd722..34d64421b 100644
 --- a/framework/configstore/rdb.go
 +++ b/framework/configstore/rdb.go
-@@ -769,8 +769,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
+@@ -148,10 +148,25 @@ func schemaKeyFromTableKey(dbKey tables.TableKey) schemas.Key {
+ }
+ 
+ // tableKeyFromSchemaKey converts a schema key to a database key.
++//
++// Propagates `provider.TenantID` onto the resulting `dbKey.TenantID` so
++// every key row is born with the same tenant as its parent provider.
++// Critical for the multi-tenant story: the GORM tenant-scope callback
++// (populateTenantIDOnCreate) was supposed to be the only source of
++// truth here, reading the tenant off the request context, but field
++// experience showed paths where the callback's setTenantIfEmpty did
++// not propagate (the `dbKey` going into INSERT still had TenantID=""
++// and the row landed with the schema's '' fallback rather than the
++// `default:default` column default — orphaning the row from every
++// tenant-scoped read). Stamping at construction time eliminates the
++// race / reflection edge case entirely; the runtime assertion in
++// tenant_scope.go remains as the safety net for any future caller
++// that forgets.
+ func tableKeyFromSchemaKey(provider tables.TableProvider, key schemas.Key) (tables.TableKey, error) {
+ 	dbKey := tables.TableKey{
+ 		Provider:           provider.Name,
+ 		ProviderID:         provider.ID,
++		TenantID:           provider.TenantID,
+ 		KeyID:              key.ID,
+ 		Name:               key.Name,
+ 		Value:              key.Value,
+@@ -769,8 +784,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
  					return s.parseGormError(err)
  				}
  			} else if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -168,7 +194,54 @@ index de67cd722..8c47df2bb 100644
  				if result.Error == nil {
  					// Found by name - update existing key, preserve original KeyID
  					dbKey.ID = existingKey.ID                             // Keep the same database ID
-@@ -1358,6 +1363,16 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
+@@ -919,6 +939,7 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
+ 		dbKey := tables.TableKey{
+ 			Provider:           dbProvider.Name,
+ 			ProviderID:         dbProvider.ID,
++			TenantID:           dbProvider.TenantID, // inherit from parent provider; required by BeforeCreate guard
+ 			KeyID:              key.ID,
+ 			Name:               key.Name,
+ 			Value:              key.Value,
+@@ -1037,9 +1058,17 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
+ 	}
+ 	// Preserve ConfigHash (it has json:"-" tag so deepCopy via JSON doesn't copy it)
+ 	configCopy.ConfigHash = config.ConfigHash
+-	// Create new provider
++	// Stamp the tenant from request ctx so the row carries the caller's
++	// tenant. The GORM tenant-scope callback (populateTenantIDOnCreate)
++	// also stamps from ctx but has bitten us with reflection edge cases
++	// — explicit stamping at construction is the reliable source of
++	// truth. tenantFromContext returns ("", false) when no header was
++	// present; the per-model BeforeCreate hook then auto-fills the
++	// default tenant (non-strict) or errors (strict mode).
++	ctxTenant, _ := tenantFromContext(ctx)
+ 	dbProvider := tables.TableProvider{
+ 		Name:                     string(provider),
++		TenantID:                 ctxTenant,
+ 		NetworkConfig:            configCopy.NetworkConfig,
+ 		ConcurrencyAndBufferSize: configCopy.ConcurrencyAndBufferSize,
+ 		ProxyConfig:              configCopy.ProxyConfig,
+@@ -1059,6 +1088,7 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
+ 		dbKey := tables.TableKey{
+ 			Provider:           dbProvider.Name,
+ 			ProviderID:         dbProvider.ID,
++			TenantID:           dbProvider.TenantID, // inherit from parent provider; required by BeforeCreate guard
+ 			KeyID:              key.ID,
+ 			Name:               key.Name,
+ 			Value:              key.Value,
+@@ -1345,8 +1375,9 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
+ 	}
+ 
+ 	dbKey, err := tableKeyFromSchemaKey(tables.TableProvider{
+-		ID:   existingKey.ProviderID,
+-		Name: existingKey.Provider,
++		ID:       existingKey.ProviderID,
++		Name:     existingKey.Provider,
++		TenantID: existingKey.TenantID, // tableKeyFromSchemaKey propagates this onto the dbKey; without it the Save would write tenant_id=''
+ 	}, key)
+ 	if err != nil {
+ 		return err
+@@ -1358,6 +1389,16 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
  	dbKey.ConfigHash = existingKey.ConfigHash
  	dbKey.EncryptionStatus = existingKey.EncryptionStatus
  	dbKey.CreatedAt = existingKey.CreatedAt // Preserve original creation timestamp
@@ -185,6 +258,18 @@ index de67cd722..8c47df2bb 100644
  
  	if err := txDB.WithContext(ctx).Save(&dbKey).Error; err != nil {
  		return s.parseGormError(err)
+@@ -1678,9 +1719,11 @@ func (s *RDBConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfig
+ 		if err != nil {
+ 			return err
+ 		}
++		mcpCtxTenant, _ := tenantFromContext(ctx) // stamp from request ctx; BeforeCreate guard auto-fills default when absent
+ 		dbClient := tables.TableMCPClient{
+ 			ClientID:              clientConfigCopy.ID,
+ 			Name:                  clientConfigCopy.Name,
++			TenantID:              mcpCtxTenant,
+ 			IsCodeModeClient:      clientConfigCopy.IsCodeModeClient,
+ 			ConnectionType:        string(clientConfigCopy.ConnectionType),
+ 			ConnectionString:      clientConfigCopy.ConnectionString,
 diff --git a/framework/configstore/sqlite.go b/framework/configstore/sqlite.go
 index 9482801d0..421f1ea79 100644
 --- a/framework/configstore/sqlite.go
@@ -205,7 +290,7 @@ index 9482801d0..421f1ea79 100644
  	// handle on the same file would contend for the single-writer lock —
  	// so both hooks operate on the existing *gorm.DB.
 diff --git a/framework/configstore/tables/team.go b/framework/configstore/tables/team.go
-index 7dc8c037b..b65d38438 100644
+index 0c37a3db0..a5e31ef1d 100644
 --- a/framework/configstore/tables/team.go
 +++ b/framework/configstore/tables/team.go
 @@ -11,14 +11,18 @@ import (
@@ -232,10 +317,10 @@ index 7dc8c037b..b65d38438 100644
  	Customer    *TableCustomer    `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`
 diff --git a/framework/configstore/tenant_scope.go b/framework/configstore/tenant_scope.go
 new file mode 100644
-index 000000000..786ab1c11
+index 000000000..2d77b7afc
 --- /dev/null
 +++ b/framework/configstore/tenant_scope.go
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,320 @@
 +// Package configstore — tenant_scope.go.
 +//
 +// The single GORM callback registration that makes every existing
@@ -274,7 +359,11 @@ index 000000000..786ab1c11
 +
 +import (
 +	"context"
++	"fmt"
++	"os"
 +	"reflect"
++	"runtime/debug"
++	"strings"
 +
 +	"github.com/maximhq/bifrost/multitenant"
 +	"gorm.io/gorm"
@@ -399,12 +488,36 @@ index 000000000..786ab1c11
 +// from ctx on each row in the statement BEFORE the INSERT runs, when
 +// the row didn't already carry an explicit value.  Bulk inserts (a
 +// slice of rows) are handled by iterating the reflect value.
++//
++// Strict-mode assertion: when ctx has no tenant_id AND the row's
++// TenantID field is the zero string AND the model is tenant-scoped,
++// the callback FAILS the write with a descriptive error containing a
++// stack trace. Most legitimate "no tenant on ctx" cases (config.json
++// boot sync, cron jobs, single-tenant deployments) set TenantID
++// explicitly on the struct (e.g. DefaultTenantID), so they bypass
++// this assertion. What it catches: API handlers that re-wrap ctx and
++// drop the tenant, plugins writing in goroutines that lost the
++// per-request ctx, and any future code path that forgets to thread
++// the request context through to the DB. The alternative — silently
++// falling back to the schema's `default:default` column default — is
++// exactly the failure mode that produced the cross-tenant data
++// corruption fixed in the 06-16 incident (rows ended up with
++// tenant_id='default' while their owning provider was tenant='shaun',
++// breaking every subsequent tenant-scoped read).
++//
++// Opt-out: BIFROST_ASSERT_TENANT_ON_INSERT=false downgrades the
++// assertion to a stderr log. Default is strict (fail the write).
 +func populateTenantIDOnCreate(tx *gorm.DB) {
 +	if tx.Error != nil || !hasTenantColumn(tx) {
 +		return
 +	}
 +	tid, ok := tenantFromContext(tx.Statement.Context)
 +	if !ok {
++		// No tenant on ctx — only safe if every row in the batch has
++		// TenantID already populated by the caller. If any row is
++		// still zero-string, the row will fall back to the schema
++		// default and we'll silently corrupt cross-tenant state.
++		assertEveryRowCarriesTenant(tx)
 +		return
 +	}
 +	rv := tx.Statement.ReflectValue
@@ -417,14 +530,93 @@ index 000000000..786ab1c11
 +	case reflect.Struct:
 +		setTenantIfEmpty(ctx, rv, tid)
 +	}
++	// Post-check: setTenantIfEmpty is reflection-based and has bitten
++	// us with edge cases where the mutation didn't propagate to the
++	// actual INSERT (live cluster wrote tenant_id='' on a row even
++	// though ctx tenant was set). Re-walk the rows and assert each
++	// one carries a non-empty TenantID before the SQL fires. This is
++	// the post-condition matching the pre-condition asserted by
++	// assertEveryRowCarriesTenant above for the no-ctx branch — both
++	// paths now share the same guarantee.
++	assertEveryRowCarriesTenant(tx)
 +}
 +
-+// setTenantIfEmpty sets the TenantID field on rv to tid only when the
-+// field's current value is the zero string.  Honors caller-supplied
-+// tenant ids (e.g. /api/platform/tenants admin handlers that mint
-+// rows on behalf of a tenant other than the one in their own
-+// request) — gorm.Field.Set has reasonable semantics for the string
-+// case but we gate on emptiness ourselves for clarity.
++// assertEveryRowCarriesTenant checks each row in the INSERT statement
++// has a non-empty TenantID. If any row is empty (which would fall back
++// to the schema's `default:default` column default), the callback
++// errors-out the INSERT with a stack trace identifying the caller —
++// unless BIFROST_ASSERT_TENANT_ON_INSERT=false, in which case the
++// failure is downgraded to a stderr log and the INSERT proceeds.
++func assertEveryRowCarriesTenant(tx *gorm.DB) {
++	rv := tx.Statement.ReflectValue
++	switch rv.Kind() {
++	case reflect.Slice, reflect.Array:
++		for i := 0; i < rv.Len(); i++ {
++			if !rowHasTenant(rv.Index(i)) {
++				raiseTenantAssertion(tx, fmt.Sprintf("INSERT into %s with row #%d.TenantID=\"\" and no tenant on ctx", tx.Statement.Table, i))
++				return
++			}
++		}
++	case reflect.Struct:
++		if !rowHasTenant(rv) {
++			raiseTenantAssertion(tx, fmt.Sprintf("INSERT into %s with TenantID=\"\" and no tenant on ctx", tx.Statement.Table))
++		}
++	}
++}
++
++// rowHasTenant returns true when the row's TenantID field is non-empty.
++// Tolerates nil pointers + non-struct values (returns true — there's
++// nothing to assert).
++func rowHasTenant(rv reflect.Value) bool {
++	if rv.Kind() == reflect.Ptr {
++		if rv.IsNil() {
++			return true
++		}
++		rv = rv.Elem()
++	}
++	if rv.Kind() != reflect.Struct {
++		return true
++	}
++	field := rv.FieldByName("TenantID")
++	if !field.IsValid() || field.Kind() != reflect.String {
++		return true
++	}
++	return field.String() != ""
++}
++
++// strictAssertEnv opts INTO strict mode (default = log-only). Set to
++// true/1/yes/on to convert the assertion from a stderr warning into a
++// hard write failure. The Bifrost helm chart sets this in multi-
++// tenant deployments; OSS tests + single-tenant deployments leave it
++// unset so existing fixture rows that don't carry a tenant continue
++// to insert (preserving OSS behaviour by default).
++const strictAssertEnv = "BIFROST_ASSERT_TENANT_ON_INSERT"
++
++// raiseTenantAssertion either fails the INSERT (when strictAssertEnv
++// is set truthy) or logs a loud stderr warning. Includes a stack
++// trace so the offending call site is obvious in the failure report.
++func raiseTenantAssertion(tx *gorm.DB, msg string) {
++	stack := debug.Stack()
++	envVal := strings.ToLower(strings.TrimSpace(os.Getenv(strictAssertEnv)))
++	strict := envVal == "true" || envVal == "1" || envVal == "yes" || envVal == "on"
++	if strict {
++		_ = tx.AddError(fmt.Errorf("multitenant: tenant assertion failed: %s\n%s", msg, stack))
++		return
++	}
++	fmt.Fprintf(os.Stderr, "[WARN] multitenant: tenant assertion (logged, not blocked): %s\n%s\n", msg, stack)
++}
++
++// setTenantIfEmpty sets the TenantID field on rv to tid when the
++// field's current value is either the zero string OR the literal
++// "default". The "default" case is critical: the GORM `default:default`
++// tag on every tenant-scoped table causes GORM to pre-fill TenantID
++// with "default" BEFORE this callback fires. Without this override, a
++// genuine ctx-supplied tenant id (e.g. "shaun") never makes it onto
++// the row — every INSERT lands with tenant_id="default" regardless
++// of which tenant the request claims. Treating "default" as
++// overridable preserves the explicit-set semantics for any other
++// caller-supplied value (e.g. the /api/platform/tenants admin handler
++// minting a row on behalf of another tenant).
 +func setTenantIfEmpty(_ context.Context, rv reflect.Value, tid string) {
 +	if rv.Kind() == reflect.Ptr {
 +		if rv.IsNil() {
@@ -439,7 +631,9 @@ index 000000000..786ab1c11
 +	if !field.IsValid() || field.Kind() != reflect.String {
 +		return
 +	}
-+	if field.String() != "" {
++	current := field.String()
++	if current != "" && current != "default" {
++		// Caller stamped an explicit non-default tenant; respect it.
 +		return
 +	}
 +	if !field.CanSet() {

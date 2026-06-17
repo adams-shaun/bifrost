@@ -16,7 +16,11 @@ import (
 // That helps us detect changes between config file and database config
 type TableProvider struct {
 	ID                       uint      `gorm:"primaryKey;autoIncrement" json:"id"`
-	Name                     string    `gorm:"type:varchar(50);uniqueIndex;not null" json:"name"` // ModelProvider as string
+	Name                     string    `gorm:"type:varchar(50);uniqueIndex:idx_providers_tenant_name;not null" json:"name"` // ModelProvider as string; unique per (tenant_id, name)
+	// TenantID scopes this provider config to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Composite-unique with Name via
+	// idx_providers_tenant_name so two tenants can both register "openai".
+	TenantID                 string    `gorm:"type:varchar(255);not null;default:default;uniqueIndex:idx_providers_tenant_name" json:"tenant_id"`
 	NetworkConfigJSON        string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.NetworkConfig
 	ConcurrencyBufferJSON    string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ConcurrencyAndBufferSize
 	ProxyConfigJSON          string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ProxyConfig
@@ -181,4 +185,14 @@ func (p *TableProvider) AfterFind(tx *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableProvider) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "config_providers")
 }

@@ -16,6 +16,7 @@ import (
 	bifrost "github.com/maximhq/bifrost/core"
 	schemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
+	"github.com/maximhq/bifrost/multitenant"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -179,6 +180,7 @@ func Init(config *Config, pricingManager *modelcatalog.ModelCatalog, logger sche
 		"model",
 		"alias",
 		"method",
+		"tenant_id",
 		"virtual_key_id",
 		"virtual_key_name",
 		"routing_engine_used",
@@ -509,6 +511,7 @@ func (p *PrometheusPlugin) PostLLMHook(ctx *schemas.BifrostContext, result *sche
 		"model":               model,
 		"alias":               alias,
 		"method":              string(requestType),
+		"tenant_id":           tenantIDFromTelemetryCtx(ctx),
 		"virtual_key_id":      virtualKeyID,
 		"virtual_key_name":    virtualKeyName,
 		"routing_engine_used": routingEngineUsed,
@@ -879,4 +882,29 @@ func (p *PrometheusPlugin) doPush() {
 func (p *PrometheusPlugin) Cleanup() error {
 	p.DisablePushGateway()
 	return nil
+}
+
+// tenantIDFromTelemetryCtx pulls the tenant id stamped onto ctx by the
+// HTTP transport's tenant-resolver middleware so Prometheus labels can
+// distinguish per-tenant traffic. Returns "" when the request didn't
+// carry the `x-f5xc-tenant` header — Prometheus treats empty as a
+// distinct label value (the "single-tenant" or "absent" bucket).
+// Tries both the typed BifrostContextKey and the stringified form
+// because fasthttp.RequestCtx.SetUserValue stores by interface{}
+// equality so the two key shapes don't collide.
+func tenantIDFromTelemetryCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	if v := ctx.Value(string(multitenant.BifrostContextKeyTenantID)); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }

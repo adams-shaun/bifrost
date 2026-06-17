@@ -37,6 +37,14 @@ func newSqliteConfigStore(ctx context.Context, config *SQLiteConfig, logger sche
 	logger.Debug("db opened for configstore")
 	s := &RDBConfigStore{logger: logger}
 	s.db.Store(db)
+	// Header-model multi-tenancy: register the GORM callbacks that turn
+	// every existing SELECT/UPDATE/DELETE on a tenant-scoped table into
+	// `WHERE tenant_id = ?` (from request context) and stamp tenant_id on
+	// every INSERT. No-op for models without a TenantID column. See
+	// framework/configstore/tenant_scope.go.
+	if err := RegisterTenantScopes(db); err != nil {
+		return nil, fmt.Errorf("failed to register tenant-scope callbacks: %w", err)
+	}
 	// SQLite has no server-side prepared-plan cache, and opening a second
 	// handle on the same file would contend for the single-writer lock —
 	// so both hooks operate on the existing *gorm.DB.

@@ -83,6 +83,7 @@ import { ChevronRight } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCookies } from "react-cookie";
+import TenantBadge from "./tenantBadge";
 import { ThemeToggle } from "./themeToggle";
 import { Badge } from "./ui/badge";
 import { PromoCardStack } from "./ui/promoCardStack";
@@ -1476,6 +1477,11 @@ export default function AppSidebar() {
           />
         </div>
       </SidebarHeader>
+      {/* Multi-tenant: tenant switcher between header and search.
+          Hidden in the collapsed (icon-only) sidebar state. */}
+      <div className="mx-2 pt-1 pb-2 group-data-[collapsible=icon]:hidden">
+        <TenantBadge />
+      </div>
       <div className="mx-2 pb-1 group-data-[collapsible=icon]:hidden">
         <div className="relative">
           <Search className="text-muted-foreground absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2" />

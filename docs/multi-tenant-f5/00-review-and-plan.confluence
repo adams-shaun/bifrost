@@ -1,0 +1,305 @@
+{info:title=Confluence wiki-markup source}
+This file is the Confluence wiki-markup form of [00-review-and-plan.md]. To import: edit a new page → toolbar *Insert* → *Markup* → *Confluence wiki* → paste.
+
+Inline cross-doc links assume sibling Confluence pages exist with matching titles. Edit the {{[Page Title]}} link macros to point at the actual page slugs in your space.
+{info}
+
+h1. mt-header multi-tenancy — code review, design, patch plan, productization
+
+Audit of the five commits on {{shaun/vesdev-mt-header}} (over OSS {{dev}}) plus a plan for converting them into a {{f5xc-patches/<patchN>/<series>/}} overlay so this fork stays cheap to re-sync from {{maximhq/bifrost}}.
+
+Branch tip: {{17030ce15}} ← {{42c2f0588}} ← {{d714eec96}} ← {{6b4d6616f}} ← {{3e7d3ecf9}}
+
+----
+
+h2. 1. Code review
+
+h3. Commit inventory
+
+||#||SHA||Subject||LOC||Surface||
+|1|{{3e7d3ecf9}}|foundation for header-model multi-tenancy|+1873 / -13 (26 files)|Go: {{multitenant/}} pkg, {{framework/configstore/{tenant_scope,tables,migrations,rdb}.go}}, {{transports/.../handlers/{tenant_resolver,platform_tenants}.go}}, {{server/server.go}}|
+|2|{{6b4d6616f}}|extend configstore tenant scope + per-tenant migrations|+155 / -26 (4 files)|{{tenant_scope.go}}, {{rdb.go}}, {{migrations.go}}, {{tables/team.go}}|
+|3|{{d714eec96}}|tenant-scope provider/governance handlers + isolation test|+691 / -76 (8 files)|{{providers.go}}, {{provider_keys.go}}, {{governance.go}}, {{middlewares.go}}, {{platform_tenants.go}}, {{tenant_resolver.go}}, {{server.go}}, {{mt_governance_isolation_test.go}}|
+|4|{{42c2f0588}}|UI tenant picker + redux surface + branding|+520 / -48 (12 files)|{{ui/lib/store/{slices,apis,hooks}/...}}, {{ui/components/{sidebar,tenantBadge}.tsx}}, {{ui/lib/constants/config.ts}}, branding SVGs|
+|5|{{17030ce15}}|wire multitenant module into local Docker image + opencode bridge|+273 (3 files)|{{transports/Dockerfile.local}}, {{multitenant/scripts/bifrost-to-opencode.sh}}, {{.gitignore}}|
+
+Total: *~3,500 LOC across 51 distinct files* (foundation is ~55% of the change).
+
+h3. What's good
+
+* *One header, one truth, one callback.* {{x-f5xc-tenant}} arrives at the edge, the resolver stamps it onto request ctx, and a single GORM callback registration ({{tenant_scope.go:58-76}}) appends {{WHERE tenant_id = ?}} to every SELECT / UPDATE / DELETE and populates {{tenant_id}} on every INSERT. Compared to the URL-path branch's ~42 patches that duplicated every handler under {{/api/tenants/{tid}/...}}, this approach *doesn't touch existing handlers at all* for the data-scope half of the story.
+* *Single-tenant fallback is free.* Header absent → {{tenantFromContext}} returns {{("", false)}} → callback short-circuits → behavior is identical to upstream OSS. The schema's {{default:default}} column default does the rest on INSERTs that happen without a context.
+* *Migration is consolidated and idempotent.* One gormigrate entry creates {{tenants}}, seeds {{default}}, adds {{tenant_id}} to 8 tables, backfills, and flips four single-column unique indexes to composite {{(tenant_id, name)}}. {{ON CONFLICT DO NOTHING}} and {{HasColumn}}/{{HasIndex}} guards keep it safe to re-run. The explicit decision to *leave the legacy single-column {{name}} unique indexes in place* is well-reasoned and documented inline ({{migrations.go:9922-9942}}) — OSS upsert sites still target them.
+* *Plugin share-shim solves a real bug.* {{multitenant/plugin_share.go}} wraps each shared {{LLMPlugin}}/{{MCPPlugin}} so a tenant-runtime {{Shutdown()}} doesn't call {{Cleanup()}} on plugin state the root still depends on. Pure forwarder, no policy.
+* *Isolation regression test exists.* {{mt_governance_isolation_test.go}} asserts the two real failure modes the URL-path series previously caught (team-name composite uniqueness; cross-tenant customer_id guard).
+* *Trade-offs are documented in code.* Every wart (Stage 1 vs Stage 2, legacy-index retention, busy-loop eviction) carries a comment explaining _why_ the current shape is acceptable and what the follow-up should be.
+
+h3. Concerns / debt
+
+# *The runtime isn't actually multi-tenant yet.* {{multitenant.Manager}} exists with LRU + refcount + {{initOnce}}, but {{server.go}} never calls {{Acquire}}. Inference still dispatches through the single root {{s.Client}}. The header gives us *data scope* isolation (via GORM); it does *not* give us *runtime* isolation (queues, MCP managers, provider workers are shared). This is acknowledged as Stage 2 work, but it's the biggest semantic gap and worth a section in the productization plan.
+# *Best-effort {{inMemoryStore}} sync* in {{providers.go:373-378}} and {{provider_keys.go:175-181}} mutates the shared {{c.Providers}} map under {{Mu}}. Until Stage 2 turns that map tenant-keyed, the inference runtime sees *whoever wrote last* — provider configs are not actually isolated at request time. Two tenants with {{anthropic}} providers pointing at different base URLs will collide.
+# *Dual context-key lookup is fragile.* {{tenant_scope.go:104-119}} tries both the typed {{BifrostContextKey}} and the stringified form because {{fasthttp.RequestCtx.SetUserValue}} stores by {{interface{}}} equality. Documented, but a sharper fix would be: middleware sets only the typed form, and any consumer reads from the typed form. Worth a follow-up.
+# *{{var _ = lib.ErrNotFound}}* at {{provider_keys.go:18-19}} is a smell. Either keep a real {{lib}} reference or drop the import.
+# *{{tenant_resolver.go}} accumulated policy.* The file started as "middleware reads header, stamps ctx" and grew the {{disableDefaultTenant}} policy with {{isUnsafeMethod}} + {{isAdminPath}} filters. Extracting policy into a sibling middleware would keep the resolver trivial and ease OSS rebase if anyone upstreams a similar pattern.
+# *{{Manager.maybeEvictLocked}} busy-loops* on {{time.Sleep(10ms)}} ({{manager.go:182-217}}). The comment says "spike-quality back-off." Fine for Stage 1; production needs a condvar or per-entry signal channel before this carries real traffic.
+# *{{Manager.evict}} ref-count drain has a fixed 5s deadline.* A long-lived streaming inference will be torn down forcibly. Needs an op-tunable {{EvictGracePeriod}} and metric.
+# *VK bearer recognition is prefix-only.* {{middlewares.go:1010-1022}} admits any {{sk-bf-…}} string at auth time and delegates validation to the governance plugin downstream. Correct, but worth a sentence: _if the governance plugin is misconfigured, this becomes "any sk-bf- string bypasses session auth"_. Belt-and-braces: also validate the VK belongs to the header tenant.
+# *{{multitenant/}} has zero unit tests.* Manager LRU, refcount, init race, plugin share-shim, account — all untested. The handler isolation test is end-to-end, not a substitute. Manager especially needs unit coverage for concurrent {{Acquire}}/{{Evict}}/{{Shutdown}}.
+# *{{migrationAddTenantsAndTenantIDColumns.Rollback}} is a no-op.* Intentionally — rolling back schema without rolling back the resolver would corrupt routing. Worth highlighting in the operator runbook.
+# *{{/api/platform/tenants}} auth is admin-session-only.* Anyone with the Bifrost admin Basic creds can create/delete tenants. RBAC on this surface needs to land before SaaS.
+
+----
+
+h2. 2. Design summary
+
+h3. Identity transport — one canonical header
+
+Tenant identity reaches every layer via the {{x-f5xc-tenant}} request header. No URL path segment, no body field, no per-handler parameter. The exact string lives once at {{multitenant/tenant.go:38}} and is read in three places:
+
+# *HTTP edge* — {{TenantResolverMiddleware}} peeks the header, stamps it onto the fasthttp {{UserValue}} (so GORM's {{stmt.Context.Value(...)}} sees it) and onto any attached {{BifrostContext}} (so inference plugins see it).
+# *Data scope* — {{RegisterTenantScopes}} installs four GORM callbacks (Query / Update / Delete / Create) that read the tenant from {{tx.Statement.Context}} and either constrain the predicate or populate the column.
+# *UI* — {{baseApi.prepareHeaders}} reads from the {{tenant}} Redux slice and sets {{x-f5xc-tenant}} on every RTK Query request.
+
+h3. Why a header (and not URL-path tenant scoping)
+
+The URL-path branch (which became the abandoned {{multi-tenant}} branch on this repo) shipped 42 patches duplicating every admin handler under {{/api/tenants/{tid}/...}}. Every OSS handler edit upstream needed a parallel edit on the {{/tenants/{tid}/...}} surface; every response shape divergence became a test matrix. Header-based identity collapses that:
+
+* *One handler tree.* {{/api/providers}}, {{/api/governance/virtual-keys}}, {{/api/mcp/clients}} etc. stay exactly where OSS puts them. The handlers don't read the header; they hit {{dbStore}}, which goes through the GORM callback, which scopes by ctx.
+* *No response-shape drift.* Tenant routes returned tenant-shaped payloads; legacy routes returned legacy-shaped payloads; both code paths fought over response evolutions. Header model: one shape.
+* *OSS rebase cost is the diff of {{f5xc-patches/}}, not 42 parallel handlers.* When upstream renames {{providerHandler.addProvider}}, we rebase one hunk in patch4, not 42 hunks across 42 patch files.
+* *Single-tenant deployments are zero-friction.* Header absent → fallback. OSS users of our fork who never set {{x-f5xc-tenant}} get OSS behavior verbatim.
+
+h3. What the foundation actually changes upstream
+
+The patch lands *four* kinds of edits in OSS source:
+
+# *New files* (zero merge risk):
+#* {{multitenant/}} (whole module — manager, runtime, tenant, account, plugin_share)
+#* {{framework/configstore/tenant_scope.go}}
+#* {{framework/configstore/tables/tenant.go}}
+#* {{transports/bifrost-http/handlers/{tenant_resolver,platform_tenants}.go}}
+#* {{mt_governance_isolation_test.go}}
+# *Struct-tag additions* on existing tables (low risk — one-line per table). Adds {{TenantID}} field with {{not null;default:default;index}} and flips single-column {{Name}} unique indexes to composite {{idx_*_tenant_name}}. Eight tables touched.
+# *Migration registration* — one new entry registered in {{triggerMigrations}}, plus a second small migration (team-name composite) in commit 2. Both go at the *end* of the chain so OSS migration churn doesn't reorder ours.
+# *Wiring* — {{server.go}} (two routes) and {{rdb.go}} (config sync upsert target + tenant-scoped key fallback lookup). These are the highest-risk hunks for OSS rebase because the surrounding lines are heavily edited upstream.
+
+h3. What is NOT touched
+
+* Inference path code ({{core/}}, plugins). The header flows through to plugins via {{BifrostContext}} and they can opt in, but nothing is forced.
+* Logging plugin: tenant_id ends up in ctx but the logstore plugin doesn't yet stamp it on rows. Follow-up.
+* Bifrost runtime ({{core/bifrost.go}}). The Manager exists but server.go doesn't call it. Inference still goes through {{s.Client}}.
+
+----
+
+h2. 3. Patch plan — ordered groupings
+
+The five commits don't map 1-to-1 onto patches. Reordering by logical concern makes the patch series easier to rebase and easier for a reviewer to understand without {{git log}} archaeology.
+
+Target layout: {{f5xc-patches/patchN/<series>/{apply.sh,patches/000K-*.patch}}}.
+
+h3. patch1 / mt-foundation-schema
+
+*Contents* (subset of commit 3e7d3ecf9):
+* {{multitenant/}} whole module ({{manager.go}}, {{runtime.go}}, {{tenant.go}}, {{account.go}}, {{plugin_share.go}}, {{go.mod}}, {{go.sum}})
+* {{framework/configstore/tables/tenant.go}} (new)
+* {{tenant_id}} column + composite-index tags on: {{tables/{customer,team,virtualkey,budget,ratelimit,provider,key,mcp}.go}}
+* {{framework/configstore/migrations.go}}: register {{migrationAddTenantsAndTenantIDColumns}} + the migration itself
+* {{framework/go.mod}} + {{transports/go.mod}} (module deps for {{multitenant}})
+* {{.gitignore}} ({{go.work.local}})
+
+*Why first.* Schema must exist before any code reads or writes against it. The {{multitenant.TenantID}}, {{multitenant.HeaderName}}, {{multitenant.BifrostContextKeyTenantID}} constants get referenced by every later patch — they need to land first. Migration goes at the end of OSS's migration chain (it already does), so an OSS migration churn next month doesn't reorder ours.
+
+*Estimated size:* ~1,200 LOC. Low rebase risk — almost entirely new files. The only existing-file edits are struct-tag additions and one migration registration line.
+
+h3. patch2 / mt-data-scope-callback
+
+*Contents* (rest of commit 3e7d3ecf9 + commit 6b4d6616f):
+* {{framework/configstore/tenant_scope.go}} (new — includes the dual-key lookup + JOIN-safe table qualification merged forward from commit 2)
+* {{framework/configstore/sqlite.go}} + {{postgres.go}} opener registration hunks (one line each: {{RegisterTenantScopes(db)}})
+* {{framework/configstore/rdb.go}} config-sync edits: explicit {{DefaultTenantID}} stamp on provider/key writes, composite upsert target, tenant-scoped key fallback lookup
+* {{migrationTenantScopedTeamNameUnique}} + idempotency guard on {{migrationUniqueTeamNames}}
+
+*Why second.* Needs patch1's schema. Pure data layer — no HTTP changes, so it can be tested independently with a configstore-only harness.
+
+*Estimated size:* ~300 LOC. Medium rebase risk — {{rdb.go}} is upstream-busy.
+
+h3. patch3 / mt-http-resolver
+
+*Contents* (subset of commits 3e7d3ecf9 + d714eec96):
+* {{transports/bifrost-http/handlers/tenant_resolver.go}} (final form from commit 3 — includes {{disableDefaultTenant}} policy + {{isUnsafeMethod}} + {{isAdminPath}} helpers)
+* {{transports/bifrost-http/handlers/platform_tenants.go}} (final form — includes {{disableDefaultTenant}} plumbing)
+* {{transports/bifrost-http/handlers/middlewares.go}} — VK-bearer pass-through hunk
+* {{transports/bifrost-http/server/server.go}} — resolver wired into both inference + admin chains, {{NewPlatformTenantsHandler}} call, {{envBool}} helper
+
+*Why third.* The resolver needs patch2's callback to do anything useful (stamping a value nobody reads is a no-op). This patch is the _minimum-viable end-to-end_: after it lands you can hit {{/api/providers}} with {{x-f5xc-tenant: acme}} and the resolver+callback combination makes the existing handler tenant-scoped without further edits.
+
+*Estimated size:* ~400 LOC. Highest rebase risk — {{server.go}} is the single most upstream-churned file in the OSS tree.
+
+h3. patch4 / mt-handler-tenant-routing
+
+*Contents* (rest of commit d714eec96):
+* {{transports/bifrost-http/handlers/providers.go}} (dbStore routing, {{allowPrivateNetwork}} env helper)
+* {{transports/bifrost-http/handlers/provider_keys.go}} (all 5 endpoints through dbStore)
+* {{transports/bifrost-http/handlers/governance.go}} (customer-FK cross-tenant guards on {{createTeam}} / {{updateTeam}})
+* {{transports/bifrost-http/handlers/mt_governance_isolation_test.go}}
+
+*Why fourth.* patch3 made the resolver work, but the legacy handlers still talk to the global in-memory store. This patch routes the writes through {{dbStore}} so they actually become tenant-scoped at the SQL layer. Separable from patch3 because it can be reverted alone (we lose tenant isolation on provider/key writes but the resolver and platform handler still work).
+
+*Estimated size:* ~700 LOC. Medium rebase risk — provider/key handler shapes change upstream periodically.
+
+h3. patch5 / mt-ui-tenant-picker
+
+*Contents* (commit 42c2f0588 minus branding):
+* {{ui/lib/store/slices/tenantSlice.ts}} (new)
+* {{ui/lib/store/apis/tenantsApi.ts}} (new)
+* {{ui/lib/store/apis/baseApi.ts}} ({{prepareHeaders}} hunk + {{Tenants}} tag)
+* {{ui/lib/store/apis/index.ts}}, {{slices/index.ts}}, {{store.ts}} wiring
+* {{ui/lib/store/hooks/useCurrentTenant.ts}} (new)
+* {{ui/lib/constants/config.ts}} ({{allow_private_network: true}} default — this is arguably a separate concern, but it travels with the same product story)
+* {{ui/components/tenantBadge.tsx}} (new)
+* {{ui/components/sidebar.tsx}} (mount badge)
+
+*Why fifth.* Pure UI, decoupled from Go. Easy to rebase against upstream UI churn — most of the changes are net-new files. The {{baseApi}} hunk is the only risky bit.
+
+*Estimated size:* ~430 LOC.
+
+h3. patch6 / mt-branding-shaunfrost (optional / opinionated)
+
+*Contents:*
+* {{ui/public/shaunfrost-icon.svg}}, {{shaunfrost-logo.svg}} (new)
+* {{ui/components/sidebar.tsx}} branding swap hunk
+
+*Why a separate patch.* This is a _fork-vanity_ change, not a multi-tenant change. Keeping it isolated means we can drop it cleanly if upstream rebranding lands, or if we decide we don't want the fork visually diverged.
+
+*Estimated size:* ~70 LOC.
+
+h3. patch7 / mt-local-image-and-bridge
+
+*Contents* (commit 17030ce15):
+* {{transports/Dockerfile.local}} (COPY + {{go work use ./multitenant}})
+* {{multitenant/scripts/bifrost-to-opencode.sh}}
+* {{.gitignore}} ({{go.work.local}} — already in patch1; if so, drop here)
+
+*Why last.* Operator tooling. Doesn't affect production runtime; CI should still pass without it. Goes at the bottom of the stack so a future operator tooling patch ({{patch8}}, {{patch9}}) can land alongside without reordering core.
+
+*Estimated size:* ~273 LOC.
+
+h3. Ordering rationale at a glance
+
+{noformat}
+patch1  schema (tenants table, tenant_id columns, multitenant pkg)
+     ↓ needed by
+patch2  data scope (GORM callback, rdb config-sync)
+     ↓ needed by
+patch3  HTTP resolver (middleware, platform handler, server wiring, VK auth)
+     ↓ uses the resolver's ctx
+patch4  handler tenant-routing (provider/keys/governance through dbStore)
+     ╴ independent ╴
+patch5  UI tenant picker
+     ╴ independent ╴
+patch6  branding (optional)
+     ╴ independent ╴
+patch7  local image + opencode bridge (operator tooling)
+{noformat}
+
+A reviewer can stop reading at patch3 and have a complete mental model of how multi-tenancy works on this fork. patches 4-7 are _applications_ of the foundation, not new mechanisms.
+
+----
+
+h2. 4. Productization plan
+
+What needs to land before this is real-customer ready, grouped by concern.
+
+h3. 4.1 Runtime isolation (Stage 2, the biggest gap)
+
+The header model gives us *data-scope* isolation. It does not yet give us *runtime* isolation. Symptoms today:
+
+* {{c.Providers}} is a single shared map. Two tenants with {{anthropic}} providers fight over the same map entry.
+* {{s.Client}} is a single root {{*bifrost.Bifrost}}. Per-tenant {{Account}} / {{MCPManager}} / provider queues don't exist.
+* {{multitenant.Manager}} is dead code in the binary.
+
+*Work needed:*
+
+# *Tenant-keyed in-memory store.* Replace {{lib.Config.Providers}} with {{map[TenantID]map[ModelProvider]ProviderConfig}}. Audit every reader to take the tenant from ctx.
+# *Wire {{Manager}} into the inference dispatch.* {{inference.go}} and {{mcpinference.go}} should acquire a tenant runtime from {{s.Manager}} before routing. Root {{s.Client}} becomes the {{default}} tenant runtime.
+# *Per-tenant eviction triggers.* Provider/key admin writes should call {{Manager.Evict(tid)}} so the next request reloads with the new config (the share-shim ensures plugin state survives).
+# *Replace busy-loop in {{maybeEvictLocked}}* with a per-entry condvar or signal channel.
+# *{{EvictGracePeriod}} config knob* + metric for forced-evict timeouts.
+
+h3. 4.2 Tests
+
+Coverage of the Go layer is one isolation test. That's not enough.
+
+# *Unit tests for {{multitenant.Manager}}:*
+#* LRU eviction under cap (insert N+1 → oldest evicted)
+#* Refcount blocks eviction (long-held handle keeps tenant alive)
+#* {{initOnce}} race (50 concurrent {{Acquire(tid)}} → loader called once)
+#* {{Shutdown}} is idempotent + waits for in-flight handles
+#* {{Evict(tid)}} while handle is held vs idle
+# *Unit tests for {{tenant_scope}} callbacks:*
+#* Insert with ctx-tenant → row carries tenant_id
+#* Insert with explicit tenant_id → callback respects caller's value
+#* Select with no ctx tenant → no implicit WHERE (single-tenant fallback)
+#* Update from tenant A cannot mutate tenant B's row
+# *Property: every admin handler must route through {{dbStore}}.* A {{go vet}}–style linter or import-graph test forbids direct access to {{lib.Config.Providers}} from {{handlers/}}.
+# *E2E (Playwright) tenant picker spec.* Two tenants, two providers with the same name, switch the picker, verify the list updates.
+# *Migration tests.* Apply against an OSS snapshot DB; verify backfill, composite index, and idempotency on re-run.
+
+h3. 4.3 Observability
+
+Tenant-aware metrics and logs.
+
+# *Per-tenant Prometheus labels.* Request rate, error rate, p95 latency, queue depth — all already exist; add {{tenant_id}} label.
+# *{{multitenant_active_runtimes}} gauge*, {{multitenant_evictions_total}} counter (by reason: lru / explicit / shutdown), {{multitenant_init_failures_total}}.
+# *Logging plugin stamps tenant_id on rows.* Read from {{BifrostContext}}, add a {{tenant_id}} column to the logstore schema, default to {{default}} on absence. Backfill via migration.
+# *Audit log for {{/api/platform/tenants/*}}.* Who created/deleted which tenant, when. Goes to logstore with {{audit=true}} flag.
+
+h3. 4.4 Security & RBAC
+
+# *{{/api/platform/tenants}} RBAC.* Today any admin-session user can mint/delete tenants. Either gate behind a role ({{platform_admin}}) or move to a separate listener that requires mTLS or a static deployment token.
+# *Resolver hardens against header spoofing.* Today any client can set {{x-f5xc-tenant: foo}} and read foo's data. We need (a) authenticated tenant binding for admin UI (session → allowed tenants list, validated on every request), and (b) for inference, the VK must bind to the header's tenant (governance plugin already loads the VK row, which now carries tenant_id — add the check).
+# *{{BIFROST_DISABLE_DEFAULT_TENANT_CONFIG}} should be default-on in prod.* Today operators opt in. For a SaaS posture flip the default.
+# *Provider URL allowlist on SaaS.* {{BIFROST_ALLOW_PRIVATE_NETWORK}} is on for our k8s deployment; for hosted multi-tenant this becomes the wrong default. Add per-deployment validator profile ({{internal}}, {{hosted}}).
+
+h3. 4.5 Operational runbook
+
+# *Migration backout plan.* The rollback is a no-op for safety. Document what an operator does if they need to revert: stop ingress → revert binary → run a one-shot rollback migration that drops {{tenants}} and removes {{tenant_id}} columns. Pre-flight: dump pre-migration DB.
+# *Tenant lifecycle runbook.* How to create / suspend / delete a tenant; what cleanup happens (rows? logs? metrics?); how to verify isolation in prod.
+# *{{x-f5xc-tenant}} rotation/redirect.* What an operator does when renaming a tenant id (today: not supported — {{tenant_id}} is the PK).
+
+h3. 4.6 Documentation
+
+# {{docs/multi-tenant-f5/01-architecture.md}} — request flow with the resolver + GORM callback + manager + share-shim diagram.
+# {{docs/multi-tenant-f5/02-operator-guide.md}} — env flags, RBAC, migration, troubleshooting.
+# {{docs/multi-tenant-f5/03-api.md}} — {{/api/platform/tenants}} reference and {{x-f5xc-tenant}} semantics on existing endpoints.
+# {{docs/multi-tenant-f5/04-tenant-loader.md}} — how a deployer plugs in their own {{TenantLoader}} (for when we wire Manager in).
+
+h3. 4.7 OSS-sync posture
+
+What we should do to keep {{make verify-patches}} green as OSS moves:
+
+# *Pin the OSS base.* Re-sync on tagged OSS releases ({{v1.x.x}}), not on {{main}}. Cadence: once per OSS minor.
+# *Maintain a CI job* that runs {{make clean-patches && make apply-patches && make build && make test-core}} against {{upstream/main}} weekly. Surfaces drift before a re-sync.
+# *Keep patch hunks narrow.* Every patch in the series should touch the minimum number of lines that achieves its goal. The biggest rebase risk is {{server.go}} (patch3) and {{rdb.go}} (patch2) — both files are upstream-busy. Resist drive-by refactors there.
+# *Per-patch CHANGELOG entries.* Each {{patchN/<series>/README.md}} carries a one-line summary so a rebaser can see what the series was meant to do without reading the diff.
+# *Treat the {{multitenant/}} package as a stable API.* Once it ships, tenant loader signatures and {{TenantID}} types are part of our public contract (anyone writing a custom {{TenantLoader}} depends on them).
+
+----
+
+h2. 5. Open questions for the next session
+
+Things I want to settle before transforming this into the patch series:
+
+# *Where does the patch series live?* Three options:
+#* Inside this fork at {{f5xc-patches/}}, with the source eventually reverted to vanilla (the bifrost-aigw model).
+#* In a sibling repo (e.g. {{bifrost-aigw}}), with this fork becoming the _worktree_ where patches are developed.
+#* Both: develop here, publish to {{bifrost-aigw}}.
+# *Do we keep the SHAUNFROST branding patch or drop it?* It's fork vanity. Cheap to drop, easy to revert if we want it back.
+# *Do we ship patch4 or fold it into patch3?* The argument for separate: reverts are cleaner. The argument for folded: the resolver without handler routing doesn't isolate provider writes, which is a misleading half-state.
+# *What's the OSS base SHA we patch against?* The current commits sit on {{dev}}; we should pick a tagged OSS release as the patch base so the series replays cleanly.
+
+These belong in a follow-up before any patches get generated.
+
+----
+
+_Report file:_ {{docs/multi-tenant-f5/00-review-and-plan.md}}. Next: pick patch boundaries, generate the series via {{git format-patch}} in a {{.workspaces/}} worktree (the AGENTS.md procedure), drop into {{f5xc-patches/}}, and verify with {{make verify-patches}}.

@@ -1,0 +1,89 @@
+From e369dbd341f450ac9665bedb7612bc92a7f7ed8a Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 19:17:59 -0600
+Subject: [PATCH] mt-tenant-cascade-delete: cascade child rows on tenant DELETE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Without this, DELETE /api/tenants/{id} only removed the row from the
+tenants table and left every tenant-scoped child row (providers, keys,
+virtual_keys, teams, customers, budgets, rate_limits, mcp_clients)
+behind as orphans. The orphans then 409'd on unique constraints when a
+new tenant with the same id was created — the seed bootstrap surfaced
+this against the live cluster.
+
+Cascades all 8 tenant-scoped tables inside a single transaction; a
+mid-cascade failure rolls everything back. Child-before-parent order
+respects the FK on config_keys.provider_id (keys before providers) and
+the governance FK chain (virtual_keys before teams/budgets/rate_limits,
+teams before customers).
+
+Detected by the seed bootstrap's orphan-WARN pass (in
+go-bifrost-ai/examples/seed). Fixes the underlying bug; existing
+orphans need a one-time cleanup (re-create deleted tenant id, then
+DELETE — the cascade reaches the orphans because they still carry the
+tenant_id).
+---
+ .../bifrost-http/handlers/platform_tenants.go | 38 ++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/transports/bifrost-http/handlers/platform_tenants.go b/transports/bifrost-http/handlers/platform_tenants.go
+index 683b37557..c6da03be1 100644
+--- a/transports/bifrost-http/handlers/platform_tenants.go
++++ b/transports/bifrost-http/handlers/platform_tenants.go
+@@ -27,6 +27,7 @@ import (
+ 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ 	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
+ )
+ 
+ // PlatformTenantsHandler implements /api/platform/tenants admin CRUD.
+@@ -215,7 +216,42 @@ func (h *PlatformTenantsHandler) delete(ctx *fasthttp.RequestCtx) {
+ 		}
+ 		return
+ 	}
+-	if err := h.configStore.DB().WithContext(ctx).Delete(&configstoreTables.TableTenant{}, "id = ?", id).Error; err != nil {
++	// Cascade-delete: every tenant-scoped child row before the parent.
++	// Without this we leak orphans (rows whose tenant_id points at a
++	// tenant that no longer exists) — those orphans then collide on
++	// unique constraints when a new tenant with the same id is created.
++	// Wrap in a tx so a mid-cascade failure rolls everything back rather
++	// than leaving a half-deleted tenant.
++	//
++	// Bypasses the tenant-scope callback by passing context.Background():
++	// the tenants table itself has no tenant_id (cross-tenant admin
++	// surface), and we want to scope the child DELETEs by an EXPLICIT
++	// tenant_id = ? filter regardless of whatever the request ctx carries
++	// (which may be empty for admin calls).
++	if err := h.configStore.DB().Transaction(func(tx *gorm.DB) error {
++		// Order matters where SQLite FKs are wired: keys → providers
++		// (config_keys.provider_id), virtual_keys → teams/budgets/rate_limits,
++		// teams → customers. Within an FK-less group order is irrelevant.
++		childModels := []any{
++			&configstoreTables.TableKey{},
++			&configstoreTables.TableProvider{},
++			&configstoreTables.TableVirtualKey{},
++			&configstoreTables.TableTeam{},
++			&configstoreTables.TableCustomer{},
++			&configstoreTables.TableBudget{},
++			&configstoreTables.TableRateLimit{},
++			&configstoreTables.TableMCPClient{},
++		}
++		for _, m := range childModels {
++			if err := tx.Where("tenant_id = ?", id).Delete(m).Error; err != nil {
++				return fmt.Errorf("cascade child rows: %w", err)
++			}
++		}
++		if err := tx.Where("id = ?", id).Delete(&configstoreTables.TableTenant{}).Error; err != nil {
++			return fmt.Errorf("delete tenant row: %w", err)
++		}
++		return nil
++	}); err != nil {
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("delete tenant: %v", err))
+ 		return
+ 	}
+-- 
+2.51.0
+

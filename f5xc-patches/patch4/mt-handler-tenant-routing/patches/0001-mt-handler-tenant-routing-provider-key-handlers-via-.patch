@@ -1,8 +1,8 @@
-From 9cca4d48f92017d20f307023bfbd41e40d7a26b8 Mon Sep 17 00:00:00 2001
+From e9b49276ba570fcd445724ae58fa32480855bfde Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 14:05:35 -0600
-Subject: [PATCH] mt-handler-tenant-routing: provider/key handlers via dbStore
- + customer-FK tenant guard + isolation regression test
+Subject: [PATCH 4/6] mt-handler-tenant-routing: provider/key handlers via
+ dbStore + customer-FK tenant guard + isolation regression test
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -55,18 +55,26 @@ ergonomics patch when the upstream signature evolves.
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
- .../bifrost-http/handlers/governance.go       |  30 ++
+ .../bifrost-http/handlers/governance.go       |  37 +-
  .../handlers/mt_governance_isolation_test.go  | 339 ++++++++++++++++++
  .../bifrost-http/handlers/provider_keys.go    | 178 ++++++---
- transports/bifrost-http/handlers/providers.go |  66 +++-
- 4 files changed, 540 insertions(+), 73 deletions(-)
+ transports/bifrost-http/handlers/providers.go |  87 ++++-
+ 4 files changed, 564 insertions(+), 77 deletions(-)
  create mode 100644 transports/bifrost-http/handlers/mt_governance_isolation_test.go
 
 diff --git a/transports/bifrost-http/handlers/governance.go b/transports/bifrost-http/handlers/governance.go
-index a80c2a2cd..466cbd73b 100644
+index a80c2a2cd..15d24e296 100644
 --- a/transports/bifrost-http/handlers/governance.go
 +++ b/transports/bifrost-http/handlers/governance.go
-@@ -1759,6 +1759,22 @@ func (h *GovernanceHandler) createTeam(ctx *fasthttp.RequestCtx) {
+@@ -631,6 +631,7 @@ func (h *GovernanceHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
+ 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+ 		vk = configstoreTables.TableVirtualKey{
+ 			ID:              uuid.NewString(),
++			TenantID:        TenantIDFromCtx(ctx), // explicit stamp; the GORM scope callback also reads ctx but the explicit form is the reliable source of truth
+ 			Name:            req.Name,
+ 			Value:           governance.GenerateVirtualKey(),
+ 			Description:     req.Description,
+@@ -1759,11 +1760,28 @@ func (h *GovernanceHandler) createTeam(ctx *fasthttp.RequestCtx) {
  			return
  		}
  	}
@@ -89,7 +97,13 @@ index a80c2a2cd..466cbd73b 100644
  	// Creating team in database
  	var team configstoreTables.TableTeam
  	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
-@@ -1893,6 +1909,20 @@ func (h *GovernanceHandler) updateTeam(ctx *fasthttp.RequestCtx) {
+ 		team = configstoreTables.TableTeam{
+ 			ID:              uuid.NewString(),
++			TenantID:        TenantIDFromCtx(ctx), // explicit stamp; same reason as createVirtualKey
+ 			Name:            req.Name,
+ 			CustomerID:      req.CustomerID,
+ 			CalendarAligned: req.CalendarAligned,
+@@ -1893,6 +1911,20 @@ func (h *GovernanceHandler) updateTeam(ctx *fasthttp.RequestCtx) {
  		SendError(ctx, 500, "Failed to retrieve team")
  		return
  	}
@@ -110,6 +124,18 @@ index a80c2a2cd..466cbd73b 100644
  	// Updating team in database
  	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
  		// Track rate-limit ID to delete after updating the team (to avoid FK constraint)
+@@ -2235,8 +2267,9 @@ func (h *GovernanceHandler) createCustomer(ctx *fasthttp.RequestCtx) {
+ 	var customer configstoreTables.TableCustomer
+ 	if err := h.configStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+ 		customer = configstoreTables.TableCustomer{
+-			ID:   uuid.NewString(),
+-			Name: req.Name,
++			ID:       uuid.NewString(),
++			TenantID: TenantIDFromCtx(ctx), // explicit stamp; same reason as createVirtualKey
++			Name:     req.Name,
+ 		}
+ 
+ 		if req.Budget != nil {
 diff --git a/transports/bifrost-http/handlers/mt_governance_isolation_test.go b/transports/bifrost-http/handlers/mt_governance_isolation_test.go
 new file mode 100644
 index 000000000..63c938f69
@@ -787,7 +813,7 @@ index 086054195..286975f67 100644
  			oldRedactedKey.AzureKeyConfig.ClientID != nil &&
  			oldRawKey.AzureKeyConfig != nil &&
 diff --git a/transports/bifrost-http/handlers/providers.go b/transports/bifrost-http/handlers/providers.go
-index 6658889e3..8746e43e8 100644
+index 6658889e3..411ab41c7 100644
 --- a/transports/bifrost-http/handlers/providers.go
 +++ b/transports/bifrost-http/handlers/providers.go
 @@ -272,15 +272,23 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
@@ -879,6 +905,35 @@ index 6658889e3..8746e43e8 100644
  			logger.Error("Failed to rollback provider %s after reload failure: %v", payload.Provider, rollbackErr)
  			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to initialize provider after add: %v (rollback failed: %v)", err, rollbackErr))
  			return
+@@ -397,9 +433,26 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 		oldRedactedConfig = &configstore.ProviderConfig{}
+ 	}
+ 
+-	// Construct ProviderConfig from individual fields (keys are managed separately via /keys endpoints)
++	// Construct ProviderConfig from individual fields (keys are managed separately via /keys endpoints).
++	//
++	// CRITICAL: re-fetch Keys from the tenant-scoped dbStore rather than reusing
++	// oldConfigRaw.Keys (which came from the global in-memory c.Providers map).
++	// In multi-tenant deployments c.Providers is shared across tenants, so the
++	// in-memory keys may belong to a DIFFERENT tenant than the caller. When
++	// UpdateProvider downstream diffs the request's Keys against the tenant-
++	// scoped DB lookup, it treats the wrong-tenant keys as new rows and tries
++	// INSERT — which trips the GLOBAL idx_key_id unique constraint with
++	// "a record with this key id already exists". Refetching scoped keys here
++	// makes the diff a no-op (every key already matches DB by key_id) so the
++	// update touches only provider metadata, which is what the admin UI wants.
++	keys := oldConfigRaw.Keys
++	if h.dbStore != nil {
++		if dbKeys, err := h.dbStore.GetProviderKeys(ctx, provider); err == nil {
++			keys = dbKeys
++		}
++	}
+ 	config := configstore.ProviderConfig{
+-		Keys:                     oldConfigRaw.Keys,
++		Keys:                     keys,
+ 		NetworkConfig:            oldConfigRaw.NetworkConfig,
+ 		ConcurrencyAndBufferSize: oldConfigRaw.ConcurrencyAndBufferSize,
+ 		ProxyConfig:              oldConfigRaw.ProxyConfig,
 -- 
 2.51.0
 

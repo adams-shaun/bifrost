@@ -148,10 +148,25 @@ func schemaKeyFromTableKey(dbKey tables.TableKey) schemas.Key {
 }
 
 // tableKeyFromSchemaKey converts a schema key to a database key.
+//
+// Propagates `provider.TenantID` onto the resulting `dbKey.TenantID` so
+// every key row is born with the same tenant as its parent provider.
+// Critical for the multi-tenant story: the GORM tenant-scope callback
+// (populateTenantIDOnCreate) was supposed to be the only source of
+// truth here, reading the tenant off the request context, but field
+// experience showed paths where the callback's setTenantIfEmpty did
+// not propagate (the `dbKey` going into INSERT still had TenantID=""
+// and the row landed with the schema's '' fallback rather than the
+// `default:default` column default — orphaning the row from every
+// tenant-scoped read). Stamping at construction time eliminates the
+// race / reflection edge case entirely; the runtime assertion in
+// tenant_scope.go remains as the safety net for any future caller
+// that forgets.
 func tableKeyFromSchemaKey(provider tables.TableProvider, key schemas.Key) (tables.TableKey, error) {
 	dbKey := tables.TableKey{
 		Provider:           provider.Name,
 		ProviderID:         provider.ID,
+		TenantID:           provider.TenantID,
 		KeyID:              key.ID,
 		Name:               key.Name,
 		Value:              key.Value,
@@ -625,7 +640,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 	for _, providerName := range sortedProviderNames(providers) {
 		providerConfig := providers[providerName]
 		dbProvider := tables.TableProvider{
-			Name:                     string(providerName),
+			Name: string(providerName),
+			// Startup-time config sync runs with a background context that
+			// has no `x-f5xc-tenant` header, so the BeforeCreate tenant-
+			// scope callback (patch2) can't infer one. Explicitly stamp the
+			// default tenant here so the composite (tenant_id, name) upsert
+			// constraint matches.
+			TenantID:                 tables.DefaultTenantID,
 			NetworkConfig:            providerConfig.NetworkConfig,
 			ConcurrencyAndBufferSize: providerConfig.ConcurrencyAndBufferSize,
 			ProxyConfig:              providerConfig.ProxyConfig,
@@ -647,10 +668,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 			dbProvider.RateLimitID = existing.RateLimitID
 		}
 
-		// Upsert provider (create or update if exists).
+		// Upsert provider (create or update if exists). Targets the
+		// composite (tenant_id, name) unique constraint introduced by the
+		// multi-tenant migration (patch1) so two tenants can carry a
+		// provider with the same name without colliding.
 		if err := txDB.WithContext(ctx).Clauses(
 			clause.OnConflict{
-				Columns:   []clause.Column{{Name: "name"}},
+				Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "name"}},
 				UpdateAll: true,
 			},
 			clause.Returning{Columns: []clause.Column{{Name: "id"}}},
@@ -672,8 +696,15 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 				}
 			}
 			dbKey := tables.TableKey{
-				Provider:           dbProvider.Name,
-				ProviderID:         dbProvider.ID,
+				Provider:   dbProvider.Name,
+				ProviderID: dbProvider.ID,
+				// Inherit the provider's tenant so the key lives in the same
+				// tenant scope. The BeforeCreate GORM callback (patch2) would
+				// also fill this in from ctx, but explicitly stamping from the
+				// resolved provider row is both clearer and safer against the
+				// case where this code path runs without a tenant header on
+				// ctx (background sync, etc.).
+				TenantID:           dbProvider.TenantID,
 				KeyID:              key.ID,
 				Name:               key.Name,
 				Value:              key.Value,
@@ -753,8 +784,13 @@ func (s *RDBConfigStore) UpdateProvidersConfig(ctx context.Context, providers ma
 					return s.parseGormError(err)
 				}
 			} else if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-				// KeyID not found, try fallback lookup by Name (handles config reload with new UUID)
-				result = txDB.WithContext(ctx).Where("name = ?", dbKey.Name).First(&existingKey)
+				// KeyID not found, try fallback lookup by Name (handles config reload with new UUID).
+				// Scope the lookup to the same tenant we're about to write into — without
+				// this, a key created via the tenant-scoped admin API (e.g. tenant_id=acme)
+				// could be matched as the "existing" row for a config.json sync that
+				// writes tenant_id=default, then the Save() below trips the composite
+				// (tenant_id, name) unique with "API key names must be unique across providers".
+				result = txDB.WithContext(ctx).Where("tenant_id = ? AND name = ?", dbKey.TenantID, dbKey.Name).First(&existingKey)
 				if result.Error == nil {
 					// Found by name - update existing key, preserve original KeyID
 					dbKey.ID = existingKey.ID                             // Keep the same database ID
@@ -903,6 +939,7 @@ func (s *RDBConfigStore) UpdateProvider(ctx context.Context, provider schemas.Mo
 		dbKey := tables.TableKey{
 			Provider:           dbProvider.Name,
 			ProviderID:         dbProvider.ID,
+			TenantID:           dbProvider.TenantID, // inherit from parent provider; required by BeforeCreate guard
 			KeyID:              key.ID,
 			Name:               key.Name,
 			Value:              key.Value,
@@ -1021,9 +1058,17 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
 	}
 	// Preserve ConfigHash (it has json:"-" tag so deepCopy via JSON doesn't copy it)
 	configCopy.ConfigHash = config.ConfigHash
-	// Create new provider
+	// Stamp the tenant from request ctx so the row carries the caller's
+	// tenant. The GORM tenant-scope callback (populateTenantIDOnCreate)
+	// also stamps from ctx but has bitten us with reflection edge cases
+	// — explicit stamping at construction is the reliable source of
+	// truth. tenantFromContext returns ("", false) when no header was
+	// present; the per-model BeforeCreate hook then auto-fills the
+	// default tenant (non-strict) or errors (strict mode).
+	ctxTenant, _ := tenantFromContext(ctx)
 	dbProvider := tables.TableProvider{
 		Name:                     string(provider),
+		TenantID:                 ctxTenant,
 		NetworkConfig:            configCopy.NetworkConfig,
 		ConcurrencyAndBufferSize: configCopy.ConcurrencyAndBufferSize,
 		ProxyConfig:              configCopy.ProxyConfig,
@@ -1043,6 +1088,7 @@ func (s *RDBConfigStore) AddProvider(ctx context.Context, provider schemas.Model
 		dbKey := tables.TableKey{
 			Provider:           dbProvider.Name,
 			ProviderID:         dbProvider.ID,
+			TenantID:           dbProvider.TenantID, // inherit from parent provider; required by BeforeCreate guard
 			KeyID:              key.ID,
 			Name:               key.Name,
 			Value:              key.Value,
@@ -1225,13 +1271,30 @@ func (s *RDBConfigStore) GetProviderConfig(ctx context.Context, provider schemas
 }
 
 // GetProviderKeys retrieves all keys for a provider ordered by creation time.
+//
+// Tenant scoping note: the GORM scope callback registers on Query but
+// keys this query off `tx.Statement.Schema` (the Scan destination), which
+// here is []TableKey. The callback's qualifyTenantColumn uses
+// `tx.Statement.Table` — and we explicitly set that to "config_providers"
+// for the JOIN — so the callback's generated WHERE becomes
+// `config_providers.tenant_id = ?`. That correctly restricts the provider
+// side of the join, BUT in practice the cross-tenant key bleed
+// reproduced anyway (a shaun-scoped request returned acme's keys).
+// Belt-and-suspenders: stamp the tenant on the JOINED config_keys side
+// too. Worst case the predicate is redundant; best case it's the only
+// thing standing between the request and a cross-tenant data leak.
 func (s *RDBConfigStore) GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error) {
+	tid, hasTenant := tenantFromContext(ctx)
 	var dbKeys []tables.TableKey
-	result := s.DB().WithContext(ctx).
+	q := s.DB().WithContext(ctx).
 		Table("config_providers").
 		Select("config_keys.*").
 		Joins("LEFT JOIN config_keys ON config_keys.provider_id = config_providers.id").
-		Where("config_providers.name = ?", string(provider)).
+		Where("config_providers.name = ?", string(provider))
+	if hasTenant {
+		q = q.Where("config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL", tid)
+	}
+	result := q.
 		Order("config_keys.created_at ASC").
 		Scan(&dbKeys)
 	if result.Error != nil {
@@ -1329,8 +1392,9 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
 	}
 
 	dbKey, err := tableKeyFromSchemaKey(tables.TableProvider{
-		ID:   existingKey.ProviderID,
-		Name: existingKey.Provider,
+		ID:       existingKey.ProviderID,
+		Name:     existingKey.Provider,
+		TenantID: existingKey.TenantID, // tableKeyFromSchemaKey propagates this onto the dbKey; without it the Save would write tenant_id=''
 	}, key)
 	if err != nil {
 		return err
@@ -1342,6 +1406,16 @@ func (s *RDBConfigStore) UpdateProviderKey(ctx context.Context, provider schemas
 	dbKey.ConfigHash = existingKey.ConfigHash
 	dbKey.EncryptionStatus = existingKey.EncryptionStatus
 	dbKey.CreatedAt = existingKey.CreatedAt // Preserve original creation timestamp
+	// Preserve the row's existing TenantID. schemas.Key (the request body
+	// shape) carries no tenant; tableKeyFromSchemaKey doesn't propagate
+	// one either (the stub TableProvider passed in above has only ID +
+	// Name). Without this assignment dbKey.TenantID is the zero string
+	// and gorm.Save would issue `UPDATE ... SET tenant_id = '' WHERE id
+	// = ? AND tenant_id = '<ctx>'` (the WHERE comes from the tenant-
+	// scope callback). The UPDATE matches and silently corrupts the
+	// row's tenant_id to '', after which every subsequent tenant-scoped
+	// read 404s the key.
+	dbKey.TenantID = existingKey.TenantID
 
 	if err := txDB.WithContext(ctx).Save(&dbKey).Error; err != nil {
 		return s.parseGormError(err)
@@ -1662,9 +1736,11 @@ func (s *RDBConfigStore) CreateMCPClientConfig(ctx context.Context, clientConfig
 		if err != nil {
 			return err
 		}
+		mcpCtxTenant, _ := tenantFromContext(ctx) // stamp from request ctx; BeforeCreate guard auto-fills default when absent
 		dbClient := tables.TableMCPClient{
 			ClientID:              clientConfigCopy.ID,
 			Name:                  clientConfigCopy.Name,
+			TenantID:              mcpCtxTenant,
 			IsCodeModeClient:      clientConfigCopy.IsCodeModeClient,
 			ConnectionType:        string(clientConfigCopy.ConnectionType),
 			ConnectionString:      clientConfigCopy.ConnectionString,

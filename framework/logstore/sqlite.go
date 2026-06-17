@@ -42,6 +42,15 @@ func newSqliteLogStore(ctx context.Context, config *SQLiteConfig, logger schemas
 	if err := triggerMigrations(ctx, db); err != nil {
 		return nil, err
 	}
+	// Header-model multi-tenancy: register the GORM callbacks that
+	// turn every existing SELECT/UPDATE/DELETE on a tenant-scoped log
+	// model into `WHERE tenant_id = ?` (from request context) and
+	// stamp tenant_id on every INSERT. Must run AFTER migrations so
+	// the migration path (which uses context.Background) isn't itself
+	// subjected to the scope predicate. See tenant_scope.go.
+	if err := RegisterTenantScopes(db); err != nil {
+		return nil, fmt.Errorf("failed to register tenant-scope callbacks: %w", err)
+	}
 
 	return s, nil
 }

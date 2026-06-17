@@ -14,10 +14,14 @@ import (
 // TableKey represents an API key configuration in the database
 type TableKey struct {
 	ID                    uint           `gorm:"primaryKey;autoIncrement" json:"id"`
-	Name                  string         `gorm:"type:varchar(255);uniqueIndex:idx_key_name;not null" json:"name"`
+	Name                  string         `gorm:"type:varchar(255);uniqueIndex:idx_key_tenant_name;not null" json:"name"`
 	ProviderID            uint           `gorm:"index;not null" json:"provider_id"`
 	Provider              string         `gorm:"index;type:varchar(50)" json:"provider"`                          // ModelProvider as string
-	KeyID                 string         `gorm:"type:varchar(255);uniqueIndex:idx_key_id;not null" json:"key_id"` // UUID from schemas.Key
+	KeyID                 string         `gorm:"type:varchar(255);uniqueIndex:idx_key_id;not null" json:"key_id"` // UUID from schemas.Key, globally unique
+	// TenantID scopes this key to a tenant. Name becomes composite-unique with
+	// TenantID via idx_key_tenant_name so two tenants can both have a key
+	// named "production". KeyID stays globally unique.
+	TenantID              string         `gorm:"type:varchar(255);not null;default:default;uniqueIndex:idx_key_tenant_name" json:"tenant_id"`
 	Value                 schemas.EnvVar `gorm:"type:text;not null" json:"value"`
 	ModelsJSON            string         `gorm:"type:text" json:"-"` // JSON serialized []string
 	BlacklistedModelsJSON string         `gorm:"type:text" json:"-"` // JSON serialized []string
@@ -641,4 +645,14 @@ func (k *TableKey) AfterFind(tx *gorm.DB) error {
 		k.SGLKeyConfig = nil
 	}
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableKey) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "config_keys")
 }

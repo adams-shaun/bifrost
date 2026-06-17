@@ -14,8 +14,13 @@ import (
 // TableMCPClient represents an MCP client configuration in the database
 type TableMCPClient struct {
 	ID                      uint            `gorm:"primaryKey;autoIncrement" json:"id"` // ID is used as the internal primary key and is also accessed by public methods, so it must be present.
-	ClientID                string          `gorm:"type:varchar(255);uniqueIndex;not null" json:"client_id"`
-	Name                    string          `gorm:"type:varchar(255);uniqueIndex;not null" json:"name"`
+	ClientID                string          `gorm:"type:varchar(255);uniqueIndex;not null" json:"client_id"` // Globally unique; FK target for TableOauthUserToken
+	Name                    string          `gorm:"type:varchar(255);uniqueIndex:idx_mcp_tenant_name;not null" json:"name"`
+	// TenantID scopes this MCP client to a tenant. Name becomes composite-unique
+	// with TenantID via idx_mcp_tenant_name so two tenants can both register an
+	// MCP client called "tools". ClientID stays globally unique because
+	// OauthUserToken holds an FK to it.
+	TenantID                string          `gorm:"type:varchar(255);not null;default:default;uniqueIndex:idx_mcp_tenant_name" json:"tenant_id"`
 	IsCodeModeClient        bool            `gorm:"default:false" json:"is_code_mode_client"`         // Whether the client is a code mode client
 	ConnectionType          string          `gorm:"type:varchar(20);not null" json:"connection_type"` // schemas.MCPConnectionType
 	ConnectionString        *schemas.EnvVar `gorm:"type:text" json:"connection_string,omitempty"`
@@ -250,4 +255,14 @@ func (c *TableMCPClient) AfterFind(tx *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableMCPClient) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "config_mcp_clients")
 }

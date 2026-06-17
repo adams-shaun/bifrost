@@ -159,3 +159,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/postgres v1.6.0
 )
+
+require github.com/maximhq/bifrost/multitenant v0.0.0
+
+replace github.com/maximhq/bifrost/multitenant => ../multitenant

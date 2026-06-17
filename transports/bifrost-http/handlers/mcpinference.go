@@ -25,6 +25,16 @@ func NewMCPInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *MCPInf
 	}
 }
 
+// bf returns the per-request *bifrost.Bifrost stashed by the tenant
+// dispatcher middleware, falling back to the root client. See
+// CompletionHandler.bf for the rationale.
+func (h *MCPInferenceHandler) bf(ctx *fasthttp.RequestCtx) *bifrost.Bifrost {
+	if bf := lib.BifrostClientFromCtx(ctx); bf != nil {
+		return bf
+	}
+	return h.client
+}
+
 // RegisterRoutes registers the MCP inference routes
 func (h *MCPInferenceHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
 	r.POST("/v1/mcp/tool/execute", lib.ChainMiddlewares(h.executeTool, middlewares...))
@@ -68,7 +78,7 @@ func (h *MCPInferenceHandler) executeChatMCPTool(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Execute MCP tool
-	toolMessage, bifrostErr := h.client.ExecuteChatMCPTool(bifrostCtx, &req)
+	toolMessage, bifrostErr := h.bf(ctx).ExecuteChatMCPTool(bifrostCtx, &req)
 	if bifrostErr != nil {
 		SendBifrostError(ctx, bifrostErr)
 		return
@@ -101,7 +111,7 @@ func (h *MCPInferenceHandler) executeResponsesMCPTool(ctx *fasthttp.RequestCtx) 
 	}
 
 	// Execute MCP tool
-	toolMessage, bifrostErr := h.client.ExecuteResponsesMCPTool(bifrostCtx, &req)
+	toolMessage, bifrostErr := h.bf(ctx).ExecuteResponsesMCPTool(bifrostCtx, &req)
 	if bifrostErr != nil {
 		SendBifrostError(ctx, bifrostErr)
 		return

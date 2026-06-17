@@ -175,6 +175,18 @@ func newPostgresLogStore(ctx context.Context, config *PostgresConfig, logger sch
 	}
 	sqlDB.SetMaxOpenConns(maxOpenConns)
 	d := &RDBLogStore{db: db, logger: logger}
+	// Header-model multi-tenancy: register the GORM callbacks that
+	// turn every existing SELECT/UPDATE/DELETE on a tenant-scoped log
+	// model into `WHERE tenant_id = ?` (from request context) and
+	// stamp tenant_id on every INSERT. Registered on the RUNTIME pool
+	// only — migrations already ran on the throwaway pool above with
+	// context.Background, which would have short-circuited the scope
+	// anyway, but registering on the runtime pool here keeps the
+	// callback off the migration path entirely. See tenant_scope.go.
+	if err := RegisterTenantScopes(db); err != nil {
+		_ = closePool(db)
+		return nil, fmt.Errorf("failed to register tenant-scope callbacks: %w", err)
+	}
 
 	// Run all index builds sequentially in a single goroutine to prevent
 	// deadlocks from concurrent CREATE INDEX CONCURRENTLY on the same table.

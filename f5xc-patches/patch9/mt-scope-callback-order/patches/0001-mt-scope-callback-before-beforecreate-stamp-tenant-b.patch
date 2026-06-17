@@ -1,0 +1,47 @@
+From 5aafea60c2c4d8a6fe4a4705bbd8d08a9fcca475 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 19:25:32 -0600
+Subject: [PATCH] mt-scope-callback-before-beforecreate: stamp tenant before
+ strict assert
+
+The scope callback was registered Before("gorm:create") but per-model
+BeforeCreate hooks (Layer 3 strict assertions via
+EnsureTenantIDOnCreate) fire inside gorm:before_create, which runs
+before gorm:create. Net result: any nested child row a handler created
+without an explicit tenant stamp (e.g. budgets/rate-limits inside a
+createCustomer/Team/VK transaction) hit the strict assert with an
+empty tenant_id and 500'd before the scope callback could fill it.
+
+Move the registration to Before("gorm:before_create") so the scope
+callback runs first and the BeforeCreate hooks see a populated field.
+
+Detected by the seed's governance-hierarchy phase: createCustomer
+500'd on the budget INSERT inside the transaction with the cluster
+running BIFROST_ASSERT_TENANT_ON_INSERT=true.
+---
+ framework/configstore/tenant_scope.go | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/framework/configstore/tenant_scope.go b/framework/configstore/tenant_scope.go
+index 2d77b7afc..32a0529df 100644
+--- a/framework/configstore/tenant_scope.go
++++ b/framework/configstore/tenant_scope.go
+@@ -72,7 +72,14 @@ func RegisterTenantScopes(db *gorm.DB) error {
+ 		Register("multitenant:scope_delete", scopeQueryByTenant); err != nil {
+ 		return err
+ 	}
+-	if err := db.Callback().Create().Before("gorm:create").
++	// Register BEFORE gorm:before_create — that's the lifecycle step
++	// that fires per-model BeforeCreate hooks (Layer 3 strict-mode
++	// asserts via EnsureTenantIDOnCreate). If the scope callback ran
++	// after that, every BeforeCreate would see an empty tenant_id (the
++	// handler hadn't stamped child rows like nested budgets / rate-limits
++	// inside customer/team/VK transactions) and strict mode would error
++	// out before the scope had a chance to fill it from request ctx.
++	if err := db.Callback().Create().Before("gorm:before_create").
+ 		Register("multitenant:scope_create", populateTenantIDOnCreate); err != nil {
+ 		return err
+ 	}
+-- 
+2.51.0
+

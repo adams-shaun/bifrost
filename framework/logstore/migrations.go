@@ -333,6 +333,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddClusterGovernanceColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddLogsTenantIDColumn(ctx, db); err != nil {
+		return err
+	}
 	// migrationSplitFilterDataMatView is intentionally NOT invoked in this
 	// release. Dropping mv_logs_filterdata while old replicas are still
 	// serving /api/logs/filterdata from it would surface "relation does not
@@ -3236,6 +3239,55 @@ func migrationAddClusterGovernanceColumns(ctx context.Context, db *gorm.DB) erro
 	err := m.Migrate()
 	if err != nil {
 		return fmt.Errorf("error while adding cluster governance columns: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddLogsTenantIDColumn adds the tenant_id column to the logs
+// table and backfills 'default' on every pre-existing row. Idempotent
+// (HasColumn guard). The column carries `default:default` so any row
+// inserted by a process that doesn't carry the tenant header (cron
+// jobs, single-tenant deployments) gets the default tenant
+// automatically; the logstore tenant-scope callback enforces row
+// visibility against `WHERE tenant_id = '<ctx>'`. Without this column,
+// the multi-tenant /api/logs endpoint returns every tenant's data to
+// every tenant — see f5xc-patches/patch6 commit message.
+func migrationAddLogsTenantIDColumn(ctx context.Context, db *gorm.DB) error {
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: "logs_add_tenant_id_column",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			if !mig.HasColumn(&Log{}, "tenant_id") {
+				if err := mig.AddColumn(&Log{}, "TenantID"); err != nil {
+					return err
+				}
+			}
+			// Idempotent backfill — only touches rows the AddColumn
+			// default missed (e.g. dialects that don't honor a NOT
+			// NULL column default on an existing table).
+			if err := tx.Exec(
+				`UPDATE logs SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''`,
+			).Error; err != nil {
+				return fmt.Errorf("backfill logs.tenant_id: %w", err)
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mig := tx.Migrator()
+			if mig.HasColumn(&Log{}, "tenant_id") {
+				if err := mig.DropColumn(&Log{}, "tenant_id"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error while adding logs.tenant_id column: %s", err.Error())
 	}
 	return nil
 }

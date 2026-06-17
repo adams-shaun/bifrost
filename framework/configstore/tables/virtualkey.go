@@ -198,12 +198,18 @@ func (mc *TableVirtualKeyMCPConfig) UnmarshalJSON(data []byte) error {
 // TableVirtualKey represents a virtual key with budget, rate limits, and team/customer association
 type TableVirtualKey struct {
 	ID              string                          `gorm:"primaryKey;type:varchar(255)" json:"id"`
-	Name            string                          `gorm:"uniqueIndex:idx_virtual_key_name;type:varchar(255);not null" json:"name"`
+	Name            string                          `gorm:"uniqueIndex:idx_virtual_keys_tenant_name;type:varchar(255);not null" json:"name"`
 	Description     string                          `gorm:"type:text" json:"description,omitempty"`
-	Value           string                          `gorm:"uniqueIndex:idx_virtual_key_value;type:text;not null" json:"value"`           // The virtual key value
+	Value           string                          `gorm:"uniqueIndex:idx_virtual_key_value;type:text;not null" json:"value"`           // The virtual key value; globally unique because inbound requests resolve VK -> tenant by value
 	IsActive        *bool                           `gorm:"default:true" json:"is_active,omitempty"`                                     // Nil means true (DB default); false means inactive
 	ProviderConfigs []TableVirtualKeyProviderConfig `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"provider_configs"` // Empty means no providers allowed (deny-by-default)
 	MCPConfigs      []TableVirtualKeyMCPConfig      `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"mcp_configs"`
+
+	// TenantID scopes this virtual key to a tenant for multi-tenant deployments.
+	// Name becomes composite-unique with TenantID via idx_virtual_keys_tenant_name
+	// so two tenants can both register a VK named e.g. "primary". Value remains
+	// globally unique because inbound requests resolve VK -> tenant by value.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;uniqueIndex:idx_virtual_keys_tenant_name" json:"tenant_id"`
 
 	// Foreign key relationships (mutually exclusive: TeamID, CustomerID, or AccessProfileID)
 	TeamID          *string `gorm:"type:varchar(255);index" json:"team_id,omitempty"`
@@ -302,4 +308,14 @@ func (vk *TableVirtualKey) AfterFind(tx *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableVirtualKey) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "governance_virtual_keys")
 }

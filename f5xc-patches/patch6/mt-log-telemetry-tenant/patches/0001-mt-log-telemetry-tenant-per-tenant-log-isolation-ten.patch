@@ -1,8 +1,8 @@
-From 23d313db97e5d8426af0c7dcee3f5488bd344963 Mon Sep 17 00:00:00 2001
+From 9145045191a1f63315c61e66ae874c46272875ed Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 15:36:00 -0600
-Subject: [PATCH] mt-log-telemetry-tenant: per-tenant log isolation + tenant_id
- Prometheus label
+Subject: [PATCH 6/6] mt-log-telemetry-tenant: per-tenant log isolation +
+ tenant_id Prometheus label
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -69,17 +69,18 @@ Regression test
 
 Ref: https://jira.f5net.com/browse/XC-25496
 ---
- framework/logstore/migrations.go        |  52 +++++++
+ framework/logstore/migrations.go        |  52 +++++
  framework/logstore/postgres.go          |  12 ++
- framework/logstore/sqlite.go            |   9 ++
+ framework/logstore/sqlite.go            |   9 +
  framework/logstore/tables.go            |   6 +
- framework/logstore/tenant_scope.go      | 178 ++++++++++++++++++++++++
- framework/logstore/tenant_scope_test.go | 134 ++++++++++++++++++
+ framework/logstore/tenant_scope.go      | 247 ++++++++++++++++++++++++
+ framework/logstore/tenant_scope_test.go | 134 +++++++++++++
  plugins/logging/go.mod                  |   4 +
- plugins/logging/operations.go           |  31 +++++
+ plugins/logging/main.go                 |  12 ++
+ plugins/logging/operations.go           |  24 +++
  plugins/telemetry/go.mod                |   4 +
- plugins/telemetry/main.go               |  28 ++++
- 10 files changed, 458 insertions(+)
+ plugins/telemetry/main.go               |  28 +++
+ 11 files changed, 532 insertions(+)
  create mode 100644 framework/logstore/tenant_scope.go
  create mode 100644 framework/logstore/tenant_scope_test.go
 
@@ -212,10 +213,10 @@ index 52a77afae..928e958c3 100644
  	Provider                string    `gorm:"type:varchar(255);index;index:idx_logs_ts_provider_status,priority:2;not null" json:"provider"`
 diff --git a/framework/logstore/tenant_scope.go b/framework/logstore/tenant_scope.go
 new file mode 100644
-index 000000000..ebac20535
+index 000000000..c46ff8149
 --- /dev/null
 +++ b/framework/logstore/tenant_scope.go
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,247 @@
 +// Package logstore — tenant_scope.go.
 +//
 +// Mirror of framework/configstore/tenant_scope.go, scoped to this
@@ -243,7 +244,11 @@ index 000000000..ebac20535
 +
 +import (
 +	"context"
++	"fmt"
++	"os"
 +	"reflect"
++	"runtime/debug"
++	"strings"
 +
 +	"github.com/maximhq/bifrost/multitenant"
 +	"gorm.io/gorm"
@@ -355,6 +360,14 @@ index 000000000..ebac20535
 +	}
 +	tid, ok := tenantFromContext(tx.Statement.Context)
 +	if !ok {
++		// Mirror of the configstore strict assertion. Fail the INSERT
++		// (or log loudly, depending on BIFROST_ASSERT_TENANT_ON_INSERT)
++		// when a tenant-scoped log row is being written without a
++		// tenant on ctx and the caller didn't stamp TenantID either.
++		// Most legitimate callers (batchWriter using plugin root ctx)
++		// have TenantID pre-stamped at storeOrEnqueueEntry; the
++		// assertion catches the case where they don't.
++		assertEveryRowCarriesTenant(tx)
 +		return
 +	}
 +	rv := tx.Statement.ReflectValue
@@ -366,6 +379,63 @@ index 000000000..ebac20535
 +	case reflect.Struct:
 +		setTenantIfEmpty(rv, tid)
 +	}
++}
++
++// assertEveryRowCarriesTenant fails the INSERT (or logs, depending on
++// BIFROST_ASSERT_TENANT_ON_INSERT) when any row in the batch has an
++// empty TenantID and no tenant on ctx. See configstore's mirror for
++// the rationale.
++func assertEveryRowCarriesTenant(tx *gorm.DB) {
++	rv := tx.Statement.ReflectValue
++	switch rv.Kind() {
++	case reflect.Slice, reflect.Array:
++		for i := 0; i < rv.Len(); i++ {
++			if !rowHasTenant(rv.Index(i)) {
++				raiseTenantAssertion(tx, fmt.Sprintf("INSERT into %s with row #%d.TenantID=\"\" and no tenant on ctx", tx.Statement.Table, i))
++				return
++			}
++		}
++	case reflect.Struct:
++		if !rowHasTenant(rv) {
++			raiseTenantAssertion(tx, fmt.Sprintf("INSERT into %s with TenantID=\"\" and no tenant on ctx", tx.Statement.Table))
++		}
++	}
++}
++
++func rowHasTenant(rv reflect.Value) bool {
++	if rv.Kind() == reflect.Ptr {
++		if rv.IsNil() {
++			return true
++		}
++		rv = rv.Elem()
++	}
++	if rv.Kind() != reflect.Struct {
++		return true
++	}
++	field := rv.FieldByName("TenantID")
++	if !field.IsValid() || field.Kind() != reflect.String {
++		return true
++	}
++	return field.String() != ""
++}
++
++// strictAssertEnv opts INTO strict mode (default = log-only). Set to
++// true/1/yes/on to convert the assertion from a stderr warning into a
++// hard write failure. The Bifrost helm chart sets this in multi-
++// tenant deployments; OSS tests + single-tenant deployments leave it
++// unset so existing fixture rows that don't carry a tenant continue
++// to insert.
++const strictAssertEnv = "BIFROST_ASSERT_TENANT_ON_INSERT"
++
++func raiseTenantAssertion(tx *gorm.DB, msg string) {
++	stack := debug.Stack()
++	envVal := strings.ToLower(strings.TrimSpace(os.Getenv(strictAssertEnv)))
++	strict := envVal == "true" || envVal == "1" || envVal == "yes" || envVal == "on"
++	if strict {
++		_ = tx.AddError(fmt.Errorf("multitenant: tenant assertion failed: %s\n%s", msg, stack))
++		return
++	}
++	fmt.Fprintf(os.Stderr, "[WARN] multitenant: tenant assertion (logged, not blocked): %s\n%s\n", msg, stack)
 +}
 +
 +// setTenantIfEmpty sets the TenantID field on rv to tid only when the
@@ -546,8 +616,31 @@ index 0d1d94e02..d100ecae1 100644
 +require github.com/maximhq/bifrost/multitenant v0.0.0
 +
 +replace github.com/maximhq/bifrost/multitenant => ../../multitenant
+diff --git a/plugins/logging/main.go b/plugins/logging/main.go
+index 4be9640a8..ba623aad5 100644
+--- a/plugins/logging/main.go
++++ b/plugins/logging/main.go
+@@ -1113,6 +1113,18 @@ func (p *LoggerPlugin) Cleanup() error {
+ // retrieval by Inject(), or enqueues directly if no traceID is available (Go SDK path).
+ // Multiple entries per traceID are supported (e.g. fallback/retry attempts within the same trace).
+ func (p *LoggerPlugin) storeOrEnqueueEntry(ctx *schemas.BifrostContext, entry *logstore.Log, callback func(entry *logstore.Log)) {
++	// Stamp the tenant from BifrostContext so /api/logs filters
++	// correctly. MUST happen at this chokepoint (rather than at the
++	// dozen-ish entry construction sites above) and MUST happen
++	// BEFORE enqueue, because the batchWriter writes with the plugin
++	// root context (p.ctx) — it has no per-request tenant to read.
++	// The logstore tenant-scope callback's INSERT hook would
++	// otherwise be the only stamp source and it sees nothing on
++	// p.ctx, so the row falls back to the column's `default` schema
++	// default and every tenant's logs get bucketed as 'default'.
++	if entry != nil && entry.TenantID == "" {
++		entry.TenantID = tenantIDFromContext(ctx)
++	}
+ 	traceID, _ := ctx.Value(schemas.BifrostContextKeyTraceID).(string)
+ 	if traceID != "" {
+ 		// Append to slice for Inject() to pick up — supports multiple attempts per trace
 diff --git a/plugins/logging/operations.go b/plugins/logging/operations.go
-index 47d470ffe..abf723ef6 100644
+index 47d470ffe..8caf2bf27 100644
 --- a/plugins/logging/operations.go
 +++ b/plugins/logging/operations.go
 @@ -12,10 +12,34 @@ import (
@@ -585,20 +678,6 @@ index 47d470ffe..abf723ef6 100644
  // insertInitialLogEntry creates a new log entry in the database using GORM
  func (p *LoggerPlugin) insertInitialLogEntry(
  	ctx context.Context,
-@@ -36,6 +60,13 @@ func (p *LoggerPlugin) insertInitialLogEntry(
- 		Status:        "processing",
- 		Stream:        false,
- 		CreatedAt:     timestamp,
-+		// Stamp the tenant from BifrostContext so /api/logs filters
-+		// correctly. The logstore tenant-scope callback's INSERT hook
-+		// would also fill this from ctx (and the column's `default`
-+		// schema default handles the no-ctx-tenant case), but stamping
-+		// here keeps the source of truth one layer up — explicit when
-+		// the row is constructed, not implicit in the DB write path.
-+		TenantID: tenantIDFromContext(ctx),
- 		// Set parsed fields for serialization
- 		InputHistoryParsed:          data.InputHistory,
- 		ResponsesInputHistoryParsed: data.ResponsesInputHistory,
 diff --git a/plugins/telemetry/go.mod b/plugins/telemetry/go.mod
 index f4ef46402..c9db3af5a 100644
 --- a/plugins/telemetry/go.mod

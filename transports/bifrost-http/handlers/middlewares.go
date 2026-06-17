@@ -19,6 +19,7 @@ import (
 	"github.com/maximhq/bifrost/framework/encrypt"
 	"github.com/maximhq/bifrost/framework/temptoken"
 	"github.com/maximhq/bifrost/framework/tracing"
+	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/transports/bifrost-http/integrations"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
@@ -970,6 +971,19 @@ func (m *AuthMiddleware) middleware(shouldSkip func(*configstore.AuthConfig, str
 			}
 			// Checking bearer auth for dashboard calls
 			if scheme == "Bearer" {
+				// A Bifrost virtual key (sk-bf-…) is a valid bearer
+				// credential for the inference surface — the governance
+				// plugin downstream is the authoritative validator
+				// (active / inactive, scope, allowed_models, budget).
+				// The auth middleware just needs to recognise the
+				// credential FORMAT so a VK-only client (opencode, curl,
+				// an SDK) can talk to /v1 when DisableAuthOnInference is
+				// false. Falling through to validateSession would 401
+				// here because a VK is not a session token.
+				if strings.HasPrefix(token, governance.VirtualKeyPrefix) {
+					next(ctx)
+					return
+				}
 				// We are checking for API keys first; it it seems like a valid Bifrost API key
 
 				// Verify the session

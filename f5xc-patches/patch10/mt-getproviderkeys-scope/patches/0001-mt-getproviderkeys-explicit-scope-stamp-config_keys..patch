@@ -1,0 +1,67 @@
+From ab671250199e6e6fe627ec888cf518f60ec1074c Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 19:45:54 -0600
+Subject: [PATCH] mt-getproviderkeys-explicit-scope: stamp
+ config_keys.tenant_id in JOIN
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GetProviderKeys was returning cross-tenant keys: a shaun-scoped
+request hitting GET /api/providers/openai/keys received both
+shaun_openai-main and acme_openai-main. The query JOINs config_providers
+to config_keys; the GORM tenant-scope callback qualified the WHERE on
+the primary table (config_providers.tenant_id = ?), but in practice
+acme's keys still bled through. Belt-and-suspenders: explicitly add a
+config_keys.tenant_id = ? predicate when the request ctx carries a
+tenant. Skip the predicate when no tenant is in ctx so single-tenant
+OSS callers (config.json sync, boot-time reads) keep their existing
+"see all" semantics.
+
+Reproduced by examples/seed in go-bifrost-ai during its isolation
+assertion phase — primary tenant's key count came back as 2x expected
+because every per-provider list was returning every tenant's keys.
+---
+ framework/configstore/rdb.go | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 34d64421b..7eaa5e08d 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1271,13 +1271,30 @@ func (s *RDBConfigStore) GetProviderConfig(ctx context.Context, provider schemas
+ }
+ 
+ // GetProviderKeys retrieves all keys for a provider ordered by creation time.
++//
++// Tenant scoping note: the GORM scope callback registers on Query but
++// keys this query off `tx.Statement.Schema` (the Scan destination), which
++// here is []TableKey. The callback's qualifyTenantColumn uses
++// `tx.Statement.Table` — and we explicitly set that to "config_providers"
++// for the JOIN — so the callback's generated WHERE becomes
++// `config_providers.tenant_id = ?`. That correctly restricts the provider
++// side of the join, BUT in practice the cross-tenant key bleed
++// reproduced anyway (a shaun-scoped request returned acme's keys).
++// Belt-and-suspenders: stamp the tenant on the JOINED config_keys side
++// too. Worst case the predicate is redundant; best case it's the only
++// thing standing between the request and a cross-tenant data leak.
+ func (s *RDBConfigStore) GetProviderKeys(ctx context.Context, provider schemas.ModelProvider) ([]schemas.Key, error) {
++	tid, hasTenant := tenantFromContext(ctx)
+ 	var dbKeys []tables.TableKey
+-	result := s.DB().WithContext(ctx).
++	q := s.DB().WithContext(ctx).
+ 		Table("config_providers").
+ 		Select("config_keys.*").
+ 		Joins("LEFT JOIN config_keys ON config_keys.provider_id = config_providers.id").
+-		Where("config_providers.name = ?", string(provider)).
++		Where("config_providers.name = ?", string(provider))
++	if hasTenant {
++		q = q.Where("config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL", tid)
++	}
++	result := q.
+ 		Order("config_keys.created_at ASC").
+ 		Scan(&dbKeys)
+ 	if result.Error != nil {
+-- 
+2.51.0
+

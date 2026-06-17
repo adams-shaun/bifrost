@@ -1,0 +1,1337 @@
+From 98b5639d10a28c931edd0365d45fa58307a5ae7d Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 19:08:19 -0600
+Subject: [PATCH] mt-runtime-isolation: per-tenant Bifrost runtime dispatch +
+ eviction hooks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes Stage 1's runtime-isolation gap. Patches 1-6 gave us data-scope
+isolation via the GORM tenant callback, but inference still dispatched
+through a single shared root *bifrost.Bifrost — provider workers,
+queues, and the lib.Config.Providers in-memory snapshot were
+last-write-wins across tenants. This commit wires multitenant.Manager
+(introduced in patch1) into the inference path so each tenant gets its
+own engine, snapshotting providers+keys from a tenant-scoped DB read at
+Acquire time.
+
+Sync inference:
+  - TenantDispatcherMiddleware mounts after TenantResolverMiddleware in
+    RegisterInferenceRoutes; reads the tenant id off ctx, asks the
+    dispatcher (BifrostHTTPServer.BifrostFor) for the right runtime,
+    stashes it on ctx UserValue, defers release. Streaming-safe — defer
+    fires after the SSE drains.
+  - inference.go and mcpinference.go gain h.bf(ctx) helpers that read
+    the per-request runtime off ctx, falling back to the constructor-
+    time h.client. All 48 h.client.X(bifrostCtx, ...) call sites in
+    those two files refactored.
+
+Async (request lifetime ≠ closure lifetime):
+  - AsyncHandler.SetDispatcher wired at boot. Each submit method calls
+    acquireBifrost(ctx) BEFORE SubmitJob — holds an extra refcount that
+    survives past request return. The closure defers release(); the
+    SubmitJob err path explicitly releases since the closure never ran.
+
+Eviction:
+  - server.EvictTenantRuntime exposed as the package-level
+    handlers.TenantEvict hook (wired in initializeManager). All 6
+    provider/key admin write handlers call defer EvictTenant(ctx) so
+    the next Acquire re-snapshots fresh DB state. Over-eager evict on
+    error paths is acceptable — same cost as a single startup load.
+
+Single-tenant fallback: BifrostFor returns s.Client+noop for empty /
+"default" tids or when Manager is nil; OSS deployments see zero overhead.
+
+Docs: docs/multi-tenant-f5/02-stage2-runtime-isolation.md.
+
+Known gaps (Stage 3): per-tenant MCP isolation, WS/WebRTC/Realtime
+handlers still on root runtime, Manager LRU cap unset, Manager unit
+tests.
+---
+ .../bifrost-http/handlers/asyncinference.go   |  88 ++++++-
+ transports/bifrost-http/handlers/inference.go | 105 +++++----
+ .../bifrost-http/handlers/mcpinference.go     |  14 +-
+ .../bifrost-http/handlers/provider_keys.go    |   6 +
+ transports/bifrost-http/handlers/providers.go |  11 +
+ .../handlers/tenant_dispatcher.go             | 100 ++++++++
+ transports/bifrost-http/lib/ctx.go            |  28 +++
+ transports/bifrost-http/server/multitenant.go | 223 ++++++++++++++++++
+ transports/bifrost-http/server/server.go      |  34 ++-
+ 9 files changed, 548 insertions(+), 61 deletions(-)
+ create mode 100644 transports/bifrost-http/handlers/tenant_dispatcher.go
+ create mode 100644 transports/bifrost-http/server/multitenant.go
+
+diff --git a/transports/bifrost-http/handlers/asyncinference.go b/transports/bifrost-http/handlers/asyncinference.go
+index 1a4f07e74..eb8764e34 100644
+--- a/transports/bifrost-http/handlers/asyncinference.go
++++ b/transports/bifrost-http/handlers/asyncinference.go
+@@ -20,6 +20,13 @@ type AsyncHandler struct {
+ 	executor     *logstore.AsyncJobExecutor
+ 	handlerStore lib.HandlerStore
+ 	config       *lib.Config
++	// dispatcher resolves per-tenant runtimes. Async closures run in a
++	// goroutine that outlives the request, so unlike the sync inference
++	// path (where the dispatch middleware's defer release fires after
++	// the handler returns) we must acquire a fresh refcount here and
++	// release it from inside the closure. nil dispatcher = single-tenant
++	// fallback (uses h.client directly).
++	dispatcher BifrostDispatcher
+ }
+ 
+ // AsyncPathToTypeMapping maps exact paths to request types (only for non-parameterized paths)
+@@ -61,6 +68,32 @@ func NewAsyncHandler(client *bifrost.Bifrost, config *lib.Config) *AsyncHandler
+ 	}
+ }
+ 
++// SetDispatcher wires a BifrostDispatcher so async closures route to
++// per-tenant runtimes. Optional; nil dispatcher = single-tenant
++// fallback (uses h.client directly). Server bootstrap calls this after
++// the Manager is initialized.
++func (h *AsyncHandler) SetDispatcher(d BifrostDispatcher) {
++	h.dispatcher = d
++}
++
++// acquireBifrost picks the runtime for an async job and returns a
++// release function the closure MUST defer. For single-tenant deployments
++// (no dispatcher, empty tid) it returns h.client with a no-op release.
++// For multi-tenant: holds a refcount on the per-tenant runtime so eviction
++// blocks until the closure completes.
++func (h *AsyncHandler) acquireBifrost(ctx *fasthttp.RequestCtx) (*bifrost.Bifrost, func()) {
++	noop := func() {}
++	if h.dispatcher == nil {
++		return h.client, noop
++	}
++	tid := TenantIDFromCtx(ctx)
++	bf, release := h.dispatcher.BifrostFor(ctx, tid)
++	if bf == nil {
++		return h.client, noop
++	}
++	return bf, release
++}
++
+ // RegisterRoutes registers async job endpoints.
+ func (h *AsyncHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
+ 	if h.executor == nil {
+@@ -120,15 +153,18 @@ func (h *AsyncHandler) asyncTextCompletion(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.TextCompletionRequest(bgCtx, bifrostTextReq)
++			defer release()
++			return bf.TextCompletionRequest(bgCtx, bifrostTextReq)
+ 		},
+ 		schemas.TextCompletionRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+ 		return
+ 	}
+@@ -157,15 +193,18 @@ func (h *AsyncHandler) asyncChatCompletion(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.ChatCompletionRequest(bgCtx, bifrostChatReq)
++			defer release()
++			return bf.ChatCompletionRequest(bgCtx, bifrostChatReq)
+ 		},
+ 		schemas.ChatCompletionRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -194,15 +233,18 @@ func (h *AsyncHandler) asyncResponses(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.ResponsesRequest(bgCtx, bifrostResponsesReq)
++			defer release()
++			return bf.ResponsesRequest(bgCtx, bifrostResponsesReq)
+ 		},
+ 		schemas.ResponsesRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Failed to create async job: %v", err))
+ 		return
+ 	}
+@@ -227,15 +269,18 @@ func (h *AsyncHandler) asyncEmbeddings(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.EmbeddingRequest(bgCtx, bifrostEmbeddingReq)
++			defer release()
++			return bf.EmbeddingRequest(bgCtx, bifrostEmbeddingReq)
+ 		},
+ 		schemas.EmbeddingRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -264,15 +309,18 @@ func (h *AsyncHandler) asyncSpeech(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.SpeechRequest(bgCtx, bifrostSpeechReq)
++			defer release()
++			return bf.SpeechRequest(bgCtx, bifrostSpeechReq)
+ 		},
+ 		schemas.SpeechRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -301,15 +349,18 @@ func (h *AsyncHandler) asyncTranscription(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.TranscriptionRequest(bgCtx, bifrostTranscriptionReq)
++			defer release()
++			return bf.TranscriptionRequest(bgCtx, bifrostTranscriptionReq)
+ 		},
+ 		schemas.TranscriptionRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -338,15 +389,18 @@ func (h *AsyncHandler) asyncImageGeneration(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.ImageGenerationRequest(bgCtx, bifrostReq)
++			defer release()
++			return bf.ImageGenerationRequest(bgCtx, bifrostReq)
+ 		},
+ 		schemas.ImageGenerationRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -375,15 +429,18 @@ func (h *AsyncHandler) asyncImageEdit(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.ImageEditRequest(bgCtx, bifrostReq)
++			defer release()
++			return bf.ImageEditRequest(bgCtx, bifrostReq)
+ 		},
+ 		schemas.ImageEditRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -407,15 +464,18 @@ func (h *AsyncHandler) asyncImageVariation(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.ImageVariationRequest(bgCtx, bifrostReq)
++			defer release()
++			return bf.ImageVariationRequest(bgCtx, bifrostReq)
+ 		},
+ 		schemas.ImageVariationRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+ 		return
+ 	}
+@@ -439,15 +499,18 @@ func (h *AsyncHandler) asyncRerank(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.RerankRequest(bgCtx, bifrostReq)
++			defer release()
++			return bf.RerankRequest(bgCtx, bifrostReq)
+ 		},
+ 		schemas.RerankRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+ 		return
+ 	}
+@@ -471,15 +534,18 @@ func (h *AsyncHandler) asyncOCR(ctx *fasthttp.RequestCtx) {
+ 
+ 	resultTTL := getResultTTLFromHeaderWithDefault(ctx, h.config.ClientConfig.AsyncJobResultTTL)
+ 
++	bf, release := h.acquireBifrost(ctx)
+ 	job, err := h.executor.SubmitJob(
+ 		bifrostCtx,
+ 		resultTTL,
+ 		func(bgCtx *schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+-			return h.client.OCRRequest(bgCtx, bifrostReq)
++			defer release()
++			return bf.OCRRequest(bgCtx, bifrostReq)
+ 		},
+ 		schemas.OCRRequest,
+ 	)
+ 	if err != nil {
++		release()
+ 		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+ 		return
+ 	}
+diff --git a/transports/bifrost-http/handlers/inference.go b/transports/bifrost-http/handlers/inference.go
+index c5b1f1d28..4e1fe06e9 100644
+--- a/transports/bifrost-http/handlers/inference.go
++++ b/transports/bifrost-http/handlers/inference.go
+@@ -56,6 +56,19 @@ func NewInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *Completio
+ 	}
+ }
+ 
++// bf returns the *bifrost.Bifrost that should serve this request. The
++// tenant dispatcher middleware (see tenant_dispatcher.go) stamps the
++// per-tenant runtime on the fasthttp ctx; we read it here so each
++// inference call dispatches against the right engine. Falls back to
++// the root client when no dispatcher is mounted (single-tenant) or the
++// request didn't traverse the middleware (admin / non-inference paths).
++func (h *CompletionHandler) bf(ctx *fasthttp.RequestCtx) *bifrost.Bifrost {
++	if bf := lib.BifrostClientFromCtx(ctx); bf != nil {
++		return bf
++	}
++	return h.client
++}
++
+ // resolveModelAndProvider parses the model string, validates it, and resolves
+ // the provider via model catalog when no provider prefix is present. Stores
+ // resolution metadata on the fasthttp context for ConvertToBifrostContext to
+@@ -829,9 +842,9 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
+ 
+ 	// If provider is empty, list all models from all providers
+ 	if provider == "" {
+-		resp, bifrostErr = h.client.ListAllModels(bifrostCtx, bifrostListModelsReq)
++		resp, bifrostErr = h.bf(ctx).ListAllModels(bifrostCtx, bifrostListModelsReq)
+ 	} else {
+-		resp, bifrostErr = h.client.ListModelsRequest(bifrostCtx, bifrostListModelsReq)
++		resp, bifrostErr = h.bf(ctx).ListModelsRequest(bifrostCtx, bifrostListModelsReq)
+ 	}
+ 
+ 	if bifrostErr != nil {
+@@ -930,7 +943,7 @@ func (h *CompletionHandler) textCompletion(ctx *fasthttp.RequestCtx) {
+ 	// This is a known issue of valyala/fasthttp. And will be fixed here once it is fixed upstream.
+ 	defer cancel() // Ensure cleanup on function exit
+ 
+-	resp, bifrostErr := h.client.TextCompletionRequest(bifrostCtx, bifrostTextReq)
++	resp, bifrostErr := h.bf(ctx).TextCompletionRequest(bifrostCtx, bifrostTextReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1005,7 +1018,7 @@ func (h *CompletionHandler) chatCompletion(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	defer cancel() // Ensure cleanup on function exit
+ 	// Complete the request
+-	resp, bifrostErr := h.client.ChatCompletionRequest(bifrostCtx, bifrostChatReq)
++	resp, bifrostErr := h.bf(ctx).ChatCompletionRequest(bifrostCtx, bifrostChatReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1076,7 +1089,7 @@ func (h *CompletionHandler) responses(ctx *fasthttp.RequestCtx) {
+ 
+ 	defer cancel() // Ensure cleanup on function exit
+ 
+-	resp, bifrostErr := h.client.ResponsesRequest(bifrostCtx, bifrostResponsesReq)
++	resp, bifrostErr := h.bf(ctx).ResponsesRequest(bifrostCtx, bifrostResponsesReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1130,7 +1143,7 @@ func (h *CompletionHandler) embeddings(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.EmbeddingRequest(bifrostCtx, bifrostEmbeddingReq)
++	resp, bifrostErr := h.bf(ctx).EmbeddingRequest(bifrostCtx, bifrostEmbeddingReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1197,7 +1210,7 @@ func (h *CompletionHandler) rerank(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.RerankRequest(bifrostCtx, bifrostRerankReq)
++	resp, bifrostErr := h.bf(ctx).RerankRequest(bifrostCtx, bifrostRerankReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1260,7 +1273,7 @@ func (h *CompletionHandler) ocr(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.OCRRequest(bifrostCtx, bifrostOCRReq)
++	resp, bifrostErr := h.bf(ctx).OCRRequest(bifrostCtx, bifrostOCRReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1321,7 +1334,7 @@ func (h *CompletionHandler) speech(ctx *fasthttp.RequestCtx) {
+ 
+ 	defer cancel() // Ensure cleanup on function exit
+ 
+-	resp, bifrostErr := h.client.SpeechRequest(bifrostCtx, bifrostSpeechReq)
++	resp, bifrostErr := h.bf(ctx).SpeechRequest(bifrostCtx, bifrostSpeechReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1448,7 +1461,7 @@ func (h *CompletionHandler) transcription(ctx *fasthttp.RequestCtx) {
+ 
+ 	defer cancel()
+ 
+-	resp, bifrostErr := h.client.TranscriptionRequest(bifrostCtx, bifrostTranscriptionReq)
++	resp, bifrostErr := h.bf(ctx).TranscriptionRequest(bifrostCtx, bifrostTranscriptionReq)
+ 
+ 	// Handle response
+ 	if bifrostErr != nil {
+@@ -1482,7 +1495,7 @@ func (h *CompletionHandler) countTokens(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	defer cancel()
+ 
+-	response, bifrostErr := h.client.CountTokensRequest(bifrostCtx, bifrostResponsesReq)
++	response, bifrostErr := h.bf(ctx).CountTokensRequest(bifrostCtx, bifrostResponsesReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1503,7 +1516,7 @@ func (h *CompletionHandler) handleStreamingTextCompletion(ctx *fasthttp.RequestC
+ 	// See router.go for detailed explanation of why we need a cancellable context
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.TextCompletionStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).TextCompletionStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -1515,7 +1528,7 @@ func (h *CompletionHandler) handleStreamingChatCompletion(ctx *fasthttp.RequestC
+ 	// See router.go for detailed explanation of why we need a cancellable context
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.ChatCompletionStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).ChatCompletionStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -1527,7 +1540,7 @@ func (h *CompletionHandler) handleStreamingResponses(ctx *fasthttp.RequestCtx, r
+ 	// See router.go for detailed explanation of why we need a cancellable context
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.ResponsesStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).ResponsesStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -1539,7 +1552,7 @@ func (h *CompletionHandler) handleStreamingSpeech(ctx *fasthttp.RequestCtx, req
+ 	// See router.go for detailed explanation of why we need a cancellable context
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.SpeechStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).SpeechStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -1551,7 +1564,7 @@ func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.Re
+ 	// See router.go for detailed explanation of why we need a cancellable context
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.TranscriptionStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).TranscriptionStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -1897,7 +1910,7 @@ func (h *CompletionHandler) imageGeneration(ctx *fasthttp.RequestCtx) {
+ 	defer cancel()
+ 
+ 	// Execute request
+-	resp, bifrostErr := h.client.ImageGenerationRequest(bifrostCtx, bifrostReq)
++	resp, bifrostErr := h.bf(ctx).ImageGenerationRequest(bifrostCtx, bifrostReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -1920,7 +1933,7 @@ func (h *CompletionHandler) handleStreamingImageGeneration(ctx *fasthttp.Request
+ 	// Pass the context directly instead of copying to avoid copying lock values
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.ImageGenerationStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).ImageGenerationStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -2104,7 +2117,7 @@ func (h *CompletionHandler) imageEdit(ctx *fasthttp.RequestCtx) {
+ 	defer cancel()
+ 
+ 	// Execute request
+-	resp, bifrostErr := h.client.ImageEditRequest(bifrostCtx, bifrostReq)
++	resp, bifrostErr := h.bf(ctx).ImageEditRequest(bifrostCtx, bifrostReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2126,7 +2139,7 @@ func (h *CompletionHandler) handleStreamingImageEditRequest(ctx *fasthttp.Reques
+ 	// See router.go for detailed explanation of why we need a cancellable context
+ 
+ 	getStream := func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+-		return h.client.ImageEditStreamRequest(bifrostCtx, req)
++		return h.bf(ctx).ImageEditStreamRequest(bifrostCtx, req)
+ 	}
+ 
+ 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
+@@ -2241,7 +2254,7 @@ func (h *CompletionHandler) imageVariation(ctx *fasthttp.RequestCtx) {
+ 	defer cancel()
+ 
+ 	// Execute request (no streaming for variations)
+-	resp, bifrostErr := h.client.ImageVariationRequest(bifrostCtx, bifrostReq)
++	resp, bifrostErr := h.bf(ctx).ImageVariationRequest(bifrostCtx, bifrostReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2309,7 +2322,7 @@ func (h *CompletionHandler) videoGeneration(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	defer cancel()
+ 
+-	resp, bifrostErr := h.client.VideoGenerationRequest(bifrostCtx, bifrostReq)
++	resp, bifrostErr := h.bf(ctx).VideoGenerationRequest(bifrostCtx, bifrostReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2362,7 +2375,7 @@ func (h *CompletionHandler) videoRetrieve(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.VideoRetrieveRequest(bifrostCtx, bifrostVideoReq)
++	resp, bifrostErr := h.bf(ctx).VideoRetrieveRequest(bifrostCtx, bifrostVideoReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2420,7 +2433,7 @@ func (h *CompletionHandler) videoDownload(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.VideoDownloadRequest(bifrostCtx, bifrostVideoReq)
++	resp, bifrostErr := h.bf(ctx).VideoDownloadRequest(bifrostCtx, bifrostVideoReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2482,7 +2495,7 @@ func (h *CompletionHandler) videoList(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.VideoListRequest(bifrostCtx, bifrostVideoReq)
++	resp, bifrostErr := h.bf(ctx).VideoListRequest(bifrostCtx, bifrostVideoReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2533,7 +2546,7 @@ func (h *CompletionHandler) videoDelete(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.VideoDeleteRequest(bifrostCtx, bifrostVideoReq)
++	resp, bifrostErr := h.bf(ctx).VideoDeleteRequest(bifrostCtx, bifrostVideoReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2610,7 +2623,7 @@ func (h *CompletionHandler) videoRemix(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.VideoRemixRequest(bifrostCtx, bifrostVideoReq)
++	resp, bifrostErr := h.bf(ctx).VideoRemixRequest(bifrostCtx, bifrostVideoReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2680,7 +2693,7 @@ func (h *CompletionHandler) batchCreate(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.BatchCreateRequest(bifrostCtx, bifrostBatchReq)
++	resp, bifrostErr := h.bf(ctx).BatchCreateRequest(bifrostCtx, bifrostBatchReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2740,7 +2753,7 @@ func (h *CompletionHandler) batchList(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.BatchListRequest(bifrostCtx, bifrostBatchReq)
++	resp, bifrostErr := h.bf(ctx).BatchListRequest(bifrostCtx, bifrostBatchReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2786,7 +2799,7 @@ func (h *CompletionHandler) batchRetrieve(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.BatchRetrieveRequest(bifrostCtx, bifrostBatchReq)
++	resp, bifrostErr := h.bf(ctx).BatchRetrieveRequest(bifrostCtx, bifrostBatchReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2832,7 +2845,7 @@ func (h *CompletionHandler) batchCancel(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.BatchCancelRequest(bifrostCtx, bifrostBatchReq)
++	resp, bifrostErr := h.bf(ctx).BatchCancelRequest(bifrostCtx, bifrostBatchReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2878,7 +2891,7 @@ func (h *CompletionHandler) batchResults(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.BatchResultsRequest(bifrostCtx, bifrostBatchReq)
++	resp, bifrostErr := h.bf(ctx).BatchResultsRequest(bifrostCtx, bifrostBatchReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -2967,7 +2980,7 @@ func (h *CompletionHandler) fileUpload(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.FileUploadRequest(bifrostCtx, bifrostFileReq)
++	resp, bifrostErr := h.bf(ctx).FileUploadRequest(bifrostCtx, bifrostFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3033,7 +3046,7 @@ func (h *CompletionHandler) fileList(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.FileListRequest(bifrostCtx, bifrostFileReq)
++	resp, bifrostErr := h.bf(ctx).FileListRequest(bifrostCtx, bifrostFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3079,7 +3092,7 @@ func (h *CompletionHandler) fileRetrieve(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.FileRetrieveRequest(bifrostCtx, bifrostFileReq)
++	resp, bifrostErr := h.bf(ctx).FileRetrieveRequest(bifrostCtx, bifrostFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3125,7 +3138,7 @@ func (h *CompletionHandler) fileDelete(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.FileDeleteRequest(bifrostCtx, bifrostFileReq)
++	resp, bifrostErr := h.bf(ctx).FileDeleteRequest(bifrostCtx, bifrostFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3171,7 +3184,7 @@ func (h *CompletionHandler) fileContent(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	resp, bifrostErr := h.client.FileContentRequest(bifrostCtx, bifrostFileReq)
++	resp, bifrostErr := h.bf(ctx).FileContentRequest(bifrostCtx, bifrostFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3233,7 +3246,7 @@ func (h *CompletionHandler) containerCreate(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerCreateRequest(bifrostCtx, bifrostContainerReq)
++	resp, bifrostErr := h.bf(ctx).ContainerCreateRequest(bifrostCtx, bifrostContainerReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3292,7 +3305,7 @@ func (h *CompletionHandler) containerList(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerListRequest(bifrostCtx, bifrostContainerReq)
++	resp, bifrostErr := h.bf(ctx).ContainerListRequest(bifrostCtx, bifrostContainerReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3339,7 +3352,7 @@ func (h *CompletionHandler) containerRetrieve(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerRetrieveRequest(bifrostCtx, bifrostContainerReq)
++	resp, bifrostErr := h.bf(ctx).ContainerRetrieveRequest(bifrostCtx, bifrostContainerReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3386,7 +3399,7 @@ func (h *CompletionHandler) containerDelete(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerDeleteRequest(bifrostCtx, bifrostContainerReq)
++	resp, bifrostErr := h.bf(ctx).ContainerDeleteRequest(bifrostCtx, bifrostContainerReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3483,7 +3496,7 @@ func (h *CompletionHandler) containerFileCreate(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerFileCreateRequest(bifrostCtx, bifrostContainerFileReq)
++	resp, bifrostErr := h.bf(ctx).ContainerFileCreateRequest(bifrostCtx, bifrostContainerFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3543,7 +3556,7 @@ func (h *CompletionHandler) containerFileList(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerFileListRequest(bifrostCtx, bifrostContainerFileReq)
++	resp, bifrostErr := h.bf(ctx).ContainerFileListRequest(bifrostCtx, bifrostContainerFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3598,7 +3611,7 @@ func (h *CompletionHandler) containerFileRetrieve(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerFileRetrieveRequest(bifrostCtx, bifrostContainerFileReq)
++	resp, bifrostErr := h.bf(ctx).ContainerFileRetrieveRequest(bifrostCtx, bifrostContainerFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3653,7 +3666,7 @@ func (h *CompletionHandler) containerFileContent(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerFileContentRequest(bifrostCtx, bifrostContainerFileReq)
++	resp, bifrostErr := h.bf(ctx).ContainerFileContentRequest(bifrostCtx, bifrostContainerFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+@@ -3708,7 +3721,7 @@ func (h *CompletionHandler) containerFileDelete(ctx *fasthttp.RequestCtx) {
+ 	}
+ 	enableRawRequestResponseForContainer(bifrostCtx)
+ 
+-	resp, bifrostErr := h.client.ContainerFileDeleteRequest(bifrostCtx, bifrostContainerFileReq)
++	resp, bifrostErr := h.bf(ctx).ContainerFileDeleteRequest(bifrostCtx, bifrostContainerFileReq)
+ 	if bifrostErr != nil {
+ 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+ 		SendBifrostError(ctx, bifrostErr)
+diff --git a/transports/bifrost-http/handlers/mcpinference.go b/transports/bifrost-http/handlers/mcpinference.go
+index a3f8d6594..ceca6f48f 100644
+--- a/transports/bifrost-http/handlers/mcpinference.go
++++ b/transports/bifrost-http/handlers/mcpinference.go
+@@ -25,6 +25,16 @@ func NewMCPInferenceHandler(client *bifrost.Bifrost, config *lib.Config) *MCPInf
+ 	}
+ }
+ 
++// bf returns the per-request *bifrost.Bifrost stashed by the tenant
++// dispatcher middleware, falling back to the root client. See
++// CompletionHandler.bf for the rationale.
++func (h *MCPInferenceHandler) bf(ctx *fasthttp.RequestCtx) *bifrost.Bifrost {
++	if bf := lib.BifrostClientFromCtx(ctx); bf != nil {
++		return bf
++	}
++	return h.client
++}
++
+ // RegisterRoutes registers the MCP inference routes
+ func (h *MCPInferenceHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
+ 	r.POST("/v1/mcp/tool/execute", lib.ChainMiddlewares(h.executeTool, middlewares...))
+@@ -68,7 +78,7 @@ func (h *MCPInferenceHandler) executeChatMCPTool(ctx *fasthttp.RequestCtx) {
+ 	}
+ 
+ 	// Execute MCP tool
+-	toolMessage, bifrostErr := h.client.ExecuteChatMCPTool(bifrostCtx, &req)
++	toolMessage, bifrostErr := h.bf(ctx).ExecuteChatMCPTool(bifrostCtx, &req)
+ 	if bifrostErr != nil {
+ 		SendBifrostError(ctx, bifrostErr)
+ 		return
+@@ -101,7 +111,7 @@ func (h *MCPInferenceHandler) executeResponsesMCPTool(ctx *fasthttp.RequestCtx)
+ 	}
+ 
+ 	// Execute MCP tool
+-	toolMessage, bifrostErr := h.client.ExecuteResponsesMCPTool(bifrostCtx, &req)
++	toolMessage, bifrostErr := h.bf(ctx).ExecuteResponsesMCPTool(bifrostCtx, &req)
+ 	if bifrostErr != nil {
+ 		SendBifrostError(ctx, bifrostErr)
+ 		return
+diff --git a/transports/bifrost-http/handlers/provider_keys.go b/transports/bifrost-http/handlers/provider_keys.go
+index 286975f67..71800c95e 100644
+--- a/transports/bifrost-http/handlers/provider_keys.go
++++ b/transports/bifrost-http/handlers/provider_keys.go
+@@ -91,6 +91,8 @@ func (h *ProviderHandler) getProviderKey(ctx *fasthttp.RequestCtx) {
+ }
+ 
+ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
++	defer EvictTenant(ctx) // see providers.addProvider for rationale
++
+ 	provider, err := getProviderFromCtx(ctx)
+ 	if err != nil {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid provider: %v", err))
+@@ -188,6 +190,8 @@ func (h *ProviderHandler) createProviderKey(ctx *fasthttp.RequestCtx) {
+ }
+ 
+ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
++	defer EvictTenant(ctx) // see providers.addProvider for rationale
++
+ 	provider, err := getProviderFromCtx(ctx)
+ 	if err != nil {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid provider: %v", err))
+@@ -299,6 +303,8 @@ func (h *ProviderHandler) updateProviderKey(ctx *fasthttp.RequestCtx) {
+ }
+ 
+ func (h *ProviderHandler) deleteProviderKey(ctx *fasthttp.RequestCtx) {
++	defer EvictTenant(ctx) // see providers.addProvider for rationale
++
+ 	provider, err := getProviderFromCtx(ctx)
+ 	if err != nil {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid provider: %v", err))
+diff --git a/transports/bifrost-http/handlers/providers.go b/transports/bifrost-http/handlers/providers.go
+index 411ab41c7..e7f980d0a 100644
+--- a/transports/bifrost-http/handlers/providers.go
++++ b/transports/bifrost-http/handlers/providers.go
+@@ -225,6 +225,13 @@ func (h *ProviderHandler) getProvider(ctx *fasthttp.RequestCtx) {
+ // addProvider handles POST /api/providers - Add a new provider
+ // NOTE: This only gets called when a new custom provider is added
+ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
++	// Per-tenant runtime caches a snapshot of providers + keys taken at
++	// Acquire time. Any mutation invalidates that snapshot for this
++	// tenant — evict so the next inference re-loads from the DB.
++	// Fires on error paths too: an over-eager evict just costs one
++	// reload on the next request, which is identical to startup behavior.
++	defer EvictTenant(ctx)
++
+ 	var payload providerCreatePayload
+ 	if err := sonic.Unmarshal(ctx.PostBody(), &payload); err != nil {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+@@ -389,6 +396,8 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
+ // The frontend should send the complete provider configuration.
+ // This flow upserts the config
+ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
++	defer EvictTenant(ctx) // see addProvider for rationale
++
+ 	provider, err := getProviderFromCtx(ctx)
+ 	if err != nil {
+ 		// If not found, then first we create and then update
+@@ -599,6 +608,8 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 
+ // deleteProvider handles DELETE /api/providers/{provider} - Remove provider
+ func (h *ProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
++	defer EvictTenant(ctx) // see addProvider for rationale
++
+ 	provider, err := getProviderFromCtx(ctx)
+ 	if err != nil {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid provider: %v", err))
+diff --git a/transports/bifrost-http/handlers/tenant_dispatcher.go b/transports/bifrost-http/handlers/tenant_dispatcher.go
+new file mode 100644
+index 000000000..9db9458c4
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_dispatcher.go
+@@ -0,0 +1,100 @@
++// Package handlers — tenant_dispatcher.go.
++//
++// Stage 2 runtime-isolation middleware: turns the `x-f5xc-tenant`
++// header (stamped on ctx by TenantResolverMiddleware) into a per-
++// request *bifrost.Bifrost. Inference handlers read that runtime
++// reference off ctx via lib.BifrostClientFromCtx — they don't need
++// to know whether they're hitting the shared root runtime (single-
++// tenant fallback) or a per-tenant runtime owned by the Manager.
++//
++// Without this middleware mounted, every inference handler still
++// works (it falls back to its constructor-time h.client), but
++// per-tenant runtime isolation is lost — every tenant shares the
++// same provider workers + queues + account snapshot. Data scope
++// (the GORM tenant callback) still keeps row visibility correct.
++
++package handlers
++
++import (
++	"context"
++
++	bifrost "github.com/maximhq/bifrost/core"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++)
++
++// BifrostDispatcher abstracts the per-tenant runtime registry the
++// middleware looks up against. Implemented by *server.BifrostHTTPServer
++// in the production wiring (see server/multitenant.go BifrostFor).
++// Lives as an interface here so the handlers package doesn't import
++// server (which would cycle).
++type BifrostDispatcher interface {
++	// BifrostFor returns the *bifrost.Bifrost that should serve a
++	// request from the given tenant, plus a release function the
++	// caller must defer to allow eventual eviction. For empty / default
++	// tid (single-tenant fallback) the implementation returns the root
++	// runtime and a no-op release.
++	BifrostFor(ctx context.Context, tid string) (*bifrost.Bifrost, func())
++}
++
++// TenantEvict is the package-level eviction hook admin handlers call
++// after a successful write that mutates a tenant's runtime config
++// (provider / key / VK / MCP). Wired at boot from
++// server/multitenant.go via *BifrostHTTPServer.EvictTenantRuntime.
++// nil during single-tenant deployments (no Manager) — calls are
++// no-ops via EvictTenant below.
++//
++// Global var rather than per-handler field because the eviction surface
++// touches half a dozen handlers across providers / governance / mcp;
++// threading an interface through every constructor would churn signatures
++// for a single line of behavior. The dispatcher (BifrostDispatcher) is
++// per-request and DOES belong on a struct — eviction is a side-effect.
++var TenantEvict func(tid string)
++
++// EvictTenant fires the configured eviction hook with the tenant id read
++// off the request ctx. Safe to call when no manager is configured
++// (TenantEvict nil) or when no tenant header was present (empty tid).
++// Call AFTER a successful mutation — pre-success calls would evict
++// state that's about to be re-loaded on the very next request,
++// pointlessly thrashing the cache on a no-op admin call.
++func EvictTenant(ctx *fasthttp.RequestCtx) {
++	if TenantEvict == nil {
++		return
++	}
++	tid := TenantIDFromCtx(ctx)
++	if tid == "" {
++		return
++	}
++	TenantEvict(tid)
++}
++
++// TenantDispatcherMiddleware wraps every request: it reads the tenant
++// id off the resolver-stamped ctx, asks the dispatcher for the right
++// *bifrost.Bifrost, stashes it on the fasthttp UserValue under
++// FastHTTPUserValueBifrostClient (so handlers fetch via
++// lib.BifrostClientFromCtx), and defers the release.
++//
++// MUST mount AFTER TenantResolverMiddleware in the chain — that's the
++// middleware that puts the tenant id on ctx for us to read.
++//
++// Streaming-safe: fasthttp request handlers are synchronous within a
++// single request, so `defer release` fires after the SSE / streamed
++// response has fully drained back to the client.
++func TenantDispatcherMiddleware(dispatcher BifrostDispatcher) schemas.BifrostHTTPMiddleware {
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			if dispatcher == nil {
++				next(ctx)
++				return
++			}
++			tid := TenantIDFromCtx(ctx)
++			bf, release := dispatcher.BifrostFor(ctx, tid)
++			defer release()
++			if bf != nil {
++				ctx.SetUserValue(lib.FastHTTPUserValueBifrostClient, bf)
++			}
++			next(ctx)
++		}
++	}
++}
+diff --git a/transports/bifrost-http/lib/ctx.go b/transports/bifrost-http/lib/ctx.go
+index 6226c4af4..000d40542 100644
+--- a/transports/bifrost-http/lib/ctx.go
++++ b/transports/bifrost-http/lib/ctx.go
+@@ -16,6 +16,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/google/uuid"
++	bifrost "github.com/maximhq/bifrost/core"
+ 	"github.com/maximhq/bifrost/core/schemas"
+ 	"github.com/maximhq/bifrost/plugins/governance"
+ 	"github.com/maximhq/bifrost/plugins/maxim"
+@@ -23,6 +24,26 @@ import (
+ 	"github.com/valyala/fasthttp"
+ )
+ 
++// BifrostClientFromCtx returns the per-request *bifrost.Bifrost stashed
++// by TenantDispatcherMiddleware (Stage 2 runtime isolation). Returns
++// nil when no middleware ran or in single-tenant deployments — callers
++// MUST fall back to their constructor-time client in that case. Idiom:
++//
++//	bf := lib.BifrostClientFromCtx(ctx)
++//	if bf == nil { bf = h.client }
++//	resp, err := bf.ChatCompletionRequest(bifrostCtx, req)
++//
++// or use the (h *X) bf(ctx) helper many handlers define for brevity.
++func BifrostClientFromCtx(ctx *fasthttp.RequestCtx) *bifrost.Bifrost {
++	if ctx == nil {
++		return nil
++	}
++	if v, ok := ctx.UserValue(FastHTTPUserValueBifrostClient).(*bifrost.Bifrost); ok {
++		return v
++	}
++	return nil
++}
++
+ const (
+ 	// FastHTTPUserValueBifrostContext stores the active *schemas.BifrostContext on fasthttp.RequestCtx.
+ 	// This allows transport middleware and request handlers to share the same context instance.
+@@ -36,6 +57,13 @@ const (
+ 	// set by prepare*Request functions when a provider was auto-resolved. Picked up
+ 	// centrally in ConvertToBifrostContext to add the routing engine log.
+ 	FastHTTPUserValueModelCatalogResolution = "__bifrost_model_catalog_resolution"
++	// FastHTTPUserValueBifrostClient stores the per-request *bifrost.Bifrost
++	// the inference dispatch should use. The TenantDispatcherMiddleware
++	// stashes this so handlers don't have to know about the per-tenant
++	// runtime Manager — they just call BifrostClientFromCtx(ctx) and get
++	// the right runtime (per-tenant for header-bound requests, root
++	// Client for single-tenant fallback).
++	FastHTTPUserValueBifrostClient = "__bifrost_client"
+ )
+ 
+ // ModelCatalogResolution carries the result of an automatic provider lookup so
+diff --git a/transports/bifrost-http/server/multitenant.go b/transports/bifrost-http/server/multitenant.go
+new file mode 100644
+index 000000000..637e00c8e
+--- /dev/null
++++ b/transports/bifrost-http/server/multitenant.go
+@@ -0,0 +1,223 @@
++// Package server — multitenant.go.
++//
++// Stage 2 runtime-isolation glue. Stage 1 (patches 1-6) added data-
++// scope isolation via the GORM tenant-scope callback: every SELECT/
++// UPDATE/DELETE/INSERT on a tenant-scoped table is implicitly bound
++// to the request's `x-f5xc-tenant` header. But the inference path
++// still dispatched through a single shared `s.Client *bifrost.Bifrost`,
++// whose Account read the global `lib.Config.Providers` in-memory map
++// — last-write-wins across tenants. Two tenants with a provider named
++// "openai" stomped on each other at request time.
++//
++// Stage 2 wires the multitenant.Manager (added in patch1) into the
++// server bootstrap. On the first inference request for a given
++// tenant, Manager.Acquire calls the TenantLoader built here, which:
++//
++//   1. Reads that tenant's providers + keys from the configstore via
++//      a tenant-scoped context (the GORM callback adds
++//      `WHERE tenant_id = '<tid>'` automatically).
++//   2. Snapshots them into a multitenant.StaticAccount — a per-
++//      tenant Account that the per-tenant *bifrost.Bifrost can read
++//      without ever touching the shared in-memory map.
++//   3. Shares the global plugin chain (logging / governance /
++//      telemetry / etc.) via multitenant.ShareLLMPlugins so a per-
++//      tenant Bifrost.Shutdown can't tear down plugin state the
++//      root runtime still depends on (the share-shim noop's
++//      Cleanup, the root runtime owns the real Cleanup).
++//   4. Returns a BifrostConfig that the Manager passes into a fresh
++//      bifrost.Init — one engine per tenant, own worker pool, own
++//      provider queues, own request-side concurrency budget.
++//
++// Eviction is admin-driven: when /api/providers, /api/providers/*/
++// keys, /api/mcp/clients, or /api/governance/virtual-keys mutate a
++// tenant's config, the handler calls s.Manager.Evict(tid) so the
++// next inference for that tenant Acquires a freshly loaded runtime.
++// Inference paths NEVER trigger eviction — Acquire/Release are
++// O(1) once the runtime is loaded, and refcounted so eviction blocks
++// on in-flight requests draining.
++package server
++
++import (
++	"context"
++	"fmt"
++
++	bifrost "github.com/maximhq/bifrost/core"
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/maximhq/bifrost/transports/bifrost-http/handlers"
++)
++
++// initializeManager constructs the per-tenant runtime manager and
++// attaches it to s.Manager. Safe to call multiple times — subsequent
++// calls are a no-op once s.Manager is non-nil. Must run AFTER s.Client
++// (the root runtime) is up, because the TenantLoader reuses the root
++// runtime's plugin chain + MCP config via the share-shim.
++func (s *BifrostHTTPServer) initializeManager(ctx context.Context) error {
++	if s.Manager != nil {
++		return nil
++	}
++	if s.Client == nil {
++		return fmt.Errorf("multitenant: initializeManager called before root Client is up")
++	}
++	if s.Config == nil || s.Config.ConfigStore == nil {
++		return fmt.Errorf("multitenant: initializeManager requires Config.ConfigStore")
++	}
++	mgr, err := multitenant.NewManager(ctx, multitenant.ManagerConfig{
++		Loader: s.newTenantLoader(),
++		// MaxActiveRuntimes left at the default (unbounded). Each
++		// tenant runtime is cheap until it sees traffic; the LRU cap
++		// is a productization knob (Stage 2 follow-up).
++		Logger: logger,
++	})
++	if err != nil {
++		return fmt.Errorf("multitenant: NewManager: %w", err)
++	}
++	s.Manager = mgr
++	// Wire the package-level eviction hook so admin write handlers
++	// (providers / keys / VK / MCP) can call handlers.EvictTenant(ctx)
++	// without taking a direct dependency on this server struct.
++	handlers.TenantEvict = s.EvictTenantRuntime
++	logger.Info("multitenant: per-tenant runtime manager initialized")
++	return nil
++}
++
++// newTenantLoader returns the TenantLoader the Manager invokes on the
++// first Acquire for each tenant (and on every Acquire after an
++// Evict). The loader is a closure over s.Config (configstore +
++// plugins + MCP) and s.Client (for the shared plugin instances).
++//
++// Behaviour:
++//   - Reads providers + keys for the tenant via tenant-scoped ctx (the
++//     GORM callback in framework/configstore appends `WHERE tenant_id
++//     = '<tid>'`). Skips tenants with no providers — returns a
++//     BifrostConfig with an empty StaticAccount, so the engine starts
++//     cleanly and serves "provider not configured" errors at request
++//     time rather than crashing at boot.
++//   - Builds a multitenant.StaticAccount snapshot. The snapshot is
++//     captured at Acquire time and re-captured on every Evict, so
++//     admin writes hit the wire via Manager.Evict(tid) (see
++//     evictTenantOnAdminWrite hooks in the provider/key handlers).
++//   - Wraps the root runtime's plugin chains via ShareLLMPlugins /
++//     ShareMCPPlugins so the per-tenant engine's Shutdown() can't
++//     Cleanup plugin state the root still depends on.
++func (s *BifrostHTTPServer) newTenantLoader() multitenant.TenantLoader {
++	return func(ctx context.Context, tid multitenant.TenantID) (schemas.BifrostConfig, error) {
++		// Push the tenant onto ctx so every configstore read filters
++		// to this tenant via the GORM scope callback. The Manager
++		// passed its rootCtx in; we layer the tenant on top.
++		scopedCtx := context.WithValue(ctx, multitenant.BifrostContextKeyTenantID, string(tid))
++
++		providers, err := s.Config.ConfigStore.GetProvidersConfig(scopedCtx)
++		if err != nil {
++			return schemas.BifrostConfig{}, fmt.Errorf("multitenant: load providers for tenant %q: %w", tid, err)
++		}
++
++		acct := multitenant.NewStaticAccount(tid)
++		for name, cfg := range providers {
++			keys, err := s.Config.ConfigStore.GetProviderKeys(scopedCtx, name)
++			if err != nil {
++				return schemas.BifrostConfig{}, fmt.Errorf("multitenant: load keys for tenant %q provider %q: %w", tid, name, err)
++			}
++			acct.AddProvider(name, keys, providerConfigForBifrost(cfg))
++		}
++
++		return schemas.BifrostConfig{
++			Account:            acct,
++			InitialPoolSize:    s.Config.ClientConfig.InitialPoolSize,
++			DropExcessRequests: s.Config.ClientConfig.DropExcessRequests,
++			// Plugins shared via share-shim so per-tenant Shutdown
++			// can't Cleanup state the root depends on.
++			LLMPlugins: multitenant.ShareLLMPlugins(s.Config.GetLoadedLLMPlugins()),
++			MCPPlugins: multitenant.ShareMCPPlugins(s.Config.GetLoadedMCPPlugins()),
++			// MCP / OAuth / KVStore: per-process globals reused across
++			// tenants. Per-tenant MCP isolation is a productization
++			// follow-up — the schema already carries tenant_id on
++			// TableMCPClient, so the same loader pattern can layer it
++			// when needed.
++			OAuth2Provider: s.Config.OAuthProvider,
++			Logger:         logger,
++			KVStore:        s.Config.KVStore,
++		}, nil
++	}
++}
++
++// providerConfigForBifrost lifts the configstore representation of a
++// provider config into the schemas.ProviderConfig that
++// bifrost.Init / Account.GetConfigForProvider expects. Mirrors the
++// mapping in lib/account.go's BaseAccount.GetConfigForProvider so the
++// per-tenant runtime sees identical shape — modulo source (snapshot
++// at TenantLoader time vs. live in-memory read).
++func providerConfigForBifrost(cfg configstore.ProviderConfig) *schemas.ProviderConfig {
++	pc := &schemas.ProviderConfig{
++		SendBackRawRequest:      cfg.SendBackRawRequest,
++		SendBackRawResponse:     cfg.SendBackRawResponse,
++		StoreRawRequestResponse: cfg.StoreRawRequestResponse,
++		ProxyConfig:             cfg.ProxyConfig,
++		CustomProviderConfig:    cfg.CustomProviderConfig,
++		OpenAIConfig:            cfg.OpenAIConfig,
++	}
++	if cfg.NetworkConfig != nil {
++		pc.NetworkConfig = *cfg.NetworkConfig
++	} else {
++		pc.NetworkConfig = schemas.DefaultNetworkConfig
++	}
++	if cfg.ConcurrencyAndBufferSize != nil {
++		pc.ConcurrencyAndBufferSize = *cfg.ConcurrencyAndBufferSize
++	} else {
++		pc.ConcurrencyAndBufferSize = schemas.DefaultConcurrencyAndBufferSize
++	}
++	return pc
++}
++
++// BifrostFor returns the *bifrost.Bifrost that should serve this
++// request, plus a release function the caller MUST defer to allow
++// eventual eviction of the underlying runtime.
++//
++// Single-tenant fallback: when the request carries no
++// `x-f5xc-tenant` header (or the header is "default", or the Manager
++// isn't initialized) the root s.Client is returned with a no-op
++// release. Single-tenant deployments thus pay zero overhead and
++// behave exactly as upstream OSS.
++//
++// Multi-tenant path: Manager.Acquire returns a Handle whose
++// .Bifrost() is the per-tenant runtime. The release function decrements
++// the runtime's refcount; the runtime is eligible for eviction once
++// refcount reaches zero (LRU policy + explicit Evict on admin writes).
++//
++// On Acquire failure (loader error, manager closed, etc.) we fall
++// back to the root s.Client and log — better to serve the request
++// from the shared runtime than to 5xx the user; the data-scope
++// callback still keeps row visibility correct, only the runtime is
++// shared. The log lets operators spot loader regressions.
++func (s *BifrostHTTPServer) BifrostFor(ctx context.Context, tid string) (*bifrost.Bifrost, func()) {
++	noopRelease := func() {}
++	if tid == "" || tid == "default" || s.Manager == nil {
++		return s.Client, noopRelease
++	}
++	handle, err := s.Manager.Acquire(ctx, multitenant.TenantID(tid))
++	if err != nil {
++		logger.Warn("multitenant: Acquire failed for tenant %q (%v); falling back to root runtime — data scope still applies but inference workers are shared", tid, err)
++		return s.Client, noopRelease
++	}
++	return handle.Bifrost(), handle.Release
++}
++
++// EvictTenantRuntime is the public hook admin handlers call after a
++// successful write that changes a tenant's runtime config (provider
++// add/update/delete, key add/update/delete, MCP client mutation,
++// etc.). The next inference for that tenant will re-Acquire and the
++// loader will re-snapshot fresh config from the DB.
++//
++// Safe to call when Manager is nil (single-tenant deployments) — just
++// a no-op. Safe to call with an empty tid (no header present on the
++// admin request — defensive only; the admin path SHOULD always carry
++// one in production).
++func (s *BifrostHTTPServer) EvictTenantRuntime(tid string) {
++	if s.Manager == nil || tid == "" {
++		return
++	}
++	if evicted := s.Manager.Evict(multitenant.TenantID(tid)); evicted {
++		logger.Info("multitenant: evicted runtime for tenant %q on admin write", tid)
++	}
++}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 7dd89e85d..0e23f1c93 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -25,6 +25,7 @@ import (
+ 	dynamicPlugins "github.com/maximhq/bifrost/framework/plugins"
+ 	"github.com/maximhq/bifrost/framework/temptoken"
+ 	"github.com/maximhq/bifrost/framework/tracing"
++	"github.com/maximhq/bifrost/multitenant"
+ 	"github.com/maximhq/bifrost/plugins/governance"
+ 	"github.com/maximhq/bifrost/plugins/logging"
+ 	"github.com/maximhq/bifrost/plugins/prompts"
+@@ -125,7 +126,14 @@ type BifrostHTTPServer struct {
+ 	AsyncJobCleaner *logstore.AsyncJobCleaner
+ 
+ 	Client *bifrost.Bifrost
+-	Config *lib.Config
++	// Manager owns the per-tenant *bifrost.Bifrost runtimes when the
++	// header model is active. Lazy-loaded via Acquire on the first
++	// inference request from a given tenant, evicted when an admin
++	// write to that tenant's providers/keys lands. nil before
++	// initialization; once set, BifrostFor handles the dispatch with
++	// a fallback to the root Client on no-tenant requests.
++	Manager *multitenant.Manager
++	Config  *lib.Config
+ 
+ 	Server *fasthttp.Server
+ 	Router *router.Router
+@@ -1107,14 +1115,27 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
+ 	}
+ 	s.MCPServerHandler = mcpServerHandler
+ 	asyncHandler := handlers.NewAsyncHandler(s.Client, s.Config)
++	// Wire the per-tenant dispatcher into async so its background closure
++	// can Acquire a fresh refcount that survives past request return —
++	// the sync inference path relies on the middleware's defer release,
++	// but async submit-and-forget jobs outlive the request handler.
++	asyncHandler.SetDispatcher(s)
+ 	// Header-model multi-tenancy: prepend the tenant-resolver middleware
+ 	// so every inference request that carries `x-f5xc-tenant` stamps the
+ 	// value on the request context BEFORE auth / governance / logging
+ 	// plugins see it. Header absent → no stamp → configstore tenant-scope
+ 	// callback skips the implicit WHERE (single-tenant N=1 fallback).
++	//
++	// Stage 2 follow-up: prepend ALSO TenantDispatcherMiddleware so each
++	// inference request gets the per-tenant *bifrost.Bifrost stashed on
++	// ctx. Handlers fetch it via lib.BifrostClientFromCtx and fall back
++	// to their constructor-time client when nil. Middleware order is
++	// resolver-then-dispatcher: dispatcher reads the tid the resolver
++	// just stamped.
+ 	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
+ 	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
+-	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW}, middlewares...)
++	dispatchMW := handlers.TenantDispatcherMiddleware(s)
++	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW, dispatchMW}, middlewares...)
+ 	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
+ 	inferenceHandler.RegisterRoutes(s.Router, chained...)
+ 	asyncHandler.RegisterRoutes(s.Router, chained...)
+@@ -1437,6 +1458,15 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
+ 	// Sync plugin execution order from config to core (defensive — Init receives sorted list,
+ 	// but this ensures order consistency if the loading path changes in the future)
+ 	s.Client.ReorderPlugins(s.Config.GetPluginOrder())
++	// Stage 2 runtime isolation: stand up the per-tenant runtime
++	// Manager that BifrostFor / EvictTenantRuntime dispatch through.
++	// Single-tenant deployments still reach inference via the root
++	// s.Client (BifrostFor returns it when the request has no tenant
++	// header). See multitenant.go for the loader + share-shim
++	// rationale.
++	if err := s.initializeManager(ctx); err != nil {
++		return fmt.Errorf("failed to initialize multitenant manager: %v", err)
++	}
+ 	// List all models and add to model catalog with per-provider status tracking
+ 	logger.Info("listing all models and adding to model catalog")
+ 	if s.Config.ModelCatalog != nil {
+-- 
+2.51.0
+

@@ -20,6 +20,10 @@ type TableBudget struct {
 	VirtualKeyID     *string `gorm:"type:varchar(255);index" json:"virtual_key_id,omitempty"`
 	ProviderConfigID *uint   `gorm:"index" json:"provider_config_id,omitempty"`
 
+	// TenantID scopes this budget to a tenant for multi-tenant deployments.
+	// See TableCustomer.TenantID. Backfilled to DefaultTenantID on upgrade.
+	TenantID string `gorm:"type:varchar(255);not null;default:default;index" json:"tenant_id"`
+
 	// Deprecated: set calendar_aligned on the parent access profile / VK / team
 	// instead. Kept for backward compatibility with older config.json files;
 	// the OSS applyV1Compat path and the enterprise access-profile reconciler
@@ -72,4 +76,14 @@ func (b *TableBudget) BeforeSave(tx *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
+// TenantID is the zero string at the moment of write — even if the GORM
+// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
+// to propagate. Stamp TenantID at construction (from request ctx, from
+// the parent entity, or to DefaultTenantID for boot-time syncs) to
+// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
+func (t *TableBudget) BeforeCreate(tx *gorm.DB) error {
+	return EnsureTenantIDOnCreate(&t.TenantID, "governance_budgets")
 }

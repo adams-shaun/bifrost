@@ -164,3 +164,7 @@ require (
 	gorm.io/driver/sqlite v1.6.0 // indirect
 	gorm.io/gorm v1.31.1 // indirect
 )
+
+require github.com/maximhq/bifrost/multitenant v0.0.0
+
+replace github.com/maximhq/bifrost/multitenant => ../../multitenant

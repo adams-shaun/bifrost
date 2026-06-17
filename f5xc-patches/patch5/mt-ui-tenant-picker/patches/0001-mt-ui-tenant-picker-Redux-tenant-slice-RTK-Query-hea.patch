@@ -1,8 +1,8 @@
-From 4271315dd6308a947c0c2044c0cc67e4f5b6d2d0 Mon Sep 17 00:00:00 2001
+From bc2eab1437066bc3cf19849b067c0c5dfa594d46 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 14:09:38 -0600
-Subject: [PATCH] mt-ui-tenant-picker: Redux tenant slice + RTK Query header
- injection + sidebar picker
+Subject: [PATCH 5/6] mt-ui-tenant-picker: Redux tenant slice + RTK Query
+ header injection + sidebar picker
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -360,7 +360,7 @@ index 675331b38..68457a5cf 100644
 \ No newline at end of file
 diff --git a/ui/lib/store/apis/tenantsApi.ts b/ui/lib/store/apis/tenantsApi.ts
 new file mode 100644
-index 000000000..1058ec32f
+index 000000000..9ebc02ab3
 --- /dev/null
 +++ b/ui/lib/store/apis/tenantsApi.ts
 @@ -0,0 +1,65 @@
@@ -405,21 +405,21 @@ index 000000000..1058ec32f
 +export const tenantsApi = baseApi.injectEndpoints({
 +	endpoints: (builder) => ({
 +		getTenants: builder.query<Tenant[], void>({
-+			query: () => "/platform/tenants",
++			query: () => "/tenants",
 +			transformResponse: (response: ListTenantsResponse): Tenant[] =>
 +				(response.tenants ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
 +			providesTags: ["Tenants"],
 +		}),
 +
 +		getTenant: builder.query<Tenant, string>({
-+			query: (id) => `/platform/tenants/${encodeURIComponent(id)}`,
++			query: (id) => `/tenants/${encodeURIComponent(id)}`,
 +			transformResponse: (response: { tenant: Tenant }) => response.tenant,
 +			providesTags: (_result, _err, id) => [{ type: "Tenants", id }],
 +		}),
 +
 +		createTenant: builder.mutation<CreateTenantResponse, CreateTenantRequest>({
 +			query: (body) => ({
-+				url: "/platform/tenants",
++				url: "/tenants",
 +				method: "POST",
 +				body,
 +			}),

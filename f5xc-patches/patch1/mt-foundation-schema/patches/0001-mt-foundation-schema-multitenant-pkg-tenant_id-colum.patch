@@ -1,8 +1,8 @@
-From 453d0f128fe1006221fea907b183e5e05b025d0c Mon Sep 17 00:00:00 2001
+From 0c4045849a5212279a094ad943c5f38919267f61 Mon Sep 17 00:00:00 2001
 From: Shaun Adams <s.adams@f5.com>
 Date: Tue, 16 Jun 2026 13:39:18 -0600
-Subject: [PATCH] mt-foundation-schema: multitenant pkg + tenant_id columns +
- consolidated migration
+Subject: [PATCH 1/6] mt-foundation-schema: multitenant pkg + tenant_id columns
+ + consolidated migration
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -48,15 +48,15 @@ Ref: https://jira.f5net.com/browse/XC-25496
  .gitignore                                 |   2 +
  framework/configstore/migrations.go        | 135 +++++++
  framework/configstore/rdb.go               |  26 +-
- framework/configstore/tables/budget.go     |   4 +
- framework/configstore/tables/customer.go   |   5 +
- framework/configstore/tables/key.go        |   8 +-
- framework/configstore/tables/mcp.go        |   9 +-
- framework/configstore/tables/provider.go   |   6 +-
- framework/configstore/tables/ratelimit.go  |   4 +
- framework/configstore/tables/team.go       |   4 +
- framework/configstore/tables/tenant.go     |  46 +++
- framework/configstore/tables/virtualkey.go |  10 +-
+ framework/configstore/tables/budget.go     |  14 +
+ framework/configstore/tables/customer.go   |  16 +-
+ framework/configstore/tables/key.go        |  18 +-
+ framework/configstore/tables/mcp.go        |  19 +-
+ framework/configstore/tables/provider.go   |  16 +-
+ framework/configstore/tables/ratelimit.go  |  14 +
+ framework/configstore/tables/team.go       |  14 +
+ framework/configstore/tables/tenant.go     |  86 +++++
+ framework/configstore/tables/virtualkey.go |  20 +-
  framework/go.mod                           |   4 +
  multitenant/account.go                     |  77 ++++
  multitenant/go.mod                         | 163 +++++++++
@@ -67,7 +67,7 @@ Ref: https://jira.f5net.com/browse/XC-25496
  multitenant/tenant.go                      |  73 ++++
  transports/Dockerfile.local                |   2 +
  transports/go.mod                          |   4 +
- 22 files changed, 1411 insertions(+), 12 deletions(-)
+ 22 files changed, 1531 insertions(+), 13 deletions(-)
  create mode 100644 framework/configstore/tables/tenant.go
  create mode 100644 multitenant/account.go
  create mode 100644 multitenant/go.mod
@@ -294,7 +294,7 @@ index dc95f5f39..de67cd722 100644
  				Name:               key.Name,
  				Value:              key.Value,
 diff --git a/framework/configstore/tables/budget.go b/framework/configstore/tables/budget.go
-index 015ec6e69..79119aef7 100644
+index 015ec6e69..a185c1a9b 100644
 --- a/framework/configstore/tables/budget.go
 +++ b/framework/configstore/tables/budget.go
 @@ -20,6 +20,10 @@ type TableBudget struct {
@@ -308,11 +308,37 @@ index 015ec6e69..79119aef7 100644
  	// Deprecated: set calendar_aligned on the parent access profile / VK / team
  	// instead. Kept for backward compatibility with older config.json files;
  	// the OSS applyV1Compat path and the enterprise access-profile reconciler
+@@ -73,3 +77,13 @@ func (b *TableBudget) BeforeSave(tx *gorm.DB) error {
+ 
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableBudget) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "governance_budgets")
++}
 diff --git a/framework/configstore/tables/customer.go b/framework/configstore/tables/customer.go
-index c3b9a6f08..d8f6b4d66 100644
+index c3b9a6f08..7fd3ae10e 100644
 --- a/framework/configstore/tables/customer.go
 +++ b/framework/configstore/tables/customer.go
-@@ -9,6 +9,11 @@ type TableCustomer struct {
+@@ -1,6 +1,10 @@
+ package tables
+ 
+-import "time"
++import (
++	"time"
++
++	"gorm.io/gorm"
++)
+ 
+ // TableCustomer represents a customer entity with budget and rate limit
+ type TableCustomer struct {
+@@ -9,6 +13,11 @@ type TableCustomer struct {
  	BudgetID    *string `gorm:"type:varchar(255);index" json:"budget_id,omitempty"`
  	RateLimitID *string `gorm:"type:varchar(255);index" json:"rate_limit_id,omitempty"`
  
@@ -324,8 +350,17 @@ index c3b9a6f08..d8f6b4d66 100644
  	// Relationships
  	Budget      *TableBudget      `gorm:"foreignKey:BudgetID" json:"budget,omitempty"`
  	RateLimit   *TableRateLimit   `gorm:"foreignKey:RateLimitID" json:"rate_limit,omitempty"`
+@@ -25,3 +34,8 @@ type TableCustomer struct {
+ 
+ // TableName sets the table name for each model
+ func (TableCustomer) TableName() string { return "governance_customers" }
++
++// BeforeCreate is the per-model multitenant guard. See provider.go's mirror.
++func (c *TableCustomer) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&c.TenantID, "governance_customers")
++}
 diff --git a/framework/configstore/tables/key.go b/framework/configstore/tables/key.go
-index e790f73a0..bf1171b7e 100644
+index e790f73a0..b9023e645 100644
 --- a/framework/configstore/tables/key.go
 +++ b/framework/configstore/tables/key.go
 @@ -14,10 +14,14 @@ import (
@@ -345,8 +380,22 @@ index e790f73a0..bf1171b7e 100644
  	Value                 schemas.EnvVar `gorm:"type:text;not null" json:"value"`
  	ModelsJSON            string         `gorm:"type:text" json:"-"` // JSON serialized []string
  	BlacklistedModelsJSON string         `gorm:"type:text" json:"-"` // JSON serialized []string
+@@ -642,3 +646,13 @@ func (k *TableKey) AfterFind(tx *gorm.DB) error {
+ 	}
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableKey) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "config_keys")
++}
 diff --git a/framework/configstore/tables/mcp.go b/framework/configstore/tables/mcp.go
-index 87cf7e586..76ff0ff68 100644
+index 87cf7e586..5a3c835c3 100644
 --- a/framework/configstore/tables/mcp.go
 +++ b/framework/configstore/tables/mcp.go
 @@ -14,8 +14,13 @@ import (
@@ -365,8 +414,22 @@ index 87cf7e586..76ff0ff68 100644
  	IsCodeModeClient        bool            `gorm:"default:false" json:"is_code_mode_client"`         // Whether the client is a code mode client
  	ConnectionType          string          `gorm:"type:varchar(20);not null" json:"connection_type"` // schemas.MCPConnectionType
  	ConnectionString        *schemas.EnvVar `gorm:"type:text" json:"connection_string,omitempty"`
+@@ -251,3 +256,13 @@ func (c *TableMCPClient) AfterFind(tx *gorm.DB) error {
+ 	}
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableMCPClient) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "config_mcp_clients")
++}
 diff --git a/framework/configstore/tables/provider.go b/framework/configstore/tables/provider.go
-index dcc253cec..771151f3d 100644
+index dcc253cec..929400689 100644
 --- a/framework/configstore/tables/provider.go
 +++ b/framework/configstore/tables/provider.go
 @@ -16,7 +16,11 @@ import (
@@ -382,8 +445,22 @@ index dcc253cec..771151f3d 100644
  	NetworkConfigJSON        string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.NetworkConfig
  	ConcurrencyBufferJSON    string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ConcurrencyAndBufferSize
  	ProxyConfigJSON          string    `gorm:"type:text" json:"-"`                                // JSON serialized schemas.ProxyConfig
+@@ -182,3 +186,13 @@ func (p *TableProvider) AfterFind(tx *gorm.DB) error {
+ 
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableProvider) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "config_providers")
++}
 diff --git a/framework/configstore/tables/ratelimit.go b/framework/configstore/tables/ratelimit.go
-index 086a9449a..773bf1c90 100644
+index 086a9449a..b6b2328b8 100644
 --- a/framework/configstore/tables/ratelimit.go
 +++ b/framework/configstore/tables/ratelimit.go
 @@ -23,6 +23,10 @@ type TableRateLimit struct {
@@ -397,8 +474,22 @@ index 086a9449a..773bf1c90 100644
  	// Deprecated: set calendar_aligned on the parent access profile / VK / team
  	// instead. Kept for backward compatibility with older config.json files;
  	// the OSS applyV1Compat path and the enterprise access-profile reconciler
+@@ -85,3 +89,13 @@ func (rl *TableRateLimit) BeforeSave(tx *gorm.DB) error {
+ 
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableRateLimit) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "governance_rate_limits")
++}
 diff --git a/framework/configstore/tables/team.go b/framework/configstore/tables/team.go
-index 616471934..7dc8c037b 100644
+index 616471934..0c37a3db0 100644
 --- a/framework/configstore/tables/team.go
 +++ b/framework/configstore/tables/team.go
 @@ -16,6 +16,10 @@ type TableTeam struct {
@@ -412,15 +503,69 @@ index 616471934..7dc8c037b 100644
  	// Relationships
  	Customer    *TableCustomer    `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`
  	Budgets     []TableBudget     `gorm:"foreignKey:TeamID;constraint:OnDelete:CASCADE" json:"budgets,omitempty"` // Multiple budgets with different reset intervals
+@@ -115,3 +119,13 @@ func (t *TableTeam) AfterFind(tx *gorm.DB) error {
+ 	}
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableTeam) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "governance_teams")
++}
 diff --git a/framework/configstore/tables/tenant.go b/framework/configstore/tables/tenant.go
 new file mode 100644
-index 000000000..49253ab47
+index 000000000..96f19f7cb
 --- /dev/null
 +++ b/framework/configstore/tables/tenant.go
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,86 @@
 +package tables
 +
-+import "time"
++import (
++	"fmt"
++	"os"
++	"strings"
++	"time"
++)
++
++// strictAssertTenantEnv mirrors the env var the GORM tenant-scope
++// callback in framework/configstore/tenant_scope.go uses. The two
++// guards opt into strict mode together via the same flag — set to
++// true in production multi-tenant deployments, leave unset in OSS
++// tests + single-tenant deployments.
++const strictAssertTenantEnv = "BIFROST_ASSERT_TENANT_ON_INSERT"
++
++// EnsureTenantIDOnCreate is the per-model BeforeCreate guard for every
++// tenant-scoped table. Behaviour depends on BIFROST_ASSERT_TENANT_ON_INSERT:
++//
++//   - strict mode (env=true/1/yes/on): errors when *field is empty,
++//     stopping the INSERT with a stack-trace-worthy message.
++//   - default (env unset or anything else): auto-fills *field with
++//     DefaultTenantID and returns nil. Preserves OSS / single-tenant
++//     behaviour where rows naturally land in the default tenant.
++//
++// Either way, no row ever ends up with tenant_id='' on disk — that
++// was the silent corruption mode we keep hitting. The mutate-receiver
++// shape (*string instead of string) is so the hook can repair the
++// field without needing a separate setter.
++func EnsureTenantIDOnCreate(field *string, tableName string) error {
++	if *field != "" {
++		return nil
++	}
++	envVal := strings.ToLower(strings.TrimSpace(os.Getenv(strictAssertTenantEnv)))
++	strict := envVal == "true" || envVal == "1" || envVal == "yes" || envVal == "on"
++	if strict {
++		return fmt.Errorf("multitenant: %s.tenant_id is required at INSERT but was empty — stamp it at construction (from request ctx, parent entity, or DefaultTenantID for boot-time syncs); BIFROST_ASSERT_TENANT_ON_INSERT=true so this INSERT is blocked", tableName)
++	}
++	// Non-strict (OSS default) — auto-fill rather than error so existing
++	// fixtures and single-tenant deployments keep working untouched.
++	*field = DefaultTenantID
++	return nil
++}
 +
 +// TableTenant is the top-level isolation boundary for multi-tenant Bifrost
 +// deployments. Every governance entity (customers, teams, virtual keys,
@@ -465,7 +610,7 @@ index 000000000..49253ab47
 +	TenantStatusSuspended = "suspended"
 +)
 diff --git a/framework/configstore/tables/virtualkey.go b/framework/configstore/tables/virtualkey.go
-index d018dd99c..0c5a4a737 100644
+index d018dd99c..15c9cbce4 100644
 --- a/framework/configstore/tables/virtualkey.go
 +++ b/framework/configstore/tables/virtualkey.go
 @@ -198,13 +198,19 @@ func (mc *TableVirtualKeyMCPConfig) UnmarshalJSON(data []byte) error {
@@ -490,6 +635,20 @@ index d018dd99c..0c5a4a737 100644
  	// Foreign key relationships (mutually exclusive: TeamID, CustomerID, or AccessProfileID)
  	TeamID          *string `gorm:"type:varchar(255);index" json:"team_id,omitempty"`
  	CustomerID      *string `gorm:"type:varchar(255);index" json:"customer_id,omitempty"`
+@@ -303,3 +309,13 @@ func (vk *TableVirtualKey) AfterFind(tx *gorm.DB) error {
+ 	}
+ 	return nil
+ }
++
++// BeforeCreate is the per-model multitenant guard. Fails the INSERT when
++// TenantID is the zero string at the moment of write — even if the GORM
++// tenant-scope callback (populateTenantIDOnCreate) didn't fire or failed
++// to propagate. Stamp TenantID at construction (from request ctx, from
++// the parent entity, or to DefaultTenantID for boot-time syncs) to
++// satisfy this guard. See ValidateTenantIDOnCreate doc for rationale.
++func (t *TableVirtualKey) BeforeCreate(tx *gorm.DB) error {
++	return EnsureTenantIDOnCreate(&t.TenantID, "governance_virtual_keys")
++}
 diff --git a/framework/go.mod b/framework/go.mod
 index 8f4ea3040..6a103dd48 100644
 --- a/framework/go.mod
