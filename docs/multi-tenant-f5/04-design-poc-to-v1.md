@@ -558,8 +558,9 @@ EA customers don't enable it).
 | 11 | `mt-getproviderkeybyname-scope` | Sibling fix for `getProviderKeyByName` JOIN: explicit `config_keys.tenant_id` predicate so the scope is independent of which side GORM treats as primary. Closes T1. | ~20 |
 | 12 | `mt-vkmcp-and-vk-budget-scope` | Pins `.Model()` on `GetVirtualKeyMCPConfigsByMCPClientStringIDs` + adds `config_mcp_clients.tenant_id` predicate (T2); belt-and-suspenders predicate inside `GetVirtualKeysPaginated` budget subquery (T7). | ~45 |
 | 13 | `mt-schemasync-exclusions` | Adds `tenant_id` / `source_id` to per-table `excludedGoFields` so `TestConfigSchemaSync` recognizes them as runtime-only. Closes T6. | ~12 |
+| 14 | `mt-updateprovider-tenant-safe` | Routes `updateProvider` / `addProvider` / `deleteProvider` reads + writes through `h.dbStore` direct in MT mode via 4 new helpers in `providers_tenant_safe.go`. Closes T3. | ~170 |
 
-Total: ~5,400 LOC of code; ~1,400 LOC of doc & migration commentary.
+Total: ~5,570 LOC of code; ~1,400 LOC of doc & migration commentary.
 
 Companion artifact (separate repo): `go-bifrost-ai/examples/seed` —
 end-to-end lifecycle tester. Creates 5 tenants, full-seeds 3 of them
@@ -573,7 +574,7 @@ This driver is what caught patches 8, 9, 10 and the open items below.
 |---|---|---|---|---|
 | ~~T1~~ | ~~`getProviderKeyByName` JOIN: add explicit `config_keys.tenant_id = ?` predicate~~ | ~~HIGH~~ | [rdb.go:1307](../../framework/configstore/rdb.go#L1307) | ✅ **Closed by patch11** |
 | ~~T2~~ | ~~`GetVirtualKeyMCPConfigsByMCPClientStringIDs` JOIN: pin `.Model()` + add `config_mcp_clients.tenant_id = ?`~~ | ~~HIGH~~ | [rdb.go:3090](../../framework/configstore/rdb.go#L3090) | ✅ **Closed by patch12** |
-| T3 | `UpdateProvider` writes via `h.inMemoryStore` (not tenant-safe) → trips `idx_key_id` global unique on second tenant updating "openai" | HIGH | [providers.go:563](../../transports/bifrost-http/handlers/providers.go#L563) | OPEN — 1-2d, needs careful refactor; in-memory store still serves single-tenant inference dispatch, so the swap is conditional on multi-tenant mode |
+| ~~T3~~ | ~~`UpdateProvider` writes via `h.inMemoryStore` (not tenant-safe) → trips `idx_key_id` global unique on second tenant updating "openai"~~ | ~~HIGH~~ | [providers.go:563](../../transports/bifrost-http/handlers/providers.go#L563) | ✅ **Closed by patch14** — 8 sites in `updateProvider`/`addProvider`/`deleteProvider` swapped through tenant-aware helpers in [providers_tenant_safe.go](../../transports/bifrost-http/handlers/providers_tenant_safe.go). Read + write paths route through `h.dbStore` directly in MT mode. |
 | T4 | Drop legacy `idx_key_name` global unique on `config_keys(name)` and patch OSS upsert sites to target `idx_key_tenant_name` composite | MEDIUM | [migrations.go:1529](../../framework/configstore/migrations.go#L1529) + upsert sites in rdb.go | OPEN — 1-2d, needs careful sweep of every UPSERT |
 | T5 | Tenant-scope the in-memory MCPManager registry: key by `(tenant_id, name)` OR per-tenant MCPManager via runtime config | MEDIUM | `core/mcp/...` (upstream) — easier fix may be per-tenant runtime MCPManager in `multitenant/loader.go` | OPEN — 2-3d depending on approach |
 | ~~T6~~ | ~~`TestConfigSchemaSync` fails: add `tenant_id`/`source_id` to `excludedGoFields` or to `config.schema.json`~~ | ~~LOW (test-only)~~ | `transports/bifrost-http/lib/config_test.go` | ✅ **Closed by patch13** |

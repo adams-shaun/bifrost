@@ -1,0 +1,315 @@
+From 44f1d32aa365509411959410e9a4f4291a6985cf Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 21:23:40 -0600
+Subject: [PATCH] mt-updateprovider-tenant-safe: route provider reads + writes
+ through dbStore in MT mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes T3 from docs/multi-tenant-f5/04-design-poc-to-v1.md §4.2 (the
+"a record with this key id already exists" 500 on second-tenant
+UPDATE).
+
+Root cause: updateProvider's read path
+(h.inMemoryStore.GetProviderConfigRaw / GetProviderConfigRedacted) and
+write path (h.inMemoryStore.UpdateProviderConfig +
+h.inMemoryStore.AddProvider) all hit the SHARED lib.Config.Providers
+map. That map is global, last-write-wins across tenants — so a
+second tenant updating "openai" reads tenant-1's NetworkConfig/keys
+as the merge base, then UpdateProviderConfig's downstream "sync keys
+to DB" path tries to INSERT key rows whose key_id already exists
+under tenant 1. Trips the legacy global idx_key_id unique.
+
+Fix: new helpers in providers_tenant_safe.go branch on
+TenantIDFromCtx(ctx). Multi-tenant mode reads + writes go direct
+through h.dbStore (which is tenant-scoped via the GORM scope
+callback, patch2); single-tenant OSS path is unchanged so the root
+*bifrost.Bifrost continues to serve inference against the in-memory
+map and lib.Config.UpdateProviderConfig's c.client.UpdateProvider
+keeps refreshing the account snapshot.
+
+8 sites swapped in updateProvider / addProvider / deleteProvider.
+2 sites intentionally left:
+  - line 203 (getProvider else branch — already prefers dbStore;
+    in-memory only reachable when dbStore is nil)
+  - line 927 (listManagementModelsForProvider — no ctx parameter,
+    needs a signature-change patch; TODO comment added)
+
+Per-tenant runtime invalidation is unchanged — patch7's
+defer EvictTenant(ctx) at the top of every mutation handler still
+fires, so the next inference for the updated tenant re-loads the
+freshly-written config via the Manager loader.
+
+Verified against the live cluster: seed driver's provider-update
+step (which previously had to be skipped per the workaround in
+docs/multi-tenant-f5/03-things-we-missed.md #7) now succeeds across
+all three seeded tenants (shaun / acme / globex) without tripping
+the global key-id unique.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ transports/bifrost-http/handlers/providers.go |  57 ++++++--
+ .../handlers/providers_tenant_safe.go         | 128 ++++++++++++++++++
+ 2 files changed, 170 insertions(+), 15 deletions(-)
+ create mode 100644 transports/bifrost-http/handlers/providers_tenant_safe.go
+
+diff --git a/transports/bifrost-http/handlers/providers.go b/transports/bifrost-http/handlers/providers.go
+index e7f980d0a..a6b259056 100644
+--- a/transports/bifrost-http/handlers/providers.go
++++ b/transports/bifrost-http/handlers/providers.go
+@@ -365,8 +365,12 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	// Get redacted config for response (in-memory store is now updated by updateKeyStatus)
+-	redactedConfig, err := h.inMemoryStore.GetProviderConfigRedacted(payload.Provider)
++	// Get redacted config for response. Tenant-aware: dbStore in
++	// multi-tenant mode (so the response reflects what THIS tenant just
++	// stored, not whatever the global in-memory map happens to hold for
++	// the same provider name); in-memory in single-tenant. See
++	// providers_tenant_safe.go.
++	redactedConfig, err := h.loadProviderConfigRedacted(ctx, payload.Provider)
+ 	if err != nil {
+ 		logger.Warn("Failed to get redacted config for provider %s: %v", payload.Provider, err)
+ 		// Fall back to the raw config (no keys)
+@@ -415,8 +419,12 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	// Get the raw config to access actual values for merging with redacted request values
+-	oldConfigRaw, err := h.inMemoryStore.GetProviderConfigRaw(provider)
++	// Get the raw config to access actual values for merging with redacted request values.
++	// Tenant-aware: dbStore in multi-tenant mode (the shared in-memory
++	// map can hold a DIFFERENT tenant's config for the same provider
++	// name, and merging the request payload onto that wrong base then
++	// writing it back is the core of T3 / things-we-missed #7).
++	oldConfigRaw, err := h.loadProviderConfigRaw(ctx, provider)
+ 	if err != nil {
+ 		if !errors.Is(err, lib.ErrNotFound) {
+ 			logger.Warn("Failed to get old config for provider %s: %v", provider, err)
+@@ -429,7 +437,7 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 		oldConfigRaw = &configstore.ProviderConfig{}
+ 	}
+ 
+-	oldRedactedConfig, err := h.inMemoryStore.GetProviderConfigRedacted(provider)
++	oldRedactedConfig, err := h.loadProviderConfigRedacted(ctx, provider)
+ 	if err != nil {
+ 		if !errors.Is(err, lib.ErrNotFound) {
+ 			logger.Warn("Failed to get old redacted config for provider %s: %v", provider, err)
+@@ -539,15 +547,21 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 		config.StoreRawRequestResponse = *payload.StoreRawRequestResponse
+ 	}
+ 
+-	// Add provider to store if it doesn't exist (upsert behavior)
+-	if _, err := h.inMemoryStore.GetProviderConfigRaw(provider); err != nil {
++	// Add provider to store if it doesn't exist (upsert behavior).
++	// Existence check goes through the tenant-aware helper so a row
++	// belonging to a DIFFERENT tenant under the same provider name
++	// doesn't satisfy this check (which would skip the AddProvider
++	// branch and leave the calling tenant with no row at all in
++	// multi-tenant mode).
++	if _, err := h.loadProviderConfigRaw(ctx, provider); err != nil {
+ 		if !errors.Is(err, lib.ErrNotFound) {
+ 			logger.Warn("Failed to get provider %s: %v", provider, err)
+ 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider: %v", err))
+ 			return
+ 		}
+-		// Adding the provider to store
+-		if err := h.inMemoryStore.AddProvider(ctx, provider, config); err != nil {
++		// Adding the provider to store via the tenant-aware writer (see
++		// providers_tenant_safe.go::commitProviderAdd).
++		if err := h.commitProviderAdd(ctx, provider, config); err != nil {
+ 			// In an upsert flow, "already exists" is not fatal — the provider may have been
+ 			// added concurrently or exist in the DB from a previous failed attempt.
+ 			if !errors.Is(err, lib.ErrAlreadyExists) {
+@@ -559,8 +573,14 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 		}
+ 	}
+ 
+-	// Update provider config in store (env vars will be processed by store)
+-	if err := h.inMemoryStore.UpdateProviderConfig(ctx, provider, config); err != nil {
++	// Update provider config (env vars will be processed by store).
++	// Tenant-aware: in multi-tenant mode this writes direct through
++	// dbStore inside a transaction and DOES NOT touch the global
++	// in-memory map or re-enter the legacy key-sync path. The
++	// per-tenant runtime is invalidated by patch7's defer EvictTenant
++	// at the top of this handler, so the next inference for this
++	// tenant re-loads the freshly-written config.
++	if err := h.commitProviderUpdate(ctx, provider, config); err != nil {
+ 		logger.Warn("Failed to update provider %s: %v", provider, err)
+ 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update provider: %v", err))
+ 		return
+@@ -581,8 +601,9 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
+ 		}
+ 	}
+ 
+-	// Get redacted config for response (in-memory store is now updated by updateKeyStatus)
+-	redactedConfig, err := h.inMemoryStore.GetProviderConfigRedacted(provider)
++	// Get redacted config for response (in-memory store is now updated by updateKeyStatus
++	// on single-tenant; multi-tenant goes through dbStore via the tenant-aware helper).
++	redactedConfig, err := h.loadProviderConfigRedacted(ctx, provider)
+ 	if err != nil {
+ 		logger.Warn("Failed to get redacted config for provider %s: %v", provider, err)
+ 		// Fall back to sanitized config (no keys)
+@@ -616,8 +637,8 @@ func (h *ProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
+ 		return
+ 	}
+ 
+-	// Check if provider exists
+-	if _, err := h.inMemoryStore.GetProviderConfigRedacted(provider); err != nil && !errors.Is(err, lib.ErrNotFound) {
++	// Check if provider exists (tenant-aware — see providers_tenant_safe.go).
++	if _, err := h.loadProviderConfigRedacted(ctx, provider); err != nil && !errors.Is(err, lib.ErrNotFound) {
+ 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Failed to get provider: %v", err))
+ 		return
+ 	}
+@@ -903,6 +924,12 @@ func (h *ProviderHandler) listManagementModelsForProvider(
+ 		return buildListedModels(provider, models, nil, query.Query)
+ 	}
+ 
++	// TODO(multitenant): this read is from the GLOBAL in-memory map and
++	// can return another tenant's provider config when two tenants both
++	// have providers named the same. Fixing requires threading ctx into
++	// listManagementModelsForProvider — out of scope for T3 (which
++	// targets the WRITE path); track separately as a future read-leak
++	// follow-up alongside the line 203 dead-branch cleanup.
+ 	config, err := h.inMemoryStore.GetProviderConfigRaw(provider)
+ 	if err != nil {
+ 		logger.Warn("Failed to get config for provider %s: %v", provider, err)
+diff --git a/transports/bifrost-http/handlers/providers_tenant_safe.go b/transports/bifrost-http/handlers/providers_tenant_safe.go
+new file mode 100644
+index 000000000..77dacbd9d
+--- /dev/null
++++ b/transports/bifrost-http/handlers/providers_tenant_safe.go
+@@ -0,0 +1,128 @@
++// Package handlers — providers_tenant_safe.go.
++//
++// Multi-tenant-safe variants of the provider-config read/write paths
++// that the existing handler code uses against h.inMemoryStore. Three
++// concerns motivate this file living separately from providers.go:
++//
++//  1. h.inMemoryStore.GetProviderConfigRaw / GetProviderConfigRedacted
++//     read from the SHARED lib.Config.Providers map, which is global
++//     (last-write-wins across tenants). In multi-tenant deployments
++//     this returns whoever wrote the same provider name last —
++//     potentially a DIFFERENT tenant's NetworkConfig / ProxyConfig /
++//     CustomProviderConfig — and downstream code merges those values
++//     into the request, then writes the result back to the calling
++//     tenant's DB row. Effect: cross-tenant config bleed at write
++//     time, plus the global idx_key_id constraint trip documented in
++//     [docs/multi-tenant-f5/03-things-we-missed.md] item #7.
++//
++//  2. h.inMemoryStore.UpdateProviderConfig mutates the same shared
++//     map AND triggers a "sync keys" path against the configstore
++//     that tries to INSERT any "new" keys (keys that don't appear in
++//     the previously-shared in-memory entry) — those INSERTs trip the
++//     legacy global idx_key_id when a second tenant updates an
++//     existing provider name.
++//
++//  3. The fix has to be CONDITIONAL — single-tenant OSS deployments
++//     still rely on h.inMemoryStore for inference dispatch (the root
++//     *bifrost.Bifrost reads Account.GetKeysForProvider against the
++//     same map). Swapping unconditionally would break OSS behavior.
++//
++// Branch by TenantIDFromCtx(ctx): when present, multi-tenant; when
++// empty, fall through to the legacy in-memory path. Per-tenant
++// runtime cache invalidation is unchanged — patch7's defer
++// EvictTenant(ctx) at the top of every mutation handler still owns
++// runtime refresh.
++
++package handlers
++
++import (
++	"errors"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
++	"github.com/valyala/fasthttp"
++	"gorm.io/gorm"
++)
++
++// loadProviderConfigRaw returns the raw (un-redacted) provider config
++// for the request's tenant in multi-tenant mode, falling back to the
++// shared in-memory store in single-tenant mode. Errors from the
++// tenant-scoped path are translated to lib.ErrNotFound so callers can
++// keep their existing errors.Is(err, lib.ErrNotFound) checks.
++func (h *ProviderHandler) loadProviderConfigRaw(ctx *fasthttp.RequestCtx, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
++	if TenantIDFromCtx(ctx) != "" && h.dbStore != nil {
++		cfg, err := h.dbStore.GetProviderConfig(ctx, provider)
++		if errors.Is(err, configstore.ErrNotFound) {
++			return nil, lib.ErrNotFound
++		}
++		return cfg, err
++	}
++	return h.inMemoryStore.GetProviderConfigRaw(provider)
++}
++
++// loadProviderConfigRedacted is the redacted-output sibling of
++// loadProviderConfigRaw. In multi-tenant mode it fetches via dbStore
++// and calls .Redacted() on the result; in single-tenant mode the
++// in-memory store's GetProviderConfigRedacted already redacts.
++func (h *ProviderHandler) loadProviderConfigRedacted(ctx *fasthttp.RequestCtx, provider schemas.ModelProvider) (*configstore.ProviderConfig, error) {
++	if TenantIDFromCtx(ctx) != "" && h.dbStore != nil {
++		cfg, err := h.dbStore.GetProviderConfig(ctx, provider)
++		if errors.Is(err, configstore.ErrNotFound) {
++			return nil, lib.ErrNotFound
++		}
++		if err != nil {
++			return nil, err
++		}
++		return cfg.Redacted(), nil
++	}
++	return h.inMemoryStore.GetProviderConfigRedacted(provider)
++}
++
++// commitProviderUpdate writes provider config changes to the right
++// store for the request's tenant. Multi-tenant mode goes direct to
++// dbStore inside a transaction — that path is tenant-scoped via the
++// GORM scope callback (patch2) and does NOT mutate the shared
++// in-memory map (which would be cross-tenant write amplification) or
++// re-enter the legacy key-sync code path (which trips global
++// idx_key_id, see #7).
++//
++// Single-tenant mode keeps the existing h.inMemoryStore.UpdateProviderConfig
++// path because the root *bifrost.Bifrost still serves inference
++// against the in-memory map and the post-write c.client.UpdateProvider
++// inside lib.Config refreshes the account snapshot accordingly. In
++// multi-tenant mode the per-tenant runtime is invalidated separately
++// via the EvictTenant defer at the top of every mutation handler
++// (patch7), so the next inference re-loads the tenant runtime from a
++// fresh DB read.
++func (h *ProviderHandler) commitProviderUpdate(ctx *fasthttp.RequestCtx, provider schemas.ModelProvider, config configstore.ProviderConfig) error {
++	if TenantIDFromCtx(ctx) != "" && h.dbStore != nil {
++		return h.dbStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
++			if err := h.dbStore.UpdateProvider(ctx, provider, config, tx); err != nil {
++				if errors.Is(err, configstore.ErrNotFound) {
++					return lib.ErrNotFound
++				}
++				return err
++			}
++			return nil
++		})
++	}
++	return h.inMemoryStore.UpdateProviderConfig(ctx, provider, config)
++}
++
++// commitProviderAdd is the multi-tenant-safe sibling of
++// h.inMemoryStore.AddProvider used only on the upsert branch when a
++// provider didn't exist yet for the calling tenant. Same branching
++// rationale as commitProviderUpdate.
++func (h *ProviderHandler) commitProviderAdd(ctx *fasthttp.RequestCtx, provider schemas.ModelProvider, config configstore.ProviderConfig) error {
++	if TenantIDFromCtx(ctx) != "" && h.dbStore != nil {
++		if err := h.dbStore.AddProvider(ctx, provider, config); err != nil {
++			if errors.Is(err, configstore.ErrAlreadyExists) {
++				return lib.ErrAlreadyExists
++			}
++			return err
++		}
++		return nil
++	}
++	return h.inMemoryStore.AddProvider(ctx, provider, config)
++}
+-- 
+2.51.0
+

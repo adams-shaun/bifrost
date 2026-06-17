@@ -24,7 +24,7 @@ against a live cluster — unit tests alone did not surface them.
 | 4 | `GetProviderKeys` JOIN returned cross-tenant keys | patch2 `mt-data-scope-callback` | patch10 `mt-getproviderkeys-scope` | seed assertion phase (`shaun`'s `keys count = 6 (want 3)`) |
 | 5 | `createVirtualKey/Team/Customer` handlers didn't stamp TenantID → strict-mode 500 | patch3 + patch4 | inlined into patch4 series during session (explicit stamps) | runtime in cluster |
 | 6 | `tableKeyFromSchemaKey` lost provider.TenantID → keys landed unstamped on AddProvider/UpdateProvider | patch4 | inlined into patch4 (key TenantID propagated) | runtime in cluster |
-| 7 | `UpdateProvider` handler writes via `h.inMemoryStore` (not tenant-safe) → second-tenant update of `openai` trips global `idx_key_id` | patch4 | **not yet patched**; seed skips provider update | seed UPDATE phase |
+| 7 | `UpdateProvider` handler writes via `h.inMemoryStore` (not tenant-safe) → second-tenant update of `openai` trips global `idx_key_id` | patch4 | **patch14** `mt-updateprovider-tenant-safe` (tenant-aware reads + writes via `providers_tenant_safe.go` helpers) | seed UPDATE phase |
 | 8 | Legacy global `idx_key_name` on `config_keys.name` left in place by design → two tenants can't share a key NAME | patch1 (intentional) | **not yet patched**; seed tenant-prefixes key names | seed setup |
 | 9 | MCPManager registry is per-process, not tenant-scoped at runtime → cross-tenant name collision survives DB cascade | patch1 design | **not yet patched**; seed currently skips MCP entirely | seed MCP phase |
 | 10 | `TestConfigSchemaSync` fails — Stage 1 added `tenant_id` / `source_id` fields not in `config.schema.json` | patch1 | **patch13** `mt-schemasync-exclusions` (added to per-table `excludedGoFields`) | local test run |
@@ -148,13 +148,13 @@ predicate to GetProviderKeys when ctx has a tenant. Belt-and-suspenders
 predicate explicitly on the JOINed side. Don't trust the scope callback
 to follow the join. (See sibling audit — there may be more.)
 
-### #7 — `UpdateProvider` not tenant-safe on the `inMemoryStore` write path
+### #7 — `UpdateProvider` not tenant-safe on the `inMemoryStore` write path (✅ closed by patch14)
 
 **Symptom.** When the second tenant updates `openai`, 500
 `a record with this key id already exists`.
 
 **Root cause.** [providers.go:563](../../transports/bifrost-http/handlers/providers.go#L563)
-calls `h.inMemoryStore.UpdateProviderConfig(ctx, provider, config)`.
+called `h.inMemoryStore.UpdateProviderConfig(ctx, provider, config)`.
 The `inMemoryStore` is the shared `lib.Config` BaseAccount — its
 `Providers` map is GLOBAL (not tenant-keyed). When the second tenant
 updates `openai`, the write triggers a downstream "sync keys to DB"
@@ -164,11 +164,40 @@ a different tenant — the global `idx_key_id` unique constraint trips.
 The lines just above (457-462) DO refetch keys from the tenant-scoped
 `h.dbStore`, but the subsequent
 `h.inMemoryStore.UpdateProviderConfig` re-enters the legacy
-in-memory + sync path. patch4's tenant-routing migration is
-**incomplete** on this code path — should be `h.dbStore.UpdateProviderConfig`.
+in-memory + sync path. patch4's tenant-routing migration was
+**incomplete** on this code path.
 
-**Fix.** Not yet patched. Seed workaround: skip the provider-update
-step in the lifecycle test.
+Additionally, the read sites (`GetProviderConfigRaw`,
+`GetProviderConfigRedacted`) on the same handler read from the same
+shared map, returning whatever tenant happened to write last — so the
+config the handler builds is merged onto the wrong base before the
+write even happens.
+
+**Fix.** **patch14** (`mt-updateprovider-tenant-safe`) introduces
+[providers_tenant_safe.go](../../transports/bifrost-http/handlers/providers_tenant_safe.go)
+with 4 branching helpers (`loadProviderConfigRaw`,
+`loadProviderConfigRedacted`, `commitProviderUpdate`,
+`commitProviderAdd`). When `TenantIDFromCtx(ctx) != ""`, reads + writes
+route direct through `h.dbStore` — tenant-scoped via the GORM scope
+callback (patch2). Single-tenant OSS path keeps the existing
+in-memory flow so the root `*bifrost.Bifrost` continues to serve
+inference against the global map without changes.
+
+Per-tenant runtime invalidation is unchanged: patch7's
+`defer EvictTenant(ctx)` at the top of every mutation handler still
+fires, so the next inference for the updated tenant re-loads from the
+freshly-written DB row.
+
+**Regression catcher added** to `go-bifrost-ai/examples/seed`: the
+seed driver's UPDATE pass now bumps `openai`'s NetworkTimeout to 90s
+on the `update` tenant and asserts that the `primary` tenant's openai
+provider still reads back as 30s (i.e. no cross-tenant write bleed).
+This would have caught T3 before it shipped.
+
+**Lesson.** Whenever a handler reads-modifies-writes via an in-memory
+cache, both the READ and WRITE sides need to be tenant-aware. Fixing
+only the write side leaves the merge-base wrong; fixing only the read
+side leaves the persistence path corrupt.
 
 ### #8 — Legacy global `idx_key_name` left in place (design tradeoff)
 

@@ -365,8 +365,12 @@ func (h *ProviderHandler) addProvider(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Get redacted config for response (in-memory store is now updated by updateKeyStatus)
-	redactedConfig, err := h.inMemoryStore.GetProviderConfigRedacted(payload.Provider)
+	// Get redacted config for response. Tenant-aware: dbStore in
+	// multi-tenant mode (so the response reflects what THIS tenant just
+	// stored, not whatever the global in-memory map happens to hold for
+	// the same provider name); in-memory in single-tenant. See
+	// providers_tenant_safe.go.
+	redactedConfig, err := h.loadProviderConfigRedacted(ctx, payload.Provider)
 	if err != nil {
 		logger.Warn("Failed to get redacted config for provider %s: %v", payload.Provider, err)
 		// Fall back to the raw config (no keys)
@@ -415,8 +419,12 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Get the raw config to access actual values for merging with redacted request values
-	oldConfigRaw, err := h.inMemoryStore.GetProviderConfigRaw(provider)
+	// Get the raw config to access actual values for merging with redacted request values.
+	// Tenant-aware: dbStore in multi-tenant mode (the shared in-memory
+	// map can hold a DIFFERENT tenant's config for the same provider
+	// name, and merging the request payload onto that wrong base then
+	// writing it back is the core of T3 / things-we-missed #7).
+	oldConfigRaw, err := h.loadProviderConfigRaw(ctx, provider)
 	if err != nil {
 		if !errors.Is(err, lib.ErrNotFound) {
 			logger.Warn("Failed to get old config for provider %s: %v", provider, err)
@@ -429,7 +437,7 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		oldConfigRaw = &configstore.ProviderConfig{}
 	}
 
-	oldRedactedConfig, err := h.inMemoryStore.GetProviderConfigRedacted(provider)
+	oldRedactedConfig, err := h.loadProviderConfigRedacted(ctx, provider)
 	if err != nil {
 		if !errors.Is(err, lib.ErrNotFound) {
 			logger.Warn("Failed to get old redacted config for provider %s: %v", provider, err)
@@ -539,15 +547,21 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		config.StoreRawRequestResponse = *payload.StoreRawRequestResponse
 	}
 
-	// Add provider to store if it doesn't exist (upsert behavior)
-	if _, err := h.inMemoryStore.GetProviderConfigRaw(provider); err != nil {
+	// Add provider to store if it doesn't exist (upsert behavior).
+	// Existence check goes through the tenant-aware helper so a row
+	// belonging to a DIFFERENT tenant under the same provider name
+	// doesn't satisfy this check (which would skip the AddProvider
+	// branch and leave the calling tenant with no row at all in
+	// multi-tenant mode).
+	if _, err := h.loadProviderConfigRaw(ctx, provider); err != nil {
 		if !errors.Is(err, lib.ErrNotFound) {
 			logger.Warn("Failed to get provider %s: %v", provider, err)
 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get provider: %v", err))
 			return
 		}
-		// Adding the provider to store
-		if err := h.inMemoryStore.AddProvider(ctx, provider, config); err != nil {
+		// Adding the provider to store via the tenant-aware writer (see
+		// providers_tenant_safe.go::commitProviderAdd).
+		if err := h.commitProviderAdd(ctx, provider, config); err != nil {
 			// In an upsert flow, "already exists" is not fatal — the provider may have been
 			// added concurrently or exist in the DB from a previous failed attempt.
 			if !errors.Is(err, lib.ErrAlreadyExists) {
@@ -559,8 +573,14 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// Update provider config in store (env vars will be processed by store)
-	if err := h.inMemoryStore.UpdateProviderConfig(ctx, provider, config); err != nil {
+	// Update provider config (env vars will be processed by store).
+	// Tenant-aware: in multi-tenant mode this writes direct through
+	// dbStore inside a transaction and DOES NOT touch the global
+	// in-memory map or re-enter the legacy key-sync path. The
+	// per-tenant runtime is invalidated by patch7's defer EvictTenant
+	// at the top of this handler, so the next inference for this
+	// tenant re-loads the freshly-written config.
+	if err := h.commitProviderUpdate(ctx, provider, config); err != nil {
 		logger.Warn("Failed to update provider %s: %v", provider, err)
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to update provider: %v", err))
 		return
@@ -581,8 +601,9 @@ func (h *ProviderHandler) updateProvider(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// Get redacted config for response (in-memory store is now updated by updateKeyStatus)
-	redactedConfig, err := h.inMemoryStore.GetProviderConfigRedacted(provider)
+	// Get redacted config for response (in-memory store is now updated by updateKeyStatus
+	// on single-tenant; multi-tenant goes through dbStore via the tenant-aware helper).
+	redactedConfig, err := h.loadProviderConfigRedacted(ctx, provider)
 	if err != nil {
 		logger.Warn("Failed to get redacted config for provider %s: %v", provider, err)
 		// Fall back to sanitized config (no keys)
@@ -616,8 +637,8 @@ func (h *ProviderHandler) deleteProvider(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Check if provider exists
-	if _, err := h.inMemoryStore.GetProviderConfigRedacted(provider); err != nil && !errors.Is(err, lib.ErrNotFound) {
+	// Check if provider exists (tenant-aware — see providers_tenant_safe.go).
+	if _, err := h.loadProviderConfigRedacted(ctx, provider); err != nil && !errors.Is(err, lib.ErrNotFound) {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Failed to get provider: %v", err))
 		return
 	}
@@ -903,6 +924,12 @@ func (h *ProviderHandler) listManagementModelsForProvider(
 		return buildListedModels(provider, models, nil, query.Query)
 	}
 
+	// TODO(multitenant): this read is from the GLOBAL in-memory map and
+	// can return another tenant's provider config when two tenants both
+	// have providers named the same. Fixing requires threading ctx into
+	// listManagementModelsForProvider — out of scope for T3 (which
+	// targets the WRITE path); track separately as a future read-leak
+	// follow-up alongside the line 203 dead-branch cleanup.
 	config, err := h.inMemoryStore.GetProviderConfigRaw(provider)
 	if err != nil {
 		logger.Warn("Failed to get config for provider %s: %v", provider, err)
