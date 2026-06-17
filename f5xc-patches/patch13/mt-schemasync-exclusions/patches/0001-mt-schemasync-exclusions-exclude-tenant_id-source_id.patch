@@ -1,0 +1,82 @@
+From 244334288d9c571d1312edc0f3225dfbb952097f Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 21:09:48 -0600
+Subject: [PATCH] mt-schemasync-exclusions: exclude tenant_id / source_id from
+ schema-sync test
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TestConfigSchemaSync was failing after patch1 added tenant_id columns
+to 5 governance tables (and source_id to teams) without updating the
+schema-vs-go-struct comparison test's excluded-fields list. These
+fields are runtime-only — they're stamped from the request ctx or the
+parent row, never serialized to/from config.json — so the OSS schema
+doesn't (and shouldn't) carry them.
+
+Closes T6 from docs/multi-tenant-f5/04-design-poc-to-v1.md §4.2.
+Verified: go test -run TestConfigSchemaSync$ ./transports/bifrost-http/lib/...
+passes cleanly post-patch.
+---
+ transports/bifrost-http/lib/config_test.go | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/transports/bifrost-http/lib/config_test.go b/transports/bifrost-http/lib/config_test.go
+index c52951e04..2e76d248f 100644
+--- a/transports/bifrost-http/lib/config_test.go
++++ b/transports/bifrost-http/lib/config_test.go
+@@ -15725,18 +15725,25 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"providers":     true, // Internal
+ 		"routing_rules": true, // Internal
+ 	},
+-	// Table types have DB-specific fields
++	// Table types have DB-specific fields.
++	// `tenant_id` (and `source_id` on teams) are f5xc multi-tenant
++	// overlay additions (patches 1-6) that don't belong in OSS
++	// config.json — runtime stamps them from the request ctx / parent
++	// row, not from the schema. Exclude per-table to keep
++	// TestConfigSchemaSync green.
+ 	"tables.TableBudget": {
+ 		"config_hash":        true,
+ 		"created_at":         true,
+ 		"updated_at":         true,
+ 		"virtual_key_id":     true, // Internal DB FK for multi-budget ownership
+ 		"provider_config_id": true, // Internal DB FK for multi-budget ownership
++		"tenant_id":          true, // f5xc multi-tenant overlay
+ 	},
+ 	"tables.TableRateLimit": {
+ 		"config_hash": true,
+ 		"created_at":  true,
+ 		"updated_at":  true,
++		"tenant_id":   true, // f5xc multi-tenant overlay
+ 	},
+ 	"tables.TableCustomer": {
+ 		"config_hash":  true,
+@@ -15746,6 +15753,7 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"rate_limit":   true, // GORM relation
+ 		"teams":        true, // GORM relation
+ 		"virtual_keys": true, // GORM relation
++		"tenant_id":    true, // f5xc multi-tenant overlay
+ 	},
+ 	"tables.TableTeam": {
+ 		"config_hash":  true,
+@@ -15755,6 +15763,8 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"rate_limit":   true, // GORM relation
+ 		"customer":     true, // GORM relation
+ 		"virtual_keys": true, // GORM relation
++		"tenant_id":    true, // f5xc multi-tenant overlay
++		"source_id":    true, // f5xc multi-tenant overlay (external identity binding)
+ 	},
+ 	"tables.TableVirtualKey": {
+ 		"config_hash": true,
+@@ -15764,6 +15774,7 @@ var excludedGoFields = map[string]map[string]bool{
+ 		"rate_limit":  true, // GORM relation
+ 		"team":        true, // GORM relation
+ 		"customer":    true, // GORM relation
++		"tenant_id":   true, // f5xc multi-tenant overlay
+ 	},
+ 	"tables.TableVirtualKeyProviderConfig": {
+ 		"rate_limit":     true, // GORM relation
+-- 
+2.51.0
+

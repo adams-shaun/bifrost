@@ -1,0 +1,66 @@
+From 7f84676c181d5daad244e50d8085031108ffc527 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Tue, 16 Jun 2026 21:03:57 -0600
+Subject: [PATCH] mt-getproviderkeybyname-scope: stamp config_keys.tenant_id on
+ the JOIN
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Audit follow-up to patch10. getProviderKeyByName issues the same shape
+of JOIN as GetProviderKeys (config_keys ⋈ config_providers) but with
+config_keys as the primary table — so the scope callback's qualified
+WHERE happens to land on config_keys.tenant_id and correctly restricts
+the result today. The pattern is still fragile: any refactor that flips
+the primary table to config_providers re-opens the cross-tenant key
+leak patch10 just closed.
+
+Belt-and-suspenders: read tenant from ctx and add an explicit
+WHERE config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL
+predicate when present. Skip when no tenant is on ctx so single-tenant
+OSS config sync paths keep their existing "see all" semantics.
+
+Exposure surface: GetProviderKey → GET /api/providers/{p}/keys/{kid}.
+Same fix shape as patch10.
+---
+ framework/configstore/rdb.go | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 7eaa5e08d..d03ca83ea 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -1322,13 +1322,26 @@ func (s *RDBConfigStore) GetProviderKeys(ctx context.Context, provider schemas.M
+ }
+ 
+ func (s *RDBConfigStore) getProviderKeyByName(ctx context.Context, txDB *gorm.DB, provider schemas.ModelProvider, keyID string) (*tables.TableKey, error) {
+-	var dbKey tables.TableKey
+-	if err := dbForUpdate(txDB.WithContext(ctx)).
++	// Belt-and-suspenders tenant scoping on the JOIN. Primary table here is
++	// config_keys so the scope callback's qualified WHERE happens to land
++	// on the right side already — but the pattern is fragile (a refactor
++	// that flips the primary table re-opens the same cross-tenant leak
++	// patch10 closed in GetProviderKeys). Stamp the predicate explicitly
++	// when ctx carries a tenant so the scope is independent of which side
++	// GORM treats as primary. Skip when no tenant is in ctx (single-tenant
++	// OSS deployments keep their existing "see all" semantics on config
++	// sync paths).
++	tid, hasTenant := tenantFromContext(ctx)
++	q := dbForUpdate(txDB.WithContext(ctx)).
+ 		Table("config_keys").
+ 		Select("config_keys.*").
+ 		Joins("JOIN config_providers ON config_providers.id = config_keys.provider_id").
+-		Where("config_providers.name = ? AND config_keys.key_id = ?", string(provider), keyID).
+-		First(&dbKey).Error; err != nil {
++		Where("config_providers.name = ? AND config_keys.key_id = ?", string(provider), keyID)
++	if hasTenant {
++		q = q.Where("config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL", tid)
++	}
++	var dbKey tables.TableKey
++	if err := q.First(&dbKey).Error; err != nil {
+ 		if errors.Is(err, gorm.ErrRecordNotFound) {
+ 			return nil, ErrNotFound
+ 		}
+-- 
+2.51.0
+

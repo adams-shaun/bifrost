@@ -1322,13 +1322,26 @@ func (s *RDBConfigStore) GetProviderKeys(ctx context.Context, provider schemas.M
 }
 
 func (s *RDBConfigStore) getProviderKeyByName(ctx context.Context, txDB *gorm.DB, provider schemas.ModelProvider, keyID string) (*tables.TableKey, error) {
-	var dbKey tables.TableKey
-	if err := dbForUpdate(txDB.WithContext(ctx)).
+	// Belt-and-suspenders tenant scoping on the JOIN. Primary table here is
+	// config_keys so the scope callback's qualified WHERE happens to land
+	// on the right side already — but the pattern is fragile (a refactor
+	// that flips the primary table re-opens the same cross-tenant leak
+	// patch10 closed in GetProviderKeys). Stamp the predicate explicitly
+	// when ctx carries a tenant so the scope is independent of which side
+	// GORM treats as primary. Skip when no tenant is in ctx (single-tenant
+	// OSS deployments keep their existing "see all" semantics on config
+	// sync paths).
+	tid, hasTenant := tenantFromContext(ctx)
+	q := dbForUpdate(txDB.WithContext(ctx)).
 		Table("config_keys").
 		Select("config_keys.*").
 		Joins("JOIN config_providers ON config_providers.id = config_keys.provider_id").
-		Where("config_providers.name = ? AND config_keys.key_id = ?", string(provider), keyID).
-		First(&dbKey).Error; err != nil {
+		Where("config_providers.name = ? AND config_keys.key_id = ?", string(provider), keyID)
+	if hasTenant {
+		q = q.Where("config_keys.tenant_id = ? OR config_keys.tenant_id IS NULL", tid)
+	}
+	var dbKey tables.TableKey
+	if err := q.First(&dbKey).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrNotFound
 		}
@@ -2555,12 +2568,33 @@ func (s *RDBConfigStore) GetVirtualKeysPaginated(ctx context.Context, params Vir
 	if params.SortBy == "budget_spent" {
 		// A virtual key can have multiple budgets (different reset intervals); take MAX so the
 		// highest-spending budget drives the sort without duplicating rows.
-		query = query.Joins(`LEFT JOIN (
-			SELECT virtual_key_id, MAX(current_usage) AS total_usage
-			FROM governance_budgets
-			WHERE virtual_key_id IS NOT NULL
-			GROUP BY virtual_key_id
-		) AS vk_budget_totals ON vk_budget_totals.virtual_key_id = governance_virtual_keys.id`)
+		//
+		// Tenant scoping: this is a LEFT JOIN whose self-limiting outer
+		// condition (vk_budget_totals.virtual_key_id =
+		// governance_virtual_keys.id) already filters cross-tenant rows
+		// in practice — governance_virtual_keys is tenant-scoped by the
+		// outer query so the join's RHS only matches in-scope VK ids.
+		// Belt-and-suspenders: stamp tenant_id INSIDE the subquery too,
+		// so a future refactor that weakens the outer JOIN condition
+		// can't accidentally turn this into a cross-tenant aggregation.
+		// Skip when no tenant in ctx (single-tenant fallback path).
+		tid, hasTenant := tenantFromContext(ctx)
+		if hasTenant {
+			query = query.Joins(`LEFT JOIN (
+				SELECT virtual_key_id, MAX(current_usage) AS total_usage
+				FROM governance_budgets
+				WHERE virtual_key_id IS NOT NULL
+				  AND (governance_budgets.tenant_id = ? OR governance_budgets.tenant_id IS NULL)
+				GROUP BY virtual_key_id
+			) AS vk_budget_totals ON vk_budget_totals.virtual_key_id = governance_virtual_keys.id`, tid)
+		} else {
+			query = query.Joins(`LEFT JOIN (
+				SELECT virtual_key_id, MAX(current_usage) AS total_usage
+				FROM governance_budgets
+				WHERE virtual_key_id IS NOT NULL
+				GROUP BY virtual_key_id
+			) AS vk_budget_totals ON vk_budget_totals.virtual_key_id = governance_virtual_keys.id`)
+		}
 	}
 	var virtualKeys []tables.TableVirtualKey
 	if err := query.
@@ -3087,17 +3121,29 @@ func (s *RDBConfigStore) GetVirtualKeyMCPConfigsByMCPClientIDs(ctx context.Conte
 
 // GetVirtualKeyMCPConfigsByMCPClientStringIDs retrieves all VK MCP configs for a set of string client IDs
 // (the ClientID varchar column, not the DB primary key) in one query.
+//
+// Tenant scoping: pin the primary table with .Model() so the GORM scope
+// callback's qualified WHERE lands on governance_virtual_key_mcp_configs.
+// JOIN target config_mcp_clients ALSO carries tenant_id but the callback
+// won't follow the join — add an explicit predicate so an attacker who
+// knows another tenant's MCP client_id (a public-ish string) can't
+// enumerate cross-tenant VK→MCP wiring. Skip when no tenant in ctx so
+// boot-time / single-tenant reads keep their "see all" semantics.
 func (s *RDBConfigStore) GetVirtualKeyMCPConfigsByMCPClientStringIDs(ctx context.Context, clientIDs []string) ([]tables.TableVirtualKeyMCPConfig, error) {
 	if len(clientIDs) == 0 {
 		return nil, nil
 	}
-	var configs []tables.TableVirtualKeyMCPConfig
-	err := s.DB().WithContext(ctx).
+	tid, hasTenant := tenantFromContext(ctx)
+	q := s.DB().WithContext(ctx).
+		Model(&tables.TableVirtualKeyMCPConfig{}).
 		Preload("MCPClient").
 		Joins("JOIN config_mcp_clients ON config_mcp_clients.id = governance_virtual_key_mcp_configs.mcp_client_id").
-		Where("config_mcp_clients.client_id IN ?", clientIDs).
-		Find(&configs).Error
-	if err != nil {
+		Where("config_mcp_clients.client_id IN ?", clientIDs)
+	if hasTenant {
+		q = q.Where("config_mcp_clients.tenant_id = ? OR config_mcp_clients.tenant_id IS NULL", tid)
+	}
+	var configs []tables.TableVirtualKeyMCPConfig
+	if err := q.Find(&configs).Error; err != nil {
 		return nil, err
 	}
 	return configs, nil

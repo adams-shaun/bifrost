@@ -555,8 +555,11 @@ EA customers don't enable it).
 | 8 | `mt-tenant-cascade-delete` | Tenant DELETE cascades across all 8 tenant-scoped child tables in a single tx | ~40 |
 | 9 | `mt-scope-callback-order` | Register `multitenant:scope_create` `Before("gorm:before_create")` (was `Before("gorm:create")`) so it fires before strict-mode `BeforeCreate` hooks | ~10 |
 | 10 | `mt-getproviderkeys-scope` | Explicit `WHERE config_keys.tenant_id = ?` predicate in `GetProviderKeys` (the scope callback's qualified WHERE didn't follow the JOIN) | ~20 |
+| 11 | `mt-getproviderkeybyname-scope` | Sibling fix for `getProviderKeyByName` JOIN: explicit `config_keys.tenant_id` predicate so the scope is independent of which side GORM treats as primary. Closes T1. | ~20 |
+| 12 | `mt-vkmcp-and-vk-budget-scope` | Pins `.Model()` on `GetVirtualKeyMCPConfigsByMCPClientStringIDs` + adds `config_mcp_clients.tenant_id` predicate (T2); belt-and-suspenders predicate inside `GetVirtualKeysPaginated` budget subquery (T7). | ~45 |
+| 13 | `mt-schemasync-exclusions` | Adds `tenant_id` / `source_id` to per-table `excludedGoFields` so `TestConfigSchemaSync` recognizes them as runtime-only. Closes T6. | ~12 |
 
-Total: ~5,300 LOC of code; ~1,400 LOC of doc & migration commentary.
+Total: ~5,400 LOC of code; ~1,400 LOC of doc & migration commentary.
 
 Companion artifact (separate repo): `go-bifrost-ai/examples/seed` —
 end-to-end lifecycle tester. Creates 5 tenants, full-seeds 3 of them
@@ -566,15 +569,15 @@ This driver is what caught patches 8, 9, 10 and the open items below.
 
 ### 4.2 Known TODO before EA — confirmed bugs
 
-| # | Item | Severity | Where | Effort |
+| # | Item | Severity | Where | Status |
 |---|---|---|---|---|
-| T1 | `getProviderKeyByName` JOIN: add explicit `config_keys.tenant_id = ?` predicate | HIGH | [rdb.go:1307](../../framework/configstore/rdb.go#L1307) | <1d, patch11 |
-| T2 | `GetVirtualKeyMCPConfigsByMCPClientStringIDs` JOIN: pin `.Model()` + add `config_mcp_clients.tenant_id = ?` | HIGH | [rdb.go:3090](../../framework/configstore/rdb.go#L3090) | <1d, patch12 |
-| T3 | `UpdateProvider` writes via `h.inMemoryStore` (not tenant-safe) → trips `idx_key_id` global unique on second tenant updating "openai" | HIGH | [providers.go:563](../../transports/bifrost-http/handlers/providers.go#L563) | 1-2d — needs careful refactor; in-memory store still serves single-tenant inference dispatch, so the swap is conditional on multi-tenant mode |
-| T4 | Drop legacy `idx_key_name` global unique on `config_keys(name)` and patch OSS upsert sites to target `idx_key_tenant_name` composite | MEDIUM | [migrations.go:1529](../../framework/configstore/migrations.go#L1529) + upsert sites in rdb.go | 1-2d — needs careful sweep of every UPSERT |
-| T5 | Tenant-scope the in-memory MCPManager registry: key by `(tenant_id, name)` OR per-tenant MCPManager via runtime config | MEDIUM | `core/mcp/...` (upstream) — easier fix may be per-tenant runtime MCPManager in `multitenant/loader.go` | 2-3d depending on approach |
-| T6 | `TestConfigSchemaSync` fails: add `tenant_id`/`source_id` to `excludedGoFields` or to `config.schema.json` | LOW (test-only) | `transports/bifrost-http/lib/config_test.go` | <1h |
-| T7 | `GetVirtualKeysPaginated` budget subquery: add `governance_budgets.tenant_id = ?` for refactor-resilience | LOW | [rdb.go:2555](../../framework/configstore/rdb.go#L2555) | <1h, bundle with T1/T2 |
+| ~~T1~~ | ~~`getProviderKeyByName` JOIN: add explicit `config_keys.tenant_id = ?` predicate~~ | ~~HIGH~~ | [rdb.go:1307](../../framework/configstore/rdb.go#L1307) | ✅ **Closed by patch11** |
+| ~~T2~~ | ~~`GetVirtualKeyMCPConfigsByMCPClientStringIDs` JOIN: pin `.Model()` + add `config_mcp_clients.tenant_id = ?`~~ | ~~HIGH~~ | [rdb.go:3090](../../framework/configstore/rdb.go#L3090) | ✅ **Closed by patch12** |
+| T3 | `UpdateProvider` writes via `h.inMemoryStore` (not tenant-safe) → trips `idx_key_id` global unique on second tenant updating "openai" | HIGH | [providers.go:563](../../transports/bifrost-http/handlers/providers.go#L563) | OPEN — 1-2d, needs careful refactor; in-memory store still serves single-tenant inference dispatch, so the swap is conditional on multi-tenant mode |
+| T4 | Drop legacy `idx_key_name` global unique on `config_keys(name)` and patch OSS upsert sites to target `idx_key_tenant_name` composite | MEDIUM | [migrations.go:1529](../../framework/configstore/migrations.go#L1529) + upsert sites in rdb.go | OPEN — 1-2d, needs careful sweep of every UPSERT |
+| T5 | Tenant-scope the in-memory MCPManager registry: key by `(tenant_id, name)` OR per-tenant MCPManager via runtime config | MEDIUM | `core/mcp/...` (upstream) — easier fix may be per-tenant runtime MCPManager in `multitenant/loader.go` | OPEN — 2-3d depending on approach |
+| ~~T6~~ | ~~`TestConfigSchemaSync` fails: add `tenant_id`/`source_id` to `excludedGoFields` or to `config.schema.json`~~ | ~~LOW (test-only)~~ | `transports/bifrost-http/lib/config_test.go` | ✅ **Closed by patch13** |
+| ~~T7~~ | ~~`GetVirtualKeysPaginated` budget subquery: add `governance_budgets.tenant_id = ?` for refactor-resilience~~ | ~~LOW~~ | [rdb.go:2555](../../framework/configstore/rdb.go#L2555) | ✅ **Closed by patch12** |
 
 ### 4.3 Productization knobs (not bugs, but EA-quality work)
 

@@ -27,7 +27,7 @@ against a live cluster — unit tests alone did not surface them.
 | 7 | `UpdateProvider` handler writes via `h.inMemoryStore` (not tenant-safe) → second-tenant update of `openai` trips global `idx_key_id` | patch4 | **not yet patched**; seed skips provider update | seed UPDATE phase |
 | 8 | Legacy global `idx_key_name` on `config_keys.name` left in place by design → two tenants can't share a key NAME | patch1 (intentional) | **not yet patched**; seed tenant-prefixes key names | seed setup |
 | 9 | MCPManager registry is per-process, not tenant-scoped at runtime → cross-tenant name collision survives DB cascade | patch1 design | **not yet patched**; seed currently skips MCP entirely | seed MCP phase |
-| 10 | `TestConfigSchemaSync` fails — Stage 1 added `tenant_id` / `source_id` fields not in `config.schema.json` | patch1 | **not yet patched**; needs `excludedGoFields` update or schema update | local test run |
+| 10 | `TestConfigSchemaSync` fails — Stage 1 added `tenant_id` / `source_id` fields not in `config.schema.json` | patch1 | **patch13** `mt-schemasync-exclusions` (added to per-table `excludedGoFields`) | local test run |
 
 Plus several seed-surface quirks (not bugs, just gateway behaviors the seed had to learn):
 
@@ -199,7 +199,7 @@ recreated tenant hits "client with name X already exists".
 fix: tenant-scope the MCPManager registry (or evict on tenant delete /
 mcp delete via runtime hook similar to patch7's `TenantEvict`).
 
-### #10 — `TestConfigSchemaSync` failing
+### #10 — `TestConfigSchemaSync` failing (✅ closed by patch13)
 
 **Symptom.** `lib` test package: `TestConfigSchemaSync` fails with
 6 schema errors:
@@ -268,7 +268,7 @@ Audit triggered after patch10. Searched every `.Joins(...)` in
 tables joined, primary-table-only WHERE filter from the scope
 callback). Three more candidates found:
 
-### #4a — `getProviderKeyByName` (HIGH, not yet patched)
+### #4a — `getProviderKeyByName` (HIGH, ✅ closed by patch11)
 
 [rdb.go:1307-1320](../../framework/configstore/rdb.go#L1307)
 
@@ -290,7 +290,7 @@ primary. Same shape as patch10.
 
 **Exposure:** `GetProviderKey` → `GET /api/providers/{p}/keys/{kid}`.
 
-### #4b — `GetVirtualKeyMCPConfigsByMCPClientStringIDs` (HIGH, not yet patched)
+### #4b — `GetVirtualKeyMCPConfigsByMCPClientStringIDs` (HIGH, ✅ closed by patch12)
 
 [rdb.go:3090-3104](../../framework/configstore/rdb.go#L3090)
 
@@ -311,7 +311,7 @@ primary table with `.Model(&tables.TableVirtualKeyMCPConfig{})`.
 
 **Exposure:** MCP client handlers in `handlers/mcp.go`.
 
-### #4c — `GetVirtualKeysPaginated` budget subquery (LOW)
+### #4c — `GetVirtualKeysPaginated` budget subquery (LOW, ✅ closed by patch12)
 
 [rdb.go:2555-2564](../../framework/configstore/rdb.go#L2555)
 

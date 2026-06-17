@@ -15725,18 +15725,25 @@ var excludedGoFields = map[string]map[string]bool{
 		"providers":     true, // Internal
 		"routing_rules": true, // Internal
 	},
-	// Table types have DB-specific fields
+	// Table types have DB-specific fields.
+	// `tenant_id` (and `source_id` on teams) are f5xc multi-tenant
+	// overlay additions (patches 1-6) that don't belong in OSS
+	// config.json — runtime stamps them from the request ctx / parent
+	// row, not from the schema. Exclude per-table to keep
+	// TestConfigSchemaSync green.
 	"tables.TableBudget": {
 		"config_hash":        true,
 		"created_at":         true,
 		"updated_at":         true,
 		"virtual_key_id":     true, // Internal DB FK for multi-budget ownership
 		"provider_config_id": true, // Internal DB FK for multi-budget ownership
+		"tenant_id":          true, // f5xc multi-tenant overlay
 	},
 	"tables.TableRateLimit": {
 		"config_hash": true,
 		"created_at":  true,
 		"updated_at":  true,
+		"tenant_id":   true, // f5xc multi-tenant overlay
 	},
 	"tables.TableCustomer": {
 		"config_hash":  true,
@@ -15746,6 +15753,7 @@ var excludedGoFields = map[string]map[string]bool{
 		"rate_limit":   true, // GORM relation
 		"teams":        true, // GORM relation
 		"virtual_keys": true, // GORM relation
+		"tenant_id":    true, // f5xc multi-tenant overlay
 	},
 	"tables.TableTeam": {
 		"config_hash":  true,
@@ -15755,6 +15763,8 @@ var excludedGoFields = map[string]map[string]bool{
 		"rate_limit":   true, // GORM relation
 		"customer":     true, // GORM relation
 		"virtual_keys": true, // GORM relation
+		"tenant_id":    true, // f5xc multi-tenant overlay
+		"source_id":    true, // f5xc multi-tenant overlay (external identity binding)
 	},
 	"tables.TableVirtualKey": {
 		"config_hash": true,
@@ -15764,6 +15774,7 @@ var excludedGoFields = map[string]map[string]bool{
 		"rate_limit":  true, // GORM relation
 		"team":        true, // GORM relation
 		"customer":    true, // GORM relation
+		"tenant_id":   true, // f5xc multi-tenant overlay
 	},
 	"tables.TableVirtualKeyProviderConfig": {
 		"rate_limit":     true, // GORM relation
