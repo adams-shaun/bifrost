@@ -1,0 +1,282 @@
+From 61f4826ade2be049efca32a06cf52babe3233bdb Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 18 Jun 2026 00:37:01 -0600
+Subject: [PATCH] mt-discovery-via-tenant-runtime: 4 follow-up fixes for
+ end-to-end correctness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch19's original commit (453d1c0fc) routed ListModelsRequest through
+the tenant runtime — necessary but not sufficient. Live smoke testing
+on the bm cluster revealed four more cross-tenant data-corruption
+hazards along the same theme (process-shared state mutated by per-
+tenant admin writes). All four are fixed here as a single follow-up
+commit so the patch19 series ships end-to-end working.
+
+These are also what the live `bash booststrap.sh && curl -X POST
+/v1/chat/completions` test verifies — bare `qwen3.6-coder` now
+auto-resolves and dispatches successfully through the chain.
+
+Fix 1 — eager evict in attemptModelDiscovery
+---------------------------------------------
+transports/bifrost-http/handlers/providers.go::attemptModelDiscovery
+
+The multitenant.Manager caches per-tenant runtimes. When a key
+handler fires attemptModelDiscovery → ReloadProvider → BifrostFor,
+BifrostFor returns the CACHED runtime — built from a configstore
+snapshot taken BEFORE the just-POSTed key existed. So discovery
+ran against a key-less account → "no keys found" → catalog stays
+empty even though the DB has the key.
+
+The handler's `defer EvictTenant` fires at function exit, too late.
+Eager-evict inside attemptModelDiscovery (right after stamping the
+tenant on baseCtx) so the next BifrostFor rebuilds the runtime from
+a fresh DB snapshot that includes the just-POSTed key. The defer
+still runs at function exit and is harmless when called twice
+(Manager.Evict is a no-op when no runtime is cached).
+
+Fix 2 — same fix on reloadProviderAfterCreate
+---------------------------------------------
+transports/bifrost-http/handlers/providers.go::reloadProviderAfterCreate
+
+The provider-create path also called context.WithTimeout(
+context.Background(), ...) for its discovery call — dropping the
+tenant id. With no tenant in ctx, patch19's tid extraction in
+ReloadProvider falls back to "" → BifrostFor returns the ROOT
+client (defeating patch19). Mirror attemptModelDiscovery's pattern:
+preserve tenant from request ctx, eager-evict, then bound the
+timeout off the tenant-stamped base ctx.
+
+Fix 3 — cross-tenant-safe DeleteModelDataForProvider in RemoveProvider
+----------------------------------------------------------------------
+transports/bifrost-http/server/server.go::RemoveProvider
+
+When one tenant DELETEs a provider, server.go's RemoveProvider
+calls modelCatalog.DeleteModelDataForProvider(name) — a tenant-
+blind `delete(mc.modelPool, name)`. This wipes the catalog entry
+for every other tenant that shares the provider name. Their
+auto-resolve subsequently breaks because GetProvidersForModel
+intersects the catalog with c.Providers and finds no qwen entry.
+
+Check the configstore directly (with a context.Background() to
+bypass the GORM tenant scope) and skip DeleteModelDataForProvider
+when any other tenant still owns the provider name.
+
+Fix 4 — cross-tenant-safe in-memory map delete in lib.Config.RemoveProvider
+---------------------------------------------------------------------------
+transports/bifrost-http/lib/config.go::RemoveProvider
+
+Same shape as fix 3 but on `delete(c.Providers, provider)` — the
+shared in-memory provider map. GetProvidersForModel intersects the
+catalog against c.Providers; if c.Providers loses the entry, the
+intersection is empty and auto-resolve fails even with a populated
+catalog. Add the same "other tenants still own this name → preserve"
+guard before the in-memory delete.
+
+Fix 5 — skip UpsertModelData on discovery error for custom providers
+--------------------------------------------------------------------
+transports/bifrost-http/server/server.go::ReloadProvider
+
+The seeder's DELETE pass on a tenant deletes the provider's KEY
+first, then the provider. The key DELETE handler also fires
+attemptModelDiscovery → ReloadProvider → no keys → ListModels
+returns "no keys found" → bifrostErr set → upstream fallback zeros
+allModels → UpsertModelDataForProvider called with empty data.
+
+For built-in providers, the fallback "modelData empty → use
+providerModels from pricingData" leaves modelPool[p] populated
+(pricing has built-in providers). For custom providers, pricing
+has no entries → modelPool[p] = []. The wipe propagates to every
+other tenant via the shared modelPool. Skip the Upsert when
+bifrostErr is set AND isCustom — leave the catalog as-is so a
+previously-successful upsert from another tenant survives the
+key-DELETE side effect.
+
+Why these fixes belong in patch19
+---------------------------------
+All four share the same root cause patch19 addresses: process-shared
+state (manager runtime cache, in-memory provider map, catalog
+modelPool) mutated by per-tenant admin writes without per-tenant
+guards. Patch19's routing change alone makes discovery USE the
+tenant runtime, but doesn't stop other paths from clobbering that
+runtime's outputs in the shared catalog.
+
+Live smoke test result on the bm cluster
+----------------------------------------
+After this commit, with a clean seed:
+- shaun's qwen key status=success ✓
+- modelPool["qwen"] has qwen3.6-coder ✓ (filtered + unfiltered)
+- POST /v1/chat/completions with bare "qwen3.6-coder" + tenant
+  header succeeds end-to-end through vLLM ✓
+- All isolation assertions in the seeder still pass ✓
+
+NOT in scope
+------------
+The two boot-time loops (populateModelPoolWithListModels + the loop
+in RegisterAPIRoutes around line 1530) still iterate s.Config.Providers
+and use s.Client. They run BEFORE the seeder, so with patch18 A's
+default-exclusion they iterate an empty map → no-op. If a cluster
+boots with non-default tenants whose providers were loaded into
+the shared map, those loops would still have the cross-tenant
+issues. Best handled as a follow-up that either skips them in
+strict-MT mode or iterates tenants explicitly.
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ transports/bifrost-http/handlers/providers.go | 30 +++++++++++-
+ transports/bifrost-http/lib/config.go         | 24 ++++++++++
+ transports/bifrost-http/server/server.go      | 46 ++++++++++++++++++-
+ 3 files changed, 97 insertions(+), 3 deletions(-)
+
+diff --git a/transports/bifrost-http/handlers/providers.go b/transports/bifrost-http/handlers/providers.go
+index 093ba3a16..e09b586cf 100644
+--- a/transports/bifrost-http/handlers/providers.go
++++ b/transports/bifrost-http/handlers/providers.go
+@@ -1186,8 +1186,19 @@ func (h *ProviderHandler) listBaseModels(ctx *fasthttp.RequestCtx) {
+ 
+ // reloadProviderAfterCreate performs a single bounded runtime reload after provider creation.
+ // ReloadProvider also refreshes model discovery, so create should not invoke a second discovery pass.
++//
++// f5xc-overlay (patch19): preserve the tenant id from the request ctx into the timeout
++// context, same fix as attemptModelDiscovery — without it ReloadProvider can't extract
++// the tid and BifrostFor falls back to the root runtime (defeating patch19's whole point).
++// Also eager-evict before the reload so the tenant runtime gets rebuilt from a fresh DB
++// snapshot that includes the just-POSTed provider.
+ func (h *ProviderHandler) reloadProviderAfterCreate(ctx *fasthttp.RequestCtx, provider schemas.ModelProvider) error {
+-	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	baseCtx := context.Background()
++	if tid := TenantIDFromCtx(ctx); tid != "" {
++		baseCtx = context.WithValue(baseCtx, multitenant.BifrostContextKeyTenantID, tid)
++		EvictTenant(ctx)
++	}
++	ctxWithTimeout, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+ 	defer cancel()
+ 
+ 	_, err := h.modelsManager.ReloadProvider(ctxWithTimeout, provider)
+@@ -1215,6 +1226,23 @@ func (h *ProviderHandler) attemptModelDiscovery(ctx *fasthttp.RequestCtx, provid
+ 	baseCtx := context.Background()
+ 	if tid := TenantIDFromCtx(ctx); tid != "" {
+ 		baseCtx = context.WithValue(baseCtx, multitenant.BifrostContextKeyTenantID, tid)
++		// f5xc-overlay (patch19): synchronously evict the tenant runtime
++		// BEFORE discovery. ReloadProvider routes ListModelsRequest
++		// through the tenant runtime (patch19) — but the runtime is
++		// cached by multitenant.Manager, built lazily from a snapshot of
++		// the configstore at first Acquire. If the caller is the key
++		// create/update path (the common case for discovery), the just-
++		// POSTed key is in the DB but NOT in the cached runtime's
++		// StaticAccount. Calling EvictTenant here forces the next
++		// BifrostFor inside ReloadProvider to rebuild the runtime from
++		// a fresh DB read, so discovery sees the new key.
++		//
++		// The handler's `defer EvictTenant` still fires at function exit
++		// to cover the inference path that runs AFTER this discovery
++		// (so a follow-on inference also gets the freshest config); the
++		// double-evict is harmless (Manager.Evict is a no-op when no
++		// runtime is cached).
++		EvictTenant(ctx)
+ 	}
+ 	ctxWithTimeout, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+ 	defer cancel()
+diff --git a/transports/bifrost-http/lib/config.go b/transports/bifrost-http/lib/config.go
+index a5eaf5572..1c3ed462f 100644
+--- a/transports/bifrost-http/lib/config.go
++++ b/transports/bifrost-http/lib/config.go
+@@ -4554,6 +4554,30 @@ func (c *Config) RemoveProvider(ctx context.Context, provider schemas.ModelProvi
+ 	if _, exists := c.Providers[provider]; !exists {
+ 		return nil
+ 	}
++	// f5xc-overlay (patch19): the in-memory c.Providers map is keyed by
++	// provider name only — process-shared across tenants. A naive
++	// `delete(c.Providers, provider)` wipes the entry for ALL tenants
++	// when one tenant DELETEs a provider with a common name (e.g.
++	// "qwen"). The surviving tenants then lose their auto-resolve
++	// path because GetProvidersForModel intersects the catalog with
++	// c.Providers and finds the provider missing.
++	//
++	// Use a fresh background ctx so the GORM tenant-scope callback
++	// skips its WHERE predicate and we get a cross-tenant count.
++	// If any other tenant still owns this provider name in the DB,
++	// keep the in-memory entry; the per-tenant runtimes own the
++	// per-tenant config anyway, so the shared entry just needs to
++	// stay non-empty for auto-resolve to work.
++	if c.ConfigStore != nil && !skipDBUpdate {
++		var count int64
++		if err := c.ConfigStore.DB().WithContext(context.Background()).
++			Table("config_providers").
++			Where("name = ?", string(provider)).
++			Count(&count).Error; err == nil && count > 0 {
++			logger.Info("RemoveProvider: %d other tenant(s) still own provider %s; preserving shared in-memory entry", count, provider)
++			return nil
++		}
++	}
+ 	delete(c.Providers, provider)
+ 	logger.Info("Removed provider: %s", provider)
+ 	return nil
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 024dd76c8..8d7ccf74c 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -698,7 +698,22 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
+ 	// bare model IDs from OpenAI-compatible custom backends (e.g. vLLM
+ 	// returning {"id":"qwen3.6-coder"} rather than the prefixed form).
+ 	isCustom := providerInfo.CustomProviderConfig != nil
+-	s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys, isCustom)
++	// f5xc-overlay (patch19): skip the upsert entirely when discovery
++	// errored AND the provider is custom. Upstream's fallback (write
++	// empty modelData → modelPool[p] = providerModels-from-pricing)
++	// is harmless for built-in providers because pricing has entries
++	// for them. For custom providers it WIPES the catalog: pricing
++	// has no entries → providerModels=[] → modelPool[p]=[]. Multi-
++	// tenant deployments where one tenant's key DELETE triggers this
++	// fallback would then wipe the catalog for every other tenant
++	// that shares the provider name, breaking their auto-resolve.
++	// Better to leave the catalog as-is on error so a previously-
++	// successful upsert from another tenant survives.
++	if bifrostErr != nil && isCustom {
++		logger.Info("UpsertModelData skipped for custom provider %s (discovery errored): preserving prior catalog entry", provider)
++	} else {
++		s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys, isCustom)
++	}
+ 	if listModelsErr != nil {
+ 		if hasNoKeys {
+ 			logger.Warn("unfiltered model discovery skipped for provider %s: no keys configured", provider)
+@@ -731,7 +746,34 @@ func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas
+ 	if s.Config == nil || s.Config.ModelCatalog == nil {
+ 		return fmt.Errorf("pricing manager not found")
+ 	}
+-	s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
++	// f5xc-overlay (patch19): the catalog modelPool is process-global,
++	// keyed by provider name only. A naive DeleteModelDataForProvider
++	// wipes the entry for ALL tenants — so when one tenant DELETEs a
++	// provider whose name (e.g. "qwen") is also configured by other
++	// tenants, the surviving tenants lose their catalog entries and
++	// their auto-resolve breaks. Check the configstore directly (raw
++	// table, no tenant scope) to see if any other tenant still has the
++	// provider; only delete from the catalog when nobody does.
++	if s.Config.ConfigStore != nil {
++		var count int64
++		// .Table() rather than .Model() so the GORM tenant-scope
++		// callback (which keys off Statement.Schema) doesn't auto-add
++		// a WHERE tenant_id = ? predicate. We deliberately want the
++		// cross-tenant count.
++		if err := s.Config.ConfigStore.DB().WithContext(context.Background()).
++			Table("config_providers").
++			Where("name = ?", string(provider)).
++			Count(&count).Error; err != nil {
++			logger.Warn("RemoveProvider: failed to count surviving rows for %s; defaulting to delete-from-catalog: %v", provider, err)
++			s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
++		} else if count == 0 {
++			s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
++		} else {
++			logger.Info("RemoveProvider: %d other tenant(s) still own provider %s; preserving catalog entry", count, provider)
++		}
++	} else {
++		s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
++	}
+ 
+ 	return nil
+ }
+-- 
+2.51.0
+
