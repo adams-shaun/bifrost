@@ -698,7 +698,22 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 	// bare model IDs from OpenAI-compatible custom backends (e.g. vLLM
 	// returning {"id":"qwen3.6-coder"} rather than the prefixed form).
 	isCustom := providerInfo.CustomProviderConfig != nil
-	s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys, isCustom)
+	// f5xc-overlay (patch19): skip the upsert entirely when discovery
+	// errored AND the provider is custom. Upstream's fallback (write
+	// empty modelData → modelPool[p] = providerModels-from-pricing)
+	// is harmless for built-in providers because pricing has entries
+	// for them. For custom providers it WIPES the catalog: pricing
+	// has no entries → providerModels=[] → modelPool[p]=[]. Multi-
+	// tenant deployments where one tenant's key DELETE triggers this
+	// fallback would then wipe the catalog for every other tenant
+	// that shares the provider name, breaking their auto-resolve.
+	// Better to leave the catalog as-is on error so a previously-
+	// successful upsert from another tenant survives.
+	if bifrostErr != nil && isCustom {
+		logger.Info("UpsertModelData skipped for custom provider %s (discovery errored): preserving prior catalog entry", provider)
+	} else {
+		s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys, isCustom)
+	}
 	if listModelsErr != nil {
 		if hasNoKeys {
 			logger.Warn("unfiltered model discovery skipped for provider %s: no keys configured", provider)
@@ -731,7 +746,34 @@ func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas
 	if s.Config == nil || s.Config.ModelCatalog == nil {
 		return fmt.Errorf("pricing manager not found")
 	}
-	s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
+	// f5xc-overlay (patch19): the catalog modelPool is process-global,
+	// keyed by provider name only. A naive DeleteModelDataForProvider
+	// wipes the entry for ALL tenants — so when one tenant DELETEs a
+	// provider whose name (e.g. "qwen") is also configured by other
+	// tenants, the surviving tenants lose their catalog entries and
+	// their auto-resolve breaks. Check the configstore directly (raw
+	// table, no tenant scope) to see if any other tenant still has the
+	// provider; only delete from the catalog when nobody does.
+	if s.Config.ConfigStore != nil {
+		var count int64
+		// .Table() rather than .Model() so the GORM tenant-scope
+		// callback (which keys off Statement.Schema) doesn't auto-add
+		// a WHERE tenant_id = ? predicate. We deliberately want the
+		// cross-tenant count.
+		if err := s.Config.ConfigStore.DB().WithContext(context.Background()).
+			Table("config_providers").
+			Where("name = ?", string(provider)).
+			Count(&count).Error; err != nil {
+			logger.Warn("RemoveProvider: failed to count surviving rows for %s; defaulting to delete-from-catalog: %v", provider, err)
+			s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
+		} else if count == 0 {
+			s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
+		} else {
+			logger.Info("RemoveProvider: %d other tenant(s) still own provider %s; preserving catalog entry", count, provider)
+		}
+	} else {
+		s.Config.ModelCatalog.DeleteModelDataForProvider(provider)
+	}
 
 	return nil
 }

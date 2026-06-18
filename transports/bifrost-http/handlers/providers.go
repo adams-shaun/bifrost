@@ -1186,8 +1186,19 @@ func (h *ProviderHandler) listBaseModels(ctx *fasthttp.RequestCtx) {
 
 // reloadProviderAfterCreate performs a single bounded runtime reload after provider creation.
 // ReloadProvider also refreshes model discovery, so create should not invoke a second discovery pass.
+//
+// f5xc-overlay (patch19): preserve the tenant id from the request ctx into the timeout
+// context, same fix as attemptModelDiscovery — without it ReloadProvider can't extract
+// the tid and BifrostFor falls back to the root runtime (defeating patch19's whole point).
+// Also eager-evict before the reload so the tenant runtime gets rebuilt from a fresh DB
+// snapshot that includes the just-POSTed provider.
 func (h *ProviderHandler) reloadProviderAfterCreate(ctx *fasthttp.RequestCtx, provider schemas.ModelProvider) error {
-	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	baseCtx := context.Background()
+	if tid := TenantIDFromCtx(ctx); tid != "" {
+		baseCtx = context.WithValue(baseCtx, multitenant.BifrostContextKeyTenantID, tid)
+		EvictTenant(ctx)
+	}
+	ctxWithTimeout, cancel := context.WithTimeout(baseCtx, 15*time.Second)
 	defer cancel()
 
 	_, err := h.modelsManager.ReloadProvider(ctxWithTimeout, provider)
@@ -1215,6 +1226,23 @@ func (h *ProviderHandler) attemptModelDiscovery(ctx *fasthttp.RequestCtx, provid
 	baseCtx := context.Background()
 	if tid := TenantIDFromCtx(ctx); tid != "" {
 		baseCtx = context.WithValue(baseCtx, multitenant.BifrostContextKeyTenantID, tid)
+		// f5xc-overlay (patch19): synchronously evict the tenant runtime
+		// BEFORE discovery. ReloadProvider routes ListModelsRequest
+		// through the tenant runtime (patch19) — but the runtime is
+		// cached by multitenant.Manager, built lazily from a snapshot of
+		// the configstore at first Acquire. If the caller is the key
+		// create/update path (the common case for discovery), the just-
+		// POSTed key is in the DB but NOT in the cached runtime's
+		// StaticAccount. Calling EvictTenant here forces the next
+		// BifrostFor inside ReloadProvider to rebuild the runtime from
+		// a fresh DB read, so discovery sees the new key.
+		//
+		// The handler's `defer EvictTenant` still fires at function exit
+		// to cover the inference path that runs AFTER this discovery
+		// (so a follow-on inference also gets the freshest config); the
+		// double-evict is harmless (Manager.Evict is a no-op when no
+		// runtime is cached).
+		EvictTenant(ctx)
 	}
 	ctxWithTimeout, cancel := context.WithTimeout(baseCtx, 15*time.Second)
 	defer cancel()

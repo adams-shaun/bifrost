@@ -4554,6 +4554,30 @@ func (c *Config) RemoveProvider(ctx context.Context, provider schemas.ModelProvi
 	if _, exists := c.Providers[provider]; !exists {
 		return nil
 	}
+	// f5xc-overlay (patch19): the in-memory c.Providers map is keyed by
+	// provider name only — process-shared across tenants. A naive
+	// `delete(c.Providers, provider)` wipes the entry for ALL tenants
+	// when one tenant DELETEs a provider with a common name (e.g.
+	// "qwen"). The surviving tenants then lose their auto-resolve
+	// path because GetProvidersForModel intersects the catalog with
+	// c.Providers and finds the provider missing.
+	//
+	// Use a fresh background ctx so the GORM tenant-scope callback
+	// skips its WHERE predicate and we get a cross-tenant count.
+	// If any other tenant still owns this provider name in the DB,
+	// keep the in-memory entry; the per-tenant runtimes own the
+	// per-tenant config anyway, so the shared entry just needs to
+	// stay non-empty for auto-resolve to work.
+	if c.ConfigStore != nil && !skipDBUpdate {
+		var count int64
+		if err := c.ConfigStore.DB().WithContext(context.Background()).
+			Table("config_providers").
+			Where("name = ?", string(provider)).
+			Count(&count).Error; err == nil && count > 0 {
+			logger.Info("RemoveProvider: %d other tenant(s) still own provider %s; preserving shared in-memory entry", count, provider)
+			return nil
+		}
+	}
 	delete(c.Providers, provider)
 	logger.Info("Removed provider: %s", provider)
 	return nil
