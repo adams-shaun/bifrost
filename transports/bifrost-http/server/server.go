@@ -615,6 +615,32 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 	bfCtx.SetValue(schemas.BifrostContextKeyValidateKeys, true) // Validate keys during provider add/update
 	defer bfCtx.Cancel()
 
+	// f5xc-overlay (patch19): route ListModelsRequest through the
+	// tenant runtime instead of the root bifrost client. The root
+	// client's account reads the shared in-memory c.Providers map,
+	// which is keyed by provider name only and gets clobbered
+	// cross-tenant on every admin write — making discovery against
+	// the root client fail with "no keys found for provider X" for
+	// whichever tenant didn't write last. The per-tenant runtime
+	// (multitenant.Manager) is built from a tenant-scoped
+	// StaticAccount via TenantLoader, so its account has the right
+	// keys + URL by construction.
+	//
+	// Single-tenant fallback: BifrostFor returns s.Client + a no-op
+	// release when the ctx has no tenant id, preserving OSS behaviour
+	// unchanged. Pairs with patch18 subfix B2 which preserves the
+	// tenant id from the request ctx through attemptModelDiscovery's
+	// timeout-wrapping — without B2 the tid would be empty here and
+	// we'd fall back to the root runtime anyway.
+	tid := ""
+	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
+		if s, ok := v.(string); ok {
+			tid = s
+		}
+	}
+	bfClient, release := s.BifrostFor(ctx, tid)
+	defer release()
+
 	// Run filtered and unfiltered model listing concurrently
 	var (
 		allModels        *schemas.BifrostListModelsResponse
@@ -626,13 +652,13 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 	listWg.Add(2)
 	go func() {
 		defer listWg.Done()
-		allModels, bifrostErr = s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
+		allModels, bifrostErr = bfClient.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
 			Provider: provider,
 		})
 	}()
 	go func() {
 		defer listWg.Done()
-		unfilteredModels, listModelsErr = s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
+		unfilteredModels, listModelsErr = bfClient.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
 			Provider:   provider,
 			Unfiltered: true,
 		})
