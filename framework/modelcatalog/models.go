@@ -308,8 +308,22 @@ func (mc *ModelCatalog) DeleteModelDataForProvider(provider schemas.ModelProvide
 	delete(mc.unfilteredModelPool, provider)
 }
 
-// UpsertModelDataForProvider upserts model data for a given provider
-func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse, allowedModels []schemas.Model) {
+// UpsertModelDataForProvider upserts model data for a given provider.
+//
+// f5xc-overlay (patch17): isCustom signals that `provider` is a custom
+// OpenAI-compatible backend (e.g. vLLM). Upstream's filter assumes
+// every model.ID returned by /v1/models is in `provider/model` shape,
+// which is true for the bundled providers (openai, anthropic, etc.)
+// because their pricing-data drives the catalog and the discovery
+// responses are normalised at the SDK layer. Custom backends like
+// vLLM return BARE IDs (e.g. {"id":"qwen3.6-coder"}), which the
+// upstream filter then drops as "wrong provider" — so the catalog
+// stays empty and auto-resolve at /v1/chat/completions returns
+// "no providers found for model X". When isCustom is true, we accept
+// bare IDs as belonging to the queried `provider`.
+//
+// All non-f5xc call paths pass isCustom=false → behaviour unchanged.
+func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse, allowedModels []schemas.Model, isCustom bool) {
 	if modelData == nil {
 		return
 	}
@@ -362,7 +376,12 @@ func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvide
 	for _, model := range modelData.Data {
 		parsedProvider, parsedModel := schemas.ParseModelString(model.ID, "")
 		if parsedProvider != provider {
-			continue
+			// f5xc-overlay (patch17): bare ID + custom backend → accept
+			// as belonging to the queried provider. See function header
+			// for the rationale.
+			if !(isCustom && parsedProvider == "") {
+				continue
+			}
 		}
 		if !seenModels[parsedModel] {
 			seenModels[parsedModel] = true
@@ -381,8 +400,10 @@ func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvide
 	mc.modelPool[provider] = finalModelList
 }
 
-// UpsertUnfilteredModelDataForProvider upserts unfiltered model data for a given provider
-func (mc *ModelCatalog) UpsertUnfilteredModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse) {
+// UpsertUnfilteredModelDataForProvider upserts unfiltered model data for a given provider.
+// See UpsertModelDataForProvider for the f5xc-overlay (patch17) bare-ID handling on
+// custom backends — same fix applies here.
+func (mc *ModelCatalog) UpsertUnfilteredModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse, isCustom bool) {
 	if modelData == nil {
 		return
 	}
@@ -405,7 +426,10 @@ func (mc *ModelCatalog) UpsertUnfilteredModelDataForProvider(provider schemas.Mo
 	for _, model := range modelData.Data {
 		parsedProvider, parsedModel := schemas.ParseModelString(model.ID, "")
 		if parsedProvider != provider {
-			continue
+			// f5xc-overlay (patch17): bare ID + custom backend.
+			if !(isCustom && parsedProvider == "") {
+				continue
+			}
 		}
 		if !seenModels[parsedModel] {
 			seenModels[parsedModel] = true

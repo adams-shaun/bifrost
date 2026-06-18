@@ -661,7 +661,11 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 			})
 		}
 	}
-	s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys)
+	// f5xc-overlay (patch17): pass isCustom so the upsert filter accepts
+	// bare model IDs from OpenAI-compatible custom backends (e.g. vLLM
+	// returning {"id":"qwen3.6-coder"} rather than the prefixed form).
+	isCustom := providerInfo.CustomProviderConfig != nil
+	s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys, isCustom)
 	if listModelsErr != nil {
 		if hasNoKeys {
 			logger.Warn("unfiltered model discovery skipped for provider %s: no keys configured", provider)
@@ -669,7 +673,7 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 			logger.Error("failed to list unfiltered models for provider %s: %v: falling back onto the static datasheet", provider, bifrost.GetErrorMessage(listModelsErr))
 		}
 	} else {
-		s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModels)
+		s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModels, isCustom)
 	}
 	return updatedProvider, nil
 }
@@ -890,7 +894,9 @@ func (s *BifrostHTTPServer) populateModelPoolWithListModels(ctx context.Context)
 					})
 				}
 			}
-			s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels)
+			// f5xc-overlay (patch17): see updateProvider for context.
+			isCustom := providerConfig.CustomProviderConfig != nil
+			s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels, isCustom)
 			unfilteredModelData, listModelsErr := s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
 				Provider:   provider,
 				Unfiltered: true,
@@ -898,7 +904,7 @@ func (s *BifrostHTTPServer) populateModelPoolWithListModels(ctx context.Context)
 			if listModelsErr != nil {
 				logger.Error("failed to list unfiltered models for provider %s: %v: falling back onto the static datasheet", provider, bifrost.GetErrorMessage(listModelsErr))
 			} else {
-				s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData)
+				s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData, isCustom)
 			}
 		}(provider, providerConfig)
 	}
@@ -1134,8 +1140,26 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
 	// just stamped.
 	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
 	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
+	// f5xc-overlay (patch17): inference-path strictness. When
+	// BIFROST_STRICT_TENANT_ROUTING is set, requests with no or
+	// unknown x-f5xc-tenant header are rejected 401/404 BEFORE the
+	// dispatcher silently routes them to the root runtime. Default
+	// (unset) → no-op middleware, OSS callflow unchanged. Mounted on
+	// the inference chain only; admin chain (RegisterAPIRoutes) is
+	// intentionally not gated so the platform tenants surface still
+	// works for first-tenant bootstrap.
+	strictRouting := envBool("BIFROST_STRICT_TENANT_ROUTING")
+	var strictMW schemas.BifrostHTTPMiddleware
+	if strictRouting {
+		strictMW = handlers.TenantStrictRoutingMiddleware(
+			&handlers.ConfigStoreTenantValidator{Store: s.Config.ConfigStore},
+			true,
+		)
+	} else {
+		strictMW = handlers.TenantStrictRoutingMiddleware(nil, false)
+	}
 	dispatchMW := handlers.TenantDispatcherMiddleware(s)
-	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW, dispatchMW}, middlewares...)
+	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW, strictMW, dispatchMW}, middlewares...)
 	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
 	inferenceHandler.RegisterRoutes(s.Router, chained...)
 	asyncHandler.RegisterRoutes(s.Router, chained...)
@@ -1504,7 +1528,9 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 						})
 					}
 				}
-				s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels)
+				// f5xc-overlay (patch17): see updateProvider for context.
+				isCustom := providerConfig.CustomProviderConfig != nil
+				s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels, isCustom)
 				unfilteredModelData, listModelsErr := s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
 					Provider:   provider,
 					Unfiltered: true,
@@ -1512,7 +1538,7 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 				if listModelsErr != nil {
 					logger.Error("failed to list unfiltered models for provider %s: %v: falling back onto the static datasheet", provider, bifrost.GetErrorMessage(listModelsErr))
 				} else {
-					s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData)
+					s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData, isCustom)
 				}
 			}(provider, providerConfig)
 		}
