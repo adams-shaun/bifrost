@@ -1,0 +1,744 @@
+From 6a08eef5166cfb68ec3cf6402a08201dcb270447 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Wed, 17 Jun 2026 21:13:11 -0600
+Subject: [PATCH] mt-customprovider-and-strict-routing: catalog bare-ID +
+ inference reject
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two narrowly-scoped fixes that together close the custom-provider
+inference story for the f5xc multi-tenant overlay. Both surfaced
+during the qwen3.6-coder / opencode trace earlier in the audit
+(see docs/multi-tenant-f5/12-configstore-tenant-audit.md is the
+broader gap-list).
+
+Subfix B — Catalog upsert: accept bare model IDs for custom providers
+----------------------------------------------------------------------
+framework/modelcatalog/models.go::UpsertModelDataForProvider (and the
+sibling UpsertUnfilteredModelDataForProvider) calls ParseModelString
+on every model.ID returned by the provider's /v1/models discovery
+response. Upstream's filter requires the parsed provider to equal the
+queried provider — which means model.ID MUST have an "<provider>/"
+prefix, OR the provider must already be registered as known AND the
+prefix is the provider's own name.
+
+vLLM and OpenAI-compatible custom backends return BARE IDs
+(e.g. {"id":"qwen3.6-coder"}). The upstream filter then drops them
+all as "wrong provider", so the catalog stays empty for the custom
+provider and auto-resolve at /v1/chat/completions returns
+  "no providers found for model X in model catalog to auto-resolve"
+even though discovery succeeded and the provider is well-configured.
+
+Fix: add an isCustom bool parameter to UpsertModelDataForProvider /
+UpsertUnfilteredModelDataForProvider. When isCustom is true AND the
+parsed provider is empty (bare ID, OR a "/" but provider not known to
+ParseModelString), accept the model.ID as belonging to the queried
+provider. All non-f5xc call paths pass isCustom=false → upstream
+behaviour unchanged for the bundled providers.
+
+All six call sites in transports/bifrost-http/server/server.go updated
+to pass providerInfo.CustomProviderConfig != nil. Governance test
+updated for the new arity.
+
+Subfix A — Inference path: strict tenant-header rejection (env-gated)
+----------------------------------------------------------------------
+Without strict mode, an inference request whose x-f5xc-tenant header
+doesn't resolve to a configured tenant falls through to the root
+runtime — Manager.Acquire's loader happily returns an empty-but-valid
+BifrostConfig for unknown tids (see server/multitenant.go's
+newTenantLoader). That fall-through is correct for OSS single-tenant
+callflows but lets MT deployments quietly answer requests against
+the wrong runtime when callers mis-type or forget the header.
+
+New env var BIFROST_STRICT_TENANT_ROUTING (default false → no
+behavioural change). When set, a new middleware mounted in the
+inference chain BETWEEN TenantResolverMiddleware and
+TenantDispatcherMiddleware fast-fails inference requests:
+
+  - header absent           → 401 ("header required")
+  - header set but unknown  → 404 ("tenant X not found")
+  - validator lookup error  → 503 ("tenant lookup failed")
+  - default tenant          → short-circuit, no DB hit, pass through
+
+The middleware lives at handlers/tenant_strict_routing.go and is
+mounted only on the inference chain (server.go::RegisterInferenceRoutes
+~line 1145). The admin chain is intentionally not gated so the
+platform tenants surface still works for first-tenant bootstrap.
+
+Tests
+-----
+- framework/modelcatalog/models_custom_provider_test.go — locks the
+  bare-ID truth table for both isCustom=true and =false paths, plus
+  an end-to-end test that asserts GetProvidersForModel("qwen3.6-coder")
+  returns ["qwen"] after upserting bare IDs (proves auto-resolve
+  works for custom providers).
+- transports/bifrost-http/handlers/tenant_strict_routing_test.go —
+  covers the 4-quadrant truth table (strict on/off × header
+  present/absent/known/unknown/default), the validator-error 503
+  path, and the strict-without-validator panic guard.
+
+Both test files pass under `go test -race`.
+
+Bugs we DELIBERATELY did NOT fix in this patch
+----------------------------------------------
+Bug 1 from the earlier audit ("discovery doesn't fire after key add")
+turned out to be a false positive — the re-trigger via
+handlers.ProviderHandler.attemptModelDiscovery already happens on
+createProviderKey / updateProviderKey / deleteProviderKey /
+updateProvider in upstream. The "no keys configured" warnings we
+chased were just the FIRST-attempt log at provider creation time;
+the subsequent key POST re-fires discovery, which then failed only
+because of the bad URL in the seeder's qwen base_url (fixed
+separately on the go-bifrost-ai seeder repo).
+
+Depends on patches 1, 2, 3, 4, 7 (multitenant package + tenant_id
+columns + resolver middleware + dispatcher middleware + runtime
+isolation).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/modelcatalog/models.go              |  36 +++-
+ .../models_custom_provider_test.go            | 134 ++++++++++++++
+ .../governance/httptransportprehook_test.go   |   2 +-
+ .../handlers/tenant_strict_routing.go         | 131 +++++++++++++
+ .../handlers/tenant_strict_routing_test.go    | 172 ++++++++++++++++++
+ transports/bifrost-http/server/server.go      |  40 +++-
+ 6 files changed, 501 insertions(+), 14 deletions(-)
+ create mode 100644 framework/modelcatalog/models_custom_provider_test.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_strict_routing.go
+ create mode 100644 transports/bifrost-http/handlers/tenant_strict_routing_test.go
+
+diff --git a/framework/modelcatalog/models.go b/framework/modelcatalog/models.go
+index e1f32473a..d4fe1c634 100644
+--- a/framework/modelcatalog/models.go
++++ b/framework/modelcatalog/models.go
+@@ -308,8 +308,22 @@ func (mc *ModelCatalog) DeleteModelDataForProvider(provider schemas.ModelProvide
+ 	delete(mc.unfilteredModelPool, provider)
+ }
+ 
+-// UpsertModelDataForProvider upserts model data for a given provider
+-func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse, allowedModels []schemas.Model) {
++// UpsertModelDataForProvider upserts model data for a given provider.
++//
++// f5xc-overlay (patch17): isCustom signals that `provider` is a custom
++// OpenAI-compatible backend (e.g. vLLM). Upstream's filter assumes
++// every model.ID returned by /v1/models is in `provider/model` shape,
++// which is true for the bundled providers (openai, anthropic, etc.)
++// because their pricing-data drives the catalog and the discovery
++// responses are normalised at the SDK layer. Custom backends like
++// vLLM return BARE IDs (e.g. {"id":"qwen3.6-coder"}), which the
++// upstream filter then drops as "wrong provider" — so the catalog
++// stays empty and auto-resolve at /v1/chat/completions returns
++// "no providers found for model X". When isCustom is true, we accept
++// bare IDs as belonging to the queried `provider`.
++//
++// All non-f5xc call paths pass isCustom=false → behaviour unchanged.
++func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse, allowedModels []schemas.Model, isCustom bool) {
+ 	if modelData == nil {
+ 		return
+ 	}
+@@ -362,7 +376,12 @@ func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvide
+ 	for _, model := range modelData.Data {
+ 		parsedProvider, parsedModel := schemas.ParseModelString(model.ID, "")
+ 		if parsedProvider != provider {
+-			continue
++			// f5xc-overlay (patch17): bare ID + custom backend → accept
++			// as belonging to the queried provider. See function header
++			// for the rationale.
++			if !(isCustom && parsedProvider == "") {
++				continue
++			}
+ 		}
+ 		if !seenModels[parsedModel] {
+ 			seenModels[parsedModel] = true
+@@ -381,8 +400,10 @@ func (mc *ModelCatalog) UpsertModelDataForProvider(provider schemas.ModelProvide
+ 	mc.modelPool[provider] = finalModelList
+ }
+ 
+-// UpsertUnfilteredModelDataForProvider upserts unfiltered model data for a given provider
+-func (mc *ModelCatalog) UpsertUnfilteredModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse) {
++// UpsertUnfilteredModelDataForProvider upserts unfiltered model data for a given provider.
++// See UpsertModelDataForProvider for the f5xc-overlay (patch17) bare-ID handling on
++// custom backends — same fix applies here.
++func (mc *ModelCatalog) UpsertUnfilteredModelDataForProvider(provider schemas.ModelProvider, modelData *schemas.BifrostListModelsResponse, isCustom bool) {
+ 	if modelData == nil {
+ 		return
+ 	}
+@@ -405,7 +426,10 @@ func (mc *ModelCatalog) UpsertUnfilteredModelDataForProvider(provider schemas.Mo
+ 	for _, model := range modelData.Data {
+ 		parsedProvider, parsedModel := schemas.ParseModelString(model.ID, "")
+ 		if parsedProvider != provider {
+-			continue
++			// f5xc-overlay (patch17): bare ID + custom backend.
++			if !(isCustom && parsedProvider == "") {
++				continue
++			}
+ 		}
+ 		if !seenModels[parsedModel] {
+ 			seenModels[parsedModel] = true
+diff --git a/framework/modelcatalog/models_custom_provider_test.go b/framework/modelcatalog/models_custom_provider_test.go
+new file mode 100644
+index 000000000..e08687f70
+--- /dev/null
++++ b/framework/modelcatalog/models_custom_provider_test.go
+@@ -0,0 +1,134 @@
++// f5xc-overlay (patch17): tests for the bare-ID handling on custom
++// providers in UpsertModelDataForProvider /
++// UpsertUnfilteredModelDataForProvider.
++//
++// Truth table the tests lock in:
++//
++//   model.ID shape          isCustom=false (upstream)  isCustom=true (f5xc)
++//   "openai/gpt-4o"         accepted under "openai"    accepted under "openai"
++//   "qwen3.6-coder" (bare)  DROPPED                    accepted under provider
++//   "qwen/qwen3.6-coder"    accepted under "qwen"      accepted under "qwen"
++//
++// The "isCustom=false drops bare IDs" row is the upstream behaviour we
++// MUST preserve — calling code that doesn't know to set the flag (or
++// is wired against the upstream-pinned framework module via the SDK
++// repo) sees identical semantics.
++
++package modelcatalog
++
++import (
++	"testing"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++func TestUpsertModelDataForProvider_CustomProvider_AcceptsBareID(t *testing.T) {
++	mc := NewTestCatalog(nil)
++	provider := schemas.ModelProvider("qwen")
++
++	mc.UpsertModelDataForProvider(provider, &schemas.BifrostListModelsResponse{
++		Data: []schemas.Model{
++			{ID: "qwen3.6-coder"}, // vLLM-style bare id
++			{ID: "qwen3.6-coder-instruct"},
++		},
++	}, nil, true /* isCustom */)
++
++	got := mc.GetModelsForProvider(provider)
++	want := map[string]bool{"qwen3.6-coder": true, "qwen3.6-coder-instruct": true}
++	if len(got) != len(want) {
++		t.Fatalf("want %d models, got %d (%v)", len(want), len(got), got)
++	}
++	for _, m := range got {
++		if !want[m] {
++			t.Fatalf("unexpected model in catalog: %q (want %v)", m, want)
++		}
++	}
++}
++
++func TestUpsertModelDataForProvider_NonCustomProvider_DropsBareID(t *testing.T) {
++	// Regression guard: when isCustom=false (upstream call path), bare
++	// IDs MUST still be filtered out. Otherwise we'd change upstream
++	// semantics for built-in providers.
++	mc := NewTestCatalog(nil)
++	provider := schemas.ModelProvider("openai")
++
++	mc.UpsertModelDataForProvider(provider, &schemas.BifrostListModelsResponse{
++		Data: []schemas.Model{
++			{ID: "should-be-dropped-because-no-prefix"},
++			{ID: "openai/gpt-4o"},
++		},
++	}, nil, false /* isCustom — upstream caller */)
++
++	got := mc.GetModelsForProvider(provider)
++	if len(got) != 1 || got[0] != "gpt-4o" {
++		t.Fatalf("want exactly [gpt-4o], got %v", got)
++	}
++}
++
++func TestUpsertModelDataForProvider_CustomProvider_PrefixedIDStillWorks(t *testing.T) {
++	// If a custom backend happens to return prefixed IDs (some proxies
++	// do), the isCustom branch should not regress that path.
++	//
++	// Important: in production, schemas.RegisterKnownProvider("qwen") is
++	// called by core/bifrost.go::prepareProvider when the custom
++	// provider is added (upstream commit 60072820f7), so ParseModelString
++	// learns to split on "qwen/". We mirror that here so the test
++	// exercises the same path real traffic does.
++	schemas.RegisterKnownProvider("qwen")
++	defer schemas.UnregisterKnownProvider("qwen")
++
++	mc := NewTestCatalog(nil)
++	provider := schemas.ModelProvider("qwen")
++
++	mc.UpsertModelDataForProvider(provider, &schemas.BifrostListModelsResponse{
++		Data: []schemas.Model{
++			{ID: "qwen/qwen3.6-coder"},
++		},
++	}, nil, true)
++
++	got := mc.GetModelsForProvider(provider)
++	if len(got) != 1 || got[0] != "qwen3.6-coder" {
++		t.Fatalf("want [qwen3.6-coder], got %v", got)
++	}
++}
++
++func TestUpsertUnfilteredModelDataForProvider_CustomProvider_AcceptsBareID(t *testing.T) {
++	// Same fix on the unfiltered path — covered separately because
++	// the unfiltered upsert is a sibling function that previously had
++	// the identical filter bug.
++	mc := NewTestCatalog(nil)
++	provider := schemas.ModelProvider("qwen")
++
++	mc.UpsertUnfilteredModelDataForProvider(provider, &schemas.BifrostListModelsResponse{
++		Data: []schemas.Model{
++			{ID: "qwen3.6-coder"},
++		},
++	}, true /* isCustom */)
++
++	got := mc.unfilteredModelPool[provider]
++	if len(got) != 1 || got[0] != "qwen3.6-coder" {
++		t.Fatalf("unfiltered: want [qwen3.6-coder], got %v", got)
++	}
++}
++
++func TestGetProvidersForModel_AfterCustomProviderUpsert(t *testing.T) {
++	// End-to-end of the bug-2 chain: bare ID arrives via discovery,
++	// gets accepted under the custom provider, and GetProvidersForModel
++	// returns the provider when queried with the bare name. This is the
++	// path that resolveModelAndProvider walks on /v1/chat/completions,
++	// so this test proves auto-resolve works for custom providers once
++	// the catalog has been populated.
++	mc := NewTestCatalog(nil)
++	provider := schemas.ModelProvider("qwen")
++
++	mc.UpsertModelDataForProvider(provider, &schemas.BifrostListModelsResponse{
++		Data: []schemas.Model{
++			{ID: "qwen3.6-coder"},
++		},
++	}, nil, true)
++
++	got := mc.GetProvidersForModel("qwen3.6-coder")
++	if len(got) != 1 || got[0] != provider {
++		t.Fatalf("auto-resolve: want [qwen], got %v", got)
++	}
++}
+diff --git a/plugins/governance/httptransportprehook_test.go b/plugins/governance/httptransportprehook_test.go
+index 2fae3a224..702bada0a 100644
+--- a/plugins/governance/httptransportprehook_test.go
++++ b/plugins/governance/httptransportprehook_test.go
+@@ -24,7 +24,7 @@ func TestHTTPTransportPreHook_VirtualKeyReplicateRefinesNestedModel(t *testing.T
+ 		Data: []schemas.Model{
+ 			{ID: "replicate/openai/gpt-5-nano"},
+ 		},
+-	}, nil)
++	}, nil, false)
+ 
+ 	virtualKey := buildVirtualKeyWithProviders(
+ 		"vk1",
+diff --git a/transports/bifrost-http/handlers/tenant_strict_routing.go b/transports/bifrost-http/handlers/tenant_strict_routing.go
+new file mode 100644
+index 000000000..74c5940c2
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_strict_routing.go
+@@ -0,0 +1,131 @@
++// Package handlers — tenant_strict_routing.go.
++//
++// f5xc-overlay (patch17): inference-path strictness gate.
++//
++// Without this middleware, an inference request with no `x-f5xc-tenant`
++// header falls through to the root runtime, and a header carrying an
++// id that doesn't resolve to a configured tenant ALSO falls through
++// (because Manager.Acquire's loader returns an empty-but-valid
++// BifrostConfig for unknown tids — see server/multitenant.go's
++// newTenantLoader). The fall-through is correct for OSS single-tenant
++// callflows but lets multi-tenant deployments quietly answer requests
++// against the wrong runtime when callers mis-type the header or forget
++// it entirely.
++//
++// When the BIFROST_STRICT_TENANT_ROUTING env var is set, this
++// middleware fast-fails inference requests under either condition:
++//
++//   - header absent           → 401 (with a clear "header required")
++//   - header set but unknown  → 404 ("tenant not found")
++//
++// Mount AFTER TenantResolverMiddleware (which stamps the header value
++// on ctx) and BEFORE TenantDispatcherMiddleware (which routes to the
++// per-tenant runtime). Mount ONLY on the inference chain — admin
++// chains use a different mounting at server.go::RegisterAPIRoutes
++// and intentionally don't gate on tenant presence (the platform
++// /api/tenants/* admin surface needs to operate without a header to
++// bootstrap the first non-default tenant).
++//
++// When the env var is unset (the default), the middleware is a no-op
++// — every callflow that worked yesterday still works today.
++package handlers
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/framework/configstore"
++	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// TenantValidator answers "does this tenant id exist?" The interface
++// (vs. a concrete configstore handle) keeps the middleware testable
++// without spinning a sqlite DB in tests.
++//
++// Implementations MUST be safe for concurrent use.
++type TenantValidator interface {
++	// TenantExists returns true when tid resolves to a configured
++	// tenant. Returns (false, nil) for "doesn't exist". A non-nil
++	// error is a lookup failure (DB unreachable, etc.); the middleware
++	// treats it as 503 rather than 404 so operators can distinguish.
++	TenantExists(ctx context.Context, tid string) (bool, error)
++}
++
++// ConfigStoreTenantValidator adapts a configstore.ConfigStore (which
++// has DB access) into a TenantValidator. The lookup is a plain
++// `SELECT 1 FROM tenants WHERE id = ?` via GORM. Cheap; no caching
++// at this layer — if production traffic ever shows the lookup as a
++// hot spot, layer a sync.Map cache invalidated by the tenant CREATE/
++// DELETE handlers (platform_tenants.go).
++type ConfigStoreTenantValidator struct {
++	Store configstore.ConfigStore
++}
++
++// TenantExists checks the tenants table directly.
++func (v *ConfigStoreTenantValidator) TenantExists(ctx context.Context, tid string) (bool, error) {
++	// The default tenant always exists (seeded). Short-circuit FIRST so
++	// a request landing on /v1/* with x-f5xc-tenant: default skips the
++	// DB hit entirely — and so the short-circuit still works in test
++	// harnesses that wire a nil configstore.
++	if tid == string(multitenant.DefaultTenantID) {
++		return true, nil
++	}
++	if v == nil || v.Store == nil {
++		return false, fmt.Errorf("nil configstore")
++	}
++	var row configstoreTables.TableTenant
++	err := v.Store.DB().WithContext(ctx).Select("id").Where("id = ?", tid).First(&row).Error
++	if err != nil {
++		if errors.Is(err, configstore.ErrNotFound) {
++			return false, nil
++		}
++		return false, err
++	}
++	return true, nil
++}
++
++// TenantStrictRoutingMiddleware enforces tenant-header strictness on
++// the inference chain when strictMode is true. When strictMode is
++// false the middleware is a no-op (zero overhead per request) so OSS
++// single-tenant deployments are unaffected.
++//
++// The validator MUST be non-nil when strictMode is true. Pass
++// (nil, false) to disable; pass a real validator + true to enforce.
++func TenantStrictRoutingMiddleware(validator TenantValidator, strictMode bool) schemas.BifrostHTTPMiddleware {
++	if !strictMode {
++		return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++			return next
++		}
++	}
++	if validator == nil {
++		// Defensive: strictMode without a validator would silently
++		// reject every request. Fail loud at construction.
++		panic("handlers: TenantStrictRoutingMiddleware: strictMode=true requires a non-nil validator")
++	}
++	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
++		return func(ctx *fasthttp.RequestCtx) {
++			tid := TenantIDFromCtx(ctx)
++			if tid == "" {
++				SendError(ctx, fasthttp.StatusUnauthorized,
++					"tenant header required (BIFROST_STRICT_TENANT_ROUTING is enabled): set x-f5xc-tenant on the request")
++				return
++			}
++			ok, err := validator.TenantExists(ctx, tid)
++			if err != nil {
++				SendError(ctx, fasthttp.StatusServiceUnavailable,
++					fmt.Sprintf("tenant lookup failed: %v", err))
++				return
++			}
++			if !ok {
++				SendError(ctx, fasthttp.StatusNotFound,
++					fmt.Sprintf("tenant %q not found; set x-f5xc-tenant to a configured tenant id (see GET /api/tenants)", tid))
++				return
++			}
++			next(ctx)
++		}
++	}
++}
+diff --git a/transports/bifrost-http/handlers/tenant_strict_routing_test.go b/transports/bifrost-http/handlers/tenant_strict_routing_test.go
+new file mode 100644
+index 000000000..d376ec33b
+--- /dev/null
++++ b/transports/bifrost-http/handlers/tenant_strict_routing_test.go
+@@ -0,0 +1,172 @@
++// f5xc-overlay (patch17): tests for the inference-path tenant
++// strictness middleware. Covers the four behaviour quadrants in the
++// truth table:
++//
++//                 strict=false | strict=true
++//   header absent       pass   |   401
++//   header unknown      pass   |   404
++//   header known        pass   |   pass
++//   header "default"    pass   |   pass (short-circuit, no DB hit)
++//
++// The validator is a small in-memory mock so tests don't need a sqlite
++// DB.
++
++package handlers
++
++import (
++	"context"
++	"net"
++	"testing"
++
++	"github.com/maximhq/bifrost/core/schemas"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/valyala/fasthttp"
++)
++
++// mockTenantValidator is the test double for TenantValidator.
++type mockTenantValidator struct {
++	known   map[string]bool
++	calls   int
++	failErr error
++}
++
++func (m *mockTenantValidator) TenantExists(_ context.Context, tid string) (bool, error) {
++	m.calls++
++	if m.failErr != nil {
++		return false, m.failErr
++	}
++	return m.known[tid], nil
++}
++
++// runMiddleware mounts the middleware in front of a "200 OK" handler
++// and returns the resulting status + next-was-called flag.
++func runMiddleware(t *testing.T, mw schemas.BifrostHTTPMiddleware, headerVal string) (int, bool) {
++	t.Helper()
++	nextCalled := false
++	next := func(ctx *fasthttp.RequestCtx) {
++		nextCalled = true
++		ctx.SetStatusCode(fasthttp.StatusOK)
++	}
++	wrapped := mw(next)
++
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Request.SetRequestURI("/v1/chat/completions")
++	if headerVal != "" {
++		// Stamp the ctx the way TenantResolverMiddleware does (UserValue —
++		// TenantIDFromCtx reads from here). This isolates the strict
++		// middleware from the resolver middleware's parsing details.
++		ctx.SetUserValue(string(multitenant.BifrostContextKeyTenantID), headerVal)
++	}
++	wrapped(ctx)
++	return ctx.Response.StatusCode(), nextCalled
++}
++
++func TestTenantStrictRouting_Disabled_IsNoOp(t *testing.T) {
++	// strict=false → middleware MUST be a transparent pass-through
++	// regardless of header presence. Validates the OSS-callflow
++	// preservation promise in the file header.
++	mw := TenantStrictRoutingMiddleware(nil, false)
++
++	for _, tid := range []string{"", "unknown-tenant", "acme"} {
++		status, called := runMiddleware(t, mw, tid)
++		if !called {
++			t.Fatalf("strict=false, tid=%q: next not invoked (got status=%d)", tid, status)
++		}
++		if status != fasthttp.StatusOK {
++			t.Fatalf("strict=false, tid=%q: want 200, got %d", tid, status)
++		}
++	}
++}
++
++func TestTenantStrictRouting_HeaderAbsent_Returns401(t *testing.T) {
++	mw := TenantStrictRoutingMiddleware(&mockTenantValidator{}, true)
++	status, called := runMiddleware(t, mw, "")
++	if called {
++		t.Fatal("next should not be invoked when header is absent in strict mode")
++	}
++	if status != fasthttp.StatusUnauthorized {
++		t.Fatalf("want 401 when header absent in strict mode, got %d", status)
++	}
++}
++
++func TestTenantStrictRouting_HeaderUnknown_Returns404(t *testing.T) {
++	v := &mockTenantValidator{known: map[string]bool{"acme": true}}
++	mw := TenantStrictRoutingMiddleware(v, true)
++	status, called := runMiddleware(t, mw, "globex")
++	if called {
++		t.Fatal("next should not be invoked for unknown tenant in strict mode")
++	}
++	if status != fasthttp.StatusNotFound {
++		t.Fatalf("want 404 for unknown tenant in strict mode, got %d", status)
++	}
++	if v.calls != 1 {
++		t.Fatalf("validator should be hit exactly once, got %d calls", v.calls)
++	}
++}
++
++func TestTenantStrictRouting_HeaderKnown_PassesThrough(t *testing.T) {
++	v := &mockTenantValidator{known: map[string]bool{"acme": true}}
++	mw := TenantStrictRoutingMiddleware(v, true)
++	status, called := runMiddleware(t, mw, "acme")
++	if !called {
++		t.Fatal("next should be invoked for known tenant in strict mode")
++	}
++	if status != fasthttp.StatusOK {
++		t.Fatalf("want 200 for known tenant, got %d", status)
++	}
++}
++
++func TestTenantStrictRouting_DefaultTenant_ShortCircuits(t *testing.T) {
++	// The 'default' tenant is always-exists in MT deployments (seeded by
++	// patch1). The ConfigStoreTenantValidator short-circuits the DB hit
++	// for tid == default. This test uses the real validator wired with a
++	// nil store to prove the short-circuit happens BEFORE the store is
++	// touched (any DB access would crash on the nil store).
++	v := &ConfigStoreTenantValidator{Store: nil}
++	mw := TenantStrictRoutingMiddleware(v, true)
++	status, called := runMiddleware(t, mw, string(multitenant.DefaultTenantID))
++	if !called {
++		t.Fatal("default tenant should pass through (short-circuit)")
++	}
++	if status != fasthttp.StatusOK {
++		t.Fatalf("want 200 for default tenant short-circuit, got %d", status)
++	}
++}
++
++func TestTenantStrictRouting_ValidatorError_Returns503(t *testing.T) {
++	// A lookup failure (DB unreachable, etc.) should be distinguishable
++	// from a "tenant not found" — operators reading the log want to
++	// know which one to chase. 503 vs 404 carries that signal.
++	v := &mockTenantValidator{failErr: &netDownErr{}}
++	mw := TenantStrictRoutingMiddleware(v, true)
++	status, called := runMiddleware(t, mw, "acme")
++	if called {
++		t.Fatal("next should not be invoked when validator errors")
++	}
++	if status != fasthttp.StatusServiceUnavailable {
++		t.Fatalf("want 503 when validator errors, got %d", status)
++	}
++}
++
++func TestTenantStrictRouting_StrictWithoutValidator_Panics(t *testing.T) {
++	// strict=true with a nil validator would silently reject every
++	// request. Construction MUST panic so the misconfiguration is
++	// caught at boot rather than at first inference.
++	defer func() {
++		if r := recover(); r == nil {
++			t.Fatal("expected panic on strict=true with nil validator")
++		}
++	}()
++	_ = TenantStrictRoutingMiddleware(nil, true)
++}
++
++// netDownErr is a synthetic error used by the validator-error test.
++type netDownErr struct{}
++
++func (netDownErr) Error() string   { return "simulated DB unreachable" }
++func (netDownErr) Timeout() bool   { return false }
++func (netDownErr) Temporary() bool { return true }
++
++// Sanity: netDownErr satisfies net.Error so it would behave the same
++// in production where the configstore wraps gorm errors.
++var _ net.Error = netDownErr{}
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 0e23f1c93..61c660526 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -661,7 +661,11 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
+ 			})
+ 		}
+ 	}
+-	s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys)
++	// f5xc-overlay (patch17): pass isCustom so the upsert filter accepts
++	// bare model IDs from OpenAI-compatible custom backends (e.g. vLLM
++	// returning {"id":"qwen3.6-coder"} rather than the prefixed form).
++	isCustom := providerInfo.CustomProviderConfig != nil
++	s.Config.ModelCatalog.UpsertModelDataForProvider(provider, allModels, modelsInKeys, isCustom)
+ 	if listModelsErr != nil {
+ 		if hasNoKeys {
+ 			logger.Warn("unfiltered model discovery skipped for provider %s: no keys configured", provider)
+@@ -669,7 +673,7 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
+ 			logger.Error("failed to list unfiltered models for provider %s: %v: falling back onto the static datasheet", provider, bifrost.GetErrorMessage(listModelsErr))
+ 		}
+ 	} else {
+-		s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModels)
++		s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModels, isCustom)
+ 	}
+ 	return updatedProvider, nil
+ }
+@@ -890,7 +894,9 @@ func (s *BifrostHTTPServer) populateModelPoolWithListModels(ctx context.Context)
+ 					})
+ 				}
+ 			}
+-			s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels)
++			// f5xc-overlay (patch17): see updateProvider for context.
++			isCustom := providerConfig.CustomProviderConfig != nil
++			s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels, isCustom)
+ 			unfilteredModelData, listModelsErr := s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
+ 				Provider:   provider,
+ 				Unfiltered: true,
+@@ -898,7 +904,7 @@ func (s *BifrostHTTPServer) populateModelPoolWithListModels(ctx context.Context)
+ 			if listModelsErr != nil {
+ 				logger.Error("failed to list unfiltered models for provider %s: %v: falling back onto the static datasheet", provider, bifrost.GetErrorMessage(listModelsErr))
+ 			} else {
+-				s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData)
++				s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData, isCustom)
+ 			}
+ 		}(provider, providerConfig)
+ 	}
+@@ -1134,8 +1140,26 @@ func (s *BifrostHTTPServer) RegisterInferenceRoutes(ctx context.Context, middlew
+ 	// just stamped.
+ 	disableDefaultTenant := envBool("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG")
+ 	tenantMW := handlers.TenantResolverMiddleware(disableDefaultTenant)
++	// f5xc-overlay (patch17): inference-path strictness. When
++	// BIFROST_STRICT_TENANT_ROUTING is set, requests with no or
++	// unknown x-f5xc-tenant header are rejected 401/404 BEFORE the
++	// dispatcher silently routes them to the root runtime. Default
++	// (unset) → no-op middleware, OSS callflow unchanged. Mounted on
++	// the inference chain only; admin chain (RegisterAPIRoutes) is
++	// intentionally not gated so the platform tenants surface still
++	// works for first-tenant bootstrap.
++	strictRouting := envBool("BIFROST_STRICT_TENANT_ROUTING")
++	var strictMW schemas.BifrostHTTPMiddleware
++	if strictRouting {
++		strictMW = handlers.TenantStrictRoutingMiddleware(
++			&handlers.ConfigStoreTenantValidator{Store: s.Config.ConfigStore},
++			true,
++		)
++	} else {
++		strictMW = handlers.TenantStrictRoutingMiddleware(nil, false)
++	}
+ 	dispatchMW := handlers.TenantDispatcherMiddleware(s)
+-	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW, dispatchMW}, middlewares...)
++	chained := append([]schemas.BifrostHTTPMiddleware{tenantMW, strictMW, dispatchMW}, middlewares...)
+ 	s.IntegrationHandler.RegisterRoutes(s.Router, chained...)
+ 	inferenceHandler.RegisterRoutes(s.Router, chained...)
+ 	asyncHandler.RegisterRoutes(s.Router, chained...)
+@@ -1504,7 +1528,9 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
+ 						})
+ 					}
+ 				}
+-				s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels)
++				// f5xc-overlay (patch17): see updateProvider for context.
++				isCustom := providerConfig.CustomProviderConfig != nil
++				s.Config.ModelCatalog.UpsertModelDataForProvider(provider, modelData, allowedModels, isCustom)
+ 				unfilteredModelData, listModelsErr := s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
+ 					Provider:   provider,
+ 					Unfiltered: true,
+@@ -1512,7 +1538,7 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
+ 				if listModelsErr != nil {
+ 					logger.Error("failed to list unfiltered models for provider %s: %v: falling back onto the static datasheet", provider, bifrost.GetErrorMessage(listModelsErr))
+ 				} else {
+-					s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData)
++					s.Config.ModelCatalog.UpsertUnfilteredModelDataForProvider(provider, unfilteredModelData, isCustom)
+ 				}
+ 			}(provider, providerConfig)
+ 		}
+-- 
+2.51.0
+
