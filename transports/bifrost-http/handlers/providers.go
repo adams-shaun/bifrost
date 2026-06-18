@@ -19,6 +19,7 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
+	"github.com/maximhq/bifrost/multitenant"
 	governanceplugin "github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
@@ -1203,8 +1204,19 @@ func (h *ProviderHandler) attemptModelDiscovery(ctx *fasthttp.RequestCtx, provid
 		return nil
 	}
 
-	// Attempt model discovery with reasonable timeout
-	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// f5xc-overlay (patch18): preserve the tenant id from the request
+	// ctx into the timeout context. Upstream used context.Background()
+	// which drops the tenant, causing ReloadProvider's configstore
+	// lookups to run unscoped (no GORM WHERE tenant_id = ?). Result:
+	// for tenants whose provider name collides with another's, the
+	// unscoped query returns rows from any tenant — typically wrong
+	// keys, wrong network config. Stamping the tenant here keeps the
+	// downstream GORM callbacks correctly scoped.
+	baseCtx := context.Background()
+	if tid := TenantIDFromCtx(ctx); tid != "" {
+		baseCtx = context.WithValue(baseCtx, multitenant.BifrostContextKeyTenantID, tid)
+	}
+	ctxWithTimeout, cancel := context.WithTimeout(baseCtx, 15*time.Second)
 	defer cancel()
 
 	_, err := h.modelsManager.ReloadProvider(ctxWithTimeout, provider)

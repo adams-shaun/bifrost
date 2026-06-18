@@ -592,16 +592,23 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 		}
 	}
 
-	// Read current key count from in-memory store (providerInfo.Keys is not preloaded from DB)
-	inMemoryKeys, _ := s.Config.GetProviderKeysRaw(provider)
-	isKeylessProvider := providerInfo.CustomProviderConfig != nil && providerInfo.CustomProviderConfig.IsKeyLess
-	hasNoKeys := len(inMemoryKeys) == 0 && !isKeylessProvider
-
-	// Getting allowed models from all provider keys (needed before model listing)
+	// f5xc-overlay (patch18): use the tenant-scoped configstore lookup for
+	// the hasNoKeys check instead of the shared in-memory map. The
+	// in-memory map (s.Config.GetProviderKeysRaw) is keyed by provider
+	// NAME only — when a sibling tenant DELETEs the same provider name,
+	// the entry vanishes and this check would falsely report "no keys"
+	// even when the calling tenant still has keys in the DB. Reading via
+	// the configstore + the ctx-supplied tenant id makes the check
+	// per-tenant correct.
+	//
+	// Note: a single configstore lookup serves both hasNoKeys and the
+	// allowed-models computation below — line ordering matters.
 	providerKeys, err := s.Config.ConfigStore.GetKeysByProvider(ctx, string(provider))
 	if err != nil {
 		return nil, fmt.Errorf("failed to update provider model catalog: failed to get keys by provider: %s", err)
 	}
+	isKeylessProvider := providerInfo.CustomProviderConfig != nil && providerInfo.CustomProviderConfig.IsKeyLess
+	hasNoKeys := len(providerKeys) == 0 && !isKeylessProvider
 
 	bfCtx := schemas.NewBifrostContext(ctx, time.Now().Add(15*time.Second))
 	bfCtx.SetValue(schemas.BifrostContextKeySkipPluginPipeline, true)

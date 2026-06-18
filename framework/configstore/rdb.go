@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/queryscope"
 	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/maximhq/bifrost/multitenant"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -1204,9 +1206,30 @@ func (s *RDBConfigStore) DeleteProvider(ctx context.Context, provider schemas.Mo
 }
 
 // GetProvidersConfig retrieves the provider configuration from the database.
+//
+// f5xc-overlay (patch18): when BIFROST_DISABLE_DEFAULT_TENANT_CONFIG=true
+// AND the ctx carries no tenant id (i.e. the boot-time loader call from
+// transports/bifrost-http/lib/config.go::loadProviders, which has no
+// HTTP request to derive tenant from), exclude default-tenant rows.
+//
+// Without this filter, the boot loader fetches every tenant's
+// provider rows and collapses them into a single in-memory map keyed
+// by provider name only — `c.Providers[<name>]`. With multiple
+// tenants each having a provider named "qwen", iteration order is
+// non-deterministic and last-write wins, so the root runtime ends up
+// using whichever tenant's network_config happened to land last.
+// Discovery then fires against the wrong URL, the wrong keys, or
+// both. Filtering out the default tenant at boot scopes the shared
+// in-memory map to the (typically empty in strict-MT deployments)
+// default tenant only; per-tenant runtimes load their own providers
+// via multitenant.Manager's TenantLoader, which IS tenant-scoped.
 func (s *RDBConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error) {
 	var dbProviders []tables.TableProvider
-	if err := s.DB().WithContext(ctx).Preload("Keys").Find(&dbProviders).Error; err != nil {
+	q := s.DB().WithContext(ctx).Preload("Keys")
+	if os.Getenv("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG") == "true" && ctx.Value(multitenant.BifrostContextKeyTenantID) == nil {
+		q = q.Where("tenant_id <> ?", string(multitenant.DefaultTenantID))
+	}
+	if err := q.Find(&dbProviders).Error; err != nil {
 		return nil, err
 	}
 	if len(dbProviders) == 0 {
