@@ -119,6 +119,8 @@ export default function ModelCatalogView() {
 				modelsUsed,
 				totalTraffic24h,
 				totalCost24h,
+				failed: p.status === "list_models_failed",
+				failureReason: p.status === "list_models_failed" ? p.description : undefined,
 			};
 		});
 	}, [providers, statsMap, modelsUsedMap]);

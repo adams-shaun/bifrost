@@ -6,7 +6,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ProviderIconType, RenderProviderIcon } from "@/lib/constants/icons";
 import { ProviderLabels } from "@/lib/constants/logs";
-import { Info } from "lucide-react";
+import { AlertTriangle, Info } from "lucide-react";
 
 function formatCost(dollars: number) {
 	return `$${dollars.toFixed(4)}`;
@@ -19,6 +19,13 @@ export interface ModelCatalogRow {
 	modelsUsed: string[];
 	totalTraffic24h: number;
 	totalCost24h: number;
+	// failed = the provider's most recent ListModels attempt errored
+	// (e.g. bad base_url, network unreachable, invalid key). When true,
+	// the Models column is showing request-log strings the gateway
+	// never successfully resolved, so we surface a warning so the
+	// operator doesn't mistake it for a healthy catalog.
+	failed?: boolean;
+	failureReason?: string;
 }
 
 interface ModelCatalogTableProps {
@@ -145,6 +152,23 @@ export default function ModelCatalogTable({
 												<Badge variant="secondary" className="text-muted-foreground shrink-0 px-1.5 py-0.5 text-[10px] font-bold">
 													CUSTOM
 												</Badge>
+											)}
+											{row.failed && (
+												<Tooltip>
+													<TooltipTrigger data-testid={`model-catalog-failed-${row.providerName}`}>
+														<Badge
+															variant="outline"
+															className="text-destructive border-destructive/40 shrink-0 gap-1 px-1.5 py-0.5 text-[10px] font-bold"
+														>
+															<AlertTriangle className="h-3 w-3" />
+															LIST_MODELS_FAILED
+														</Badge>
+													</TooltipTrigger>
+													<TooltipContent side="bottom" className="max-w-sm">
+														{row.failureReason ||
+															"Provider's last list-models attempt failed; the models shown below are request-log strings the gateway never successfully resolved."}
+													</TooltipContent>
+												</Tooltip>
 											)}
 										</div>
 									</TableCell>
