@@ -285,14 +285,24 @@ evict (which the chain-policy invalidation path already triggers).
 
 ### 3.3 Admin endpoints
 
-Two endpoints, parallel to the rest of the tenant-scoped admin surface
-that patches 0023-0027 established:
+Two endpoints, following the established mt-header admin pattern:
+tenant identity comes from the `x-f5xc-tenant` request header
+(resolved into ctx by
+[handlers/tenant_resolver.go](../../transports/bifrost-http/handlers/tenant_resolver.go)),
+not from the URL path. `/api/tenants*` is the cross-tenant platform
+admin surface and is path-exempt from the tenant resolver, so a
+per-tenant config under that prefix would silently lose its tenant
+context.
 
-- `GET  /api/tenants/{tid}/telemetry-config` — return the row or
-  `404` if no config.
-- `PUT  /api/tenants/{tid}/telemetry-config` — upsert the row.
-  Triggers `EvictTenant` defer hook on success so the plugin reloads
-  the policy.
+- `GET  /api/telemetry-config` (header `x-f5xc-tenant: <tid>`) —
+  return the row or `404` if no config.
+- `PUT  /api/telemetry-config` (header `x-f5xc-tenant: <tid>`) —
+  upsert the row. Triggers `EvictTenant` defer hook on success so the
+  plugin reloads the policy.
+
+Each handler reads `tid := handlers.TenantIDFromCtx(ctx)` and writes
+it as `TenantID` on the persisted row; the GORM tenant-scope callback
+filters reads automatically.
 
 `DELETE` collapses into `PUT` with the empty/null payload to keep the
 API surface small.

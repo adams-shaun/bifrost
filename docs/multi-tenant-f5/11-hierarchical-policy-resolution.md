@@ -269,30 +269,53 @@ sources string.
 
 ### 3.3 Admin endpoints
 
-Four CRUD endpoints, parallel to the rest of the tenant-scoped admin
-surface:
+Four CRUD endpoints, following the established mt-header admin
+pattern: tenant identity is read from the `x-f5xc-tenant` request
+header (resolved into ctx by
+[handlers/tenant_resolver.go](../../transports/bifrost-http/handlers/tenant_resolver.go)),
+and the sub-scope id (customer / team / VK) lives in the URL path
+when present. **The tenant id never appears in the URL path** —
+`/api/tenants*` is the cross-tenant platform admin surface
+(`platform_tenants.go`) and is path-exempt from the tenant resolver,
+so putting per-tenant config under that prefix would silently lose
+its tenant context.
 
 ```
-GET    /api/tenants/{tid}/semantic-cache-config
-PUT    /api/tenants/{tid}/semantic-cache-config
-DELETE /api/tenants/{tid}/semantic-cache-config
+# tenant-default (sub-scope = "tenant"); header: x-f5xc-tenant: <tid>
+GET    /api/semantic-cache-config
+PUT    /api/semantic-cache-config
+DELETE /api/semantic-cache-config
 
-GET    /api/tenants/{tid}/customers/{cid}/semantic-cache-config
-PUT    /api/tenants/{tid}/customers/{cid}/semantic-cache-config
-DELETE /api/tenants/{tid}/customers/{cid}/semantic-cache-config
+# customer override; header: x-f5xc-tenant: <tid>
+GET    /api/customers/{cid}/semantic-cache-config
+PUT    /api/customers/{cid}/semantic-cache-config
+DELETE /api/customers/{cid}/semantic-cache-config
 
-GET    /api/tenants/{tid}/teams/{tmid}/semantic-cache-config
-PUT    /api/tenants/{tid}/teams/{tmid}/semantic-cache-config
-DELETE /api/tenants/{tid}/teams/{tmid}/semantic-cache-config
+# team override; header: x-f5xc-tenant: <tid>
+GET    /api/teams/{tmid}/semantic-cache-config
+PUT    /api/teams/{tmid}/semantic-cache-config
+DELETE /api/teams/{tmid}/semantic-cache-config
 
-GET    /api/tenants/{tid}/virtual-keys/{vkid}/semantic-cache-config
-PUT    /api/tenants/{tid}/virtual-keys/{vkid}/semantic-cache-config
-DELETE /api/tenants/{tid}/virtual-keys/{vkid}/semantic-cache-config
+# VK override; header: x-f5xc-tenant: <tid>
+GET    /api/virtual-keys/{vkid}/semantic-cache-config
+PUT    /api/virtual-keys/{vkid}/semantic-cache-config
+DELETE /api/virtual-keys/{vkid}/semantic-cache-config
 ```
 
-Each is a thin wrapper around the configstore CRUD on the new table
-with the appropriate `scope_type` value. Validation: `Threshold ∈ [0,1]`,
-`TTL ≥ 0`, etc.
+Each handler reads `tid := handlers.TenantIDFromCtx(ctx)` and writes
+it as `TenantID` on the persisted row; the GORM tenant-scope callback
+filters reads automatically. The `ScopeKind`/`ScopeID` columns
+correspond to the URL slot: missing path segment ⇒ `(tenant, "")`,
+`/customers/{cid}` ⇒ `(customer, cid)`, and so on.
+
+The handlers also validate sub-scope ownership: a `customer_id` /
+`team_id` / `virtual_key_id` referenced in the URL must resolve to a
+row whose `tenant_id` matches the request's header tenant — same
+guard the existing governance handlers enforce (see
+[mt_governance_isolation_test.go](../../transports/bifrost-http/handlers/mt_governance_isolation_test.go)
+for the regression cases).
+
+Validation: `Threshold ∈ [0,1]`, `TTL ≥ 0`, etc.
 
 ---
 
