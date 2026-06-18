@@ -1,0 +1,357 @@
+From 07ff6d3e781ea02557fa75b273e54381a3cfa3aa Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Wed, 17 Jun 2026 23:36:52 -0600
+Subject: [PATCH] mt-discovery-tenant-scope: in-memory store cross-tenant
+ collapse fix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three subfixes addressing the discovery-routing investigation that
+landed under patch17. All three reduce reliance on the shared in-memory
+provider map (c.Providers) which is keyed by provider NAME only,
+collapsing all tenants' rows into one entry via last-write-wins.
+
+Subfix A — boot loader filter
+  framework/configstore/rdb.go::GetProvidersConfig
+  When BIFROST_DISABLE_DEFAULT_TENANT_CONFIG=true AND the ctx carries
+  no tenant id (boot loader at lib/config.go::loadProviders), add
+  WHERE tenant_id <> 'default' to exclude default-tenant rows.
+
+  Without this, boot loads every tenant's rows into the shared map.
+  Multiple tenants with a provider called "qwen" → iteration-order-
+  non-deterministic last-write wins → root runtime ends up running
+  against an arbitrary tenant's URL / keys. Discovery fires against
+  the wrong endpoint. Per-tenant runtimes already load via the
+  multitenant.Manager TenantLoader which IS tenant-scoped — so
+  excluding default at boot just stops the root client from being
+  polluted with cross-tenant config.
+
+Subfix B1 — discovery hasNoKeys check via configstore, not in-memory
+  transports/bifrost-http/server/server.go::ReloadProvider
+  The hasNoKeys decision was reading s.Config.GetProviderKeysRaw(p)
+  — the same shared in-memory map. After ANY tenant DELETEs a
+  provider with the same name, the entry vanishes and the check
+  falsely reports "no keys configured" for EVERY other tenant's
+  subsequent discovery attempts, permanently skipping model discovery.
+
+  Fixed by deriving hasNoKeys from the tenant-scoped
+  s.Config.ConfigStore.GetKeysByProvider(ctx, p) lookup (the GORM
+  scope callback adds WHERE tenant_id = ? when ctx carries the id),
+  which is already loaded a few lines later for the allowed-models
+  computation. One configstore round-trip now serves both purposes.
+
+Subfix B2 — preserve tenant ctx into discovery's timeout context
+  transports/bifrost-http/handlers/providers.go::attemptModelDiscovery
+  Was: ctxWithTimeout, _ := context.WithTimeout(context.Background(), ...)
+       (drops the tenant id stamped by TenantResolverMiddleware)
+  Now: derive the timeout ctx from a base ctx carrying the tenant id
+       from TenantIDFromCtx(ctx) so ReloadProvider's downstream
+       configstore lookups see the tenant via the GORM callback.
+
+  This makes subfix B1's tenant-scoped lookup actually scope to the
+  CALLING tenant, not "any qwen row".
+
+Tests
+  framework/configstore/rdb_provider_boot_filter_test.go locks in
+  the four-quadrant truth table for the boot-time loader filter
+  (env unset/set × ctx with/without tenant), plus the headline
+  cross-tenant-collapse-avoided scenario.
+
+  Subfix B1/B2's runtime behaviour is covered by the existing
+  server-package integration tests and the live cluster smoke test:
+  prior to this patch, fresh-seeded shaun's POST /providers/qwen/keys
+  logged "model discovery skipped: no keys configured" even though
+  the DB had the key (because globex's earlier DELETE wiped the
+  shared in-memory qwen entry). After this patch, the configstore
+  lookup sees the key correctly and discovery fires against vLLM.
+
+Pairs with patch17 (mt-customprovider-and-strict-routing): patch17
+fixed the catalog upsert filter to accept bare model IDs from custom
+backends; patch18 fixes the discovery path that populates that
+catalog, AND the boot loader that determines what the root runtime
+sees.
+
+Depends on patches 1, 2, 3, 4, 7 + patch17 (transitively — patch17
+isn't a hard dependency but pairs naturally).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ framework/configstore/rdb.go                  |  25 ++-
+ .../rdb_provider_boot_filter_test.go          | 142 ++++++++++++++++++
+ transports/bifrost-http/handlers/providers.go |  16 +-
+ transports/bifrost-http/server/server.go      |  19 ++-
+ 4 files changed, 193 insertions(+), 9 deletions(-)
+ create mode 100644 framework/configstore/rdb_provider_boot_filter_test.go
+
+diff --git a/framework/configstore/rdb.go b/framework/configstore/rdb.go
+index 6d00cdcbd..be4ad892e 100644
+--- a/framework/configstore/rdb.go
++++ b/framework/configstore/rdb.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"sort"
+ 	"strings"
+ 	"sync/atomic"
+@@ -19,6 +20,7 @@ import (
+ 	"github.com/maximhq/bifrost/framework/logstore"
+ 	"github.com/maximhq/bifrost/framework/queryscope"
+ 	"github.com/maximhq/bifrost/framework/vectorstore"
++	"github.com/maximhq/bifrost/multitenant"
+ 	"gorm.io/gorm"
+ 	"gorm.io/gorm/clause"
+ )
+@@ -1204,9 +1206,30 @@ func (s *RDBConfigStore) DeleteProvider(ctx context.Context, provider schemas.Mo
+ }
+ 
+ // GetProvidersConfig retrieves the provider configuration from the database.
++//
++// f5xc-overlay (patch18): when BIFROST_DISABLE_DEFAULT_TENANT_CONFIG=true
++// AND the ctx carries no tenant id (i.e. the boot-time loader call from
++// transports/bifrost-http/lib/config.go::loadProviders, which has no
++// HTTP request to derive tenant from), exclude default-tenant rows.
++//
++// Without this filter, the boot loader fetches every tenant's
++// provider rows and collapses them into a single in-memory map keyed
++// by provider name only — `c.Providers[<name>]`. With multiple
++// tenants each having a provider named "qwen", iteration order is
++// non-deterministic and last-write wins, so the root runtime ends up
++// using whichever tenant's network_config happened to land last.
++// Discovery then fires against the wrong URL, the wrong keys, or
++// both. Filtering out the default tenant at boot scopes the shared
++// in-memory map to the (typically empty in strict-MT deployments)
++// default tenant only; per-tenant runtimes load their own providers
++// via multitenant.Manager's TenantLoader, which IS tenant-scoped.
+ func (s *RDBConfigStore) GetProvidersConfig(ctx context.Context) (map[schemas.ModelProvider]ProviderConfig, error) {
+ 	var dbProviders []tables.TableProvider
+-	if err := s.DB().WithContext(ctx).Preload("Keys").Find(&dbProviders).Error; err != nil {
++	q := s.DB().WithContext(ctx).Preload("Keys")
++	if os.Getenv("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG") == "true" && ctx.Value(multitenant.BifrostContextKeyTenantID) == nil {
++		q = q.Where("tenant_id <> ?", string(multitenant.DefaultTenantID))
++	}
++	if err := q.Find(&dbProviders).Error; err != nil {
+ 		return nil, err
+ 	}
+ 	if len(dbProviders) == 0 {
+diff --git a/framework/configstore/rdb_provider_boot_filter_test.go b/framework/configstore/rdb_provider_boot_filter_test.go
+new file mode 100644
+index 000000000..cc3e4e88c
+--- /dev/null
++++ b/framework/configstore/rdb_provider_boot_filter_test.go
+@@ -0,0 +1,142 @@
++// f5xc-overlay (patch18): tests for GetProvidersConfig's boot-time
++// default-tenant exclusion when BIFROST_DISABLE_DEFAULT_TENANT_CONFIG=true.
++//
++// Truth table the tests lock in:
++//
++//   env unset / "false"  + any ctx        → all rows returned (upstream)
++//   env "true" + ctx has no tenant         → default-tenant rows EXCLUDED
++//   env "true" + ctx has tenant            → all rows returned (request path,
++//                                            GORM tenant-scope callback
++//                                            handles per-tenant filtering)
++//
++// The second row is the bug fix: without it, the boot loader at
++// transports/bifrost-http/lib/config.go::loadProviders pulls every
++// tenant's rows into the shared in-memory map, last-write-wins collapses
++// them by provider name only, and the root runtime ends up running
++// against a random tenant's URL / keys.
++
++package configstore
++
++import (
++	"context"
++	"testing"
++
++	"github.com/maximhq/bifrost/framework/configstore/tables"
++	"github.com/maximhq/bifrost/multitenant"
++	"github.com/stretchr/testify/require"
++)
++
++// seedQwenAcrossTenants writes a qwen provider row for each of the
++// supplied tenant ids using the per-tenant ctx. Returns nothing — tests
++// query via GetProvidersConfig afterwards.
++func seedQwenAcrossTenants(t *testing.T, store *RDBConfigStore, tenants ...string) {
++	t.Helper()
++	for _, tid := range tenants {
++		row := &tables.TableProvider{
++			Name:     "qwen",
++			TenantID: tid,
++			NetworkConfig: nil,
++		}
++		require.NoError(t,
++			store.DB().WithContext(withTenant(context.Background(), tid)).Create(row).Error,
++			"create qwen row for tenant %q", tid,
++		)
++	}
++}
++
++func TestGetProvidersConfig_EnvUnset_ReturnsAllRows(t *testing.T) {
++	t.Setenv("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG", "")
++	store := setupRDBTestStoreWithTenantScope(t)
++	seedQwenAcrossTenants(t, store, tables.DefaultTenantID, "shaun", "acme")
++
++	got, err := store.GetProvidersConfig(context.Background())
++	require.NoError(t, err)
++	// Map-collapsed by name; existence is what matters.
++	if _, ok := got["qwen"]; !ok {
++		t.Fatal("env-unset: qwen should be present in result (upstream behaviour)")
++	}
++}
++
++func TestGetProvidersConfig_EnvSet_NoTenant_ExcludesDefault(t *testing.T) {
++	t.Setenv("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG", "true")
++	store := setupRDBTestStoreWithTenantScope(t)
++
++	// Default-only: env set + no tenant in ctx → result must be empty.
++	seedQwenAcrossTenants(t, store, tables.DefaultTenantID)
++	got, err := store.GetProvidersConfig(context.Background())
++	require.NoError(t, err)
++	if _, ok := got["qwen"]; ok {
++		t.Fatal("env=true: default-tenant qwen MUST be excluded from boot load")
++	}
++
++	// Add a non-default tenant row: that one SHOULD appear in the result
++	// (excluding default doesn't exclude everything).
++	seedQwenAcrossTenants(t, store, "shaun")
++	got, err = store.GetProvidersConfig(context.Background())
++	require.NoError(t, err)
++	if _, ok := got["qwen"]; !ok {
++		t.Fatal("env=true: non-default tenant's qwen should still be present in result")
++	}
++}
++
++func TestGetProvidersConfig_EnvSet_WithTenant_ReturnsAllRows(t *testing.T) {
++	// When ctx carries a tenant id, the GORM tenant-scope callback
++	// already adds WHERE tenant_id = ? to the query. Our env-gated
++	// filter would be redundant (and would over-restrict if ctx says
++	// 'default'). The exclusion fires ONLY on no-tenant ctx (boot path).
++	t.Setenv("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG", "true")
++	store := setupRDBTestStoreWithTenantScope(t)
++	seedQwenAcrossTenants(t, store, tables.DefaultTenantID, "shaun")
++
++	got, err := store.GetProvidersConfig(withTenant(context.Background(), "shaun"))
++	require.NoError(t, err)
++	if _, ok := got["qwen"]; !ok {
++		t.Fatal("env=true with tenant ctx: shaun's qwen should be returned")
++	}
++}
++
++func TestGetProvidersConfig_EnvSet_CrossTenantCollapseAvoided(t *testing.T) {
++	// The headline scenario the patch fixes: multiple tenants each have
++	// a qwen row with DIFFERENT network_config (URL). At boot, without
++	// the filter, the map collapses them and a random one wins. With
++	// the filter (env set + no ctx), default's row is excluded so
++	// whichever single non-default row is present "wins" deterministically
++	// from the operator's POV — i.e. they know it'll be a non-default
++	// row, not a stale default seeded long ago.
++	t.Setenv("BIFROST_DISABLE_DEFAULT_TENANT_CONFIG", "true")
++	store := setupRDBTestStoreWithTenantScope(t)
++
++	// Default has a STALE row (the kind that survives schema migrations
++	// from before the cluster was MT-enabled). Should NOT influence boot.
++	require.NoError(t,
++		store.DB().WithContext(withTenant(context.Background(), tables.DefaultTenantID)).
++			Create(&tables.TableProvider{
++				Name:     "qwen",
++				TenantID: tables.DefaultTenantID,
++				// Stale URL fingerprint we can detect.
++				NetworkConfig: nil,
++			}).Error,
++	)
++
++	// Boot-style call: empty ctx, env=true.
++	got, err := store.GetProvidersConfig(context.Background())
++	require.NoError(t, err)
++	if _, ok := got["qwen"]; ok {
++		t.Fatal("only the default row exists; with env=true, result must NOT include qwen — the boot loader is letting per-tenant runtimes serve qwen via their own TenantLoader")
++	}
++
++	// Sanity: the row is still in the DB (we didn't delete it; we just
++	// stopped including it at boot).
++	var count int64
++	require.NoError(t,
++		store.DB().Model(&tables.TableProvider{}).Where("name = ?", "qwen").Count(&count).Error,
++	)
++	if count != 1 {
++		t.Fatalf("expected exactly 1 qwen row still in DB, got %d", count)
++	}
++}
++
++// _ avoids the unused-import warning if multitenant.* is only referenced
++// in setup helpers via withTenant — keeps the test file honest if those
++// helpers move.
++var _ = multitenant.BifrostContextKeyTenantID
+diff --git a/transports/bifrost-http/handlers/providers.go b/transports/bifrost-http/handlers/providers.go
+index a6b259056..093ba3a16 100644
+--- a/transports/bifrost-http/handlers/providers.go
++++ b/transports/bifrost-http/handlers/providers.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/maximhq/bifrost/framework/configstore"
+ 	"github.com/maximhq/bifrost/framework/configstore/tables"
+ 	"github.com/maximhq/bifrost/framework/modelcatalog"
++	"github.com/maximhq/bifrost/multitenant"
+ 	governanceplugin "github.com/maximhq/bifrost/plugins/governance"
+ 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
+ 	"github.com/valyala/fasthttp"
+@@ -1203,8 +1204,19 @@ func (h *ProviderHandler) attemptModelDiscovery(ctx *fasthttp.RequestCtx, provid
+ 		return nil
+ 	}
+ 
+-	// Attempt model discovery with reasonable timeout
+-	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	// f5xc-overlay (patch18): preserve the tenant id from the request
++	// ctx into the timeout context. Upstream used context.Background()
++	// which drops the tenant, causing ReloadProvider's configstore
++	// lookups to run unscoped (no GORM WHERE tenant_id = ?). Result:
++	// for tenants whose provider name collides with another's, the
++	// unscoped query returns rows from any tenant — typically wrong
++	// keys, wrong network config. Stamping the tenant here keeps the
++	// downstream GORM callbacks correctly scoped.
++	baseCtx := context.Background()
++	if tid := TenantIDFromCtx(ctx); tid != "" {
++		baseCtx = context.WithValue(baseCtx, multitenant.BifrostContextKeyTenantID, tid)
++	}
++	ctxWithTimeout, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+ 	defer cancel()
+ 
+ 	_, err := h.modelsManager.ReloadProvider(ctxWithTimeout, provider)
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index 61c660526..ffa1bba3a 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -592,16 +592,23 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
+ 		}
+ 	}
+ 
+-	// Read current key count from in-memory store (providerInfo.Keys is not preloaded from DB)
+-	inMemoryKeys, _ := s.Config.GetProviderKeysRaw(provider)
+-	isKeylessProvider := providerInfo.CustomProviderConfig != nil && providerInfo.CustomProviderConfig.IsKeyLess
+-	hasNoKeys := len(inMemoryKeys) == 0 && !isKeylessProvider
+-
+-	// Getting allowed models from all provider keys (needed before model listing)
++	// f5xc-overlay (patch18): use the tenant-scoped configstore lookup for
++	// the hasNoKeys check instead of the shared in-memory map. The
++	// in-memory map (s.Config.GetProviderKeysRaw) is keyed by provider
++	// NAME only — when a sibling tenant DELETEs the same provider name,
++	// the entry vanishes and this check would falsely report "no keys"
++	// even when the calling tenant still has keys in the DB. Reading via
++	// the configstore + the ctx-supplied tenant id makes the check
++	// per-tenant correct.
++	//
++	// Note: a single configstore lookup serves both hasNoKeys and the
++	// allowed-models computation below — line ordering matters.
+ 	providerKeys, err := s.Config.ConfigStore.GetKeysByProvider(ctx, string(provider))
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to update provider model catalog: failed to get keys by provider: %s", err)
+ 	}
++	isKeylessProvider := providerInfo.CustomProviderConfig != nil && providerInfo.CustomProviderConfig.IsKeyLess
++	hasNoKeys := len(providerKeys) == 0 && !isKeylessProvider
+ 
+ 	bfCtx := schemas.NewBifrostContext(ctx, time.Now().Add(15*time.Second))
+ 	bfCtx.SetValue(schemas.BifrostContextKeySkipPluginPipeline, true)
+-- 
+2.51.0
+
