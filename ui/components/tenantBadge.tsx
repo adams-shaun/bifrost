@@ -112,7 +112,15 @@ export default function TenantBadge() {
 						<DropdownMenuItem
 							key={t.id}
 							onSelect={() => {
-								if (!isCurrent) setCurrentTenant(t.id);
+								if (isCurrent) return;
+								setCurrentTenant(t.id);
+								// Force a full reload on tenant switch so RTK Query
+								// caches, in-memory selectors, and any component-local
+								// state tied to the prior tenant are dropped cleanly.
+								// Cheaper than auditing every slice/api for tenant-keyed
+								// invalidation, and matches operator intuition: a tenant
+								// switch is a workspace switch.
+								window.location.reload();
 							}}
 							className="flex items-center justify-between gap-2"
 						>
