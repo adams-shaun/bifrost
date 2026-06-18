@@ -1,0 +1,134 @@
+From 453d1c0fc1a682870b69c7a422b8df260a442757 Mon Sep 17 00:00:00 2001
+From: Shaun Adams <s.adams@f5.com>
+Date: Thu, 18 Jun 2026 00:03:32 -0600
+Subject: [PATCH] mt-discovery-via-tenant-runtime: route ListModelsRequest
+ through tenant runtime
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Builds on patch18 by closing the last loop in the discovery path:
+the actual ListModelsRequest call in ReloadProvider was still using
+s.Client (the root bifrost runtime). The root runtime's account reads
+c.Providers from the shared in-memory map, which is keyed by provider
+name only — same cross-tenant clobbering issue patch18 documented at
+the hasNoKeys check layer.
+
+The visible symptom after patch18 was a log line shift:
+  before patch18: "model discovery skipped: no keys configured"
+                  (the in-memory keys check returned 0 because a sibling
+                   tenant's DELETE wiped the entry)
+  after patch18:  "failed to list all models: no keys found for provider
+                   qwen" (hasNoKeys check correctly says we have keys;
+                   ListModels itself blew up because the root runtime's
+                   account has the wrong tenant's keys / URL / no keys)
+  after patch19:  ListModels succeeds against the tenant runtime that
+                  was built from a tenant-scoped StaticAccount via
+                  multitenant.Manager's TenantLoader
+
+The fix: extract the tenant id from ctx (preserved by patch18 B2),
+call s.BifrostFor(ctx, tid), get the tenant runtime + release fn,
+and use that for BOTH the filtered and unfiltered ListModelsRequest
+calls. Defer the release so the runtime is eligible for LRU eviction
+when refcount drops to zero.
+
+Single-tenant fallback: BifrostFor returns s.Client + a no-op
+release when tid is empty (no tenant header) or when s.Manager is
+nil (single-tenant OSS deployment). Behaviour for those paths is
+unchanged — the root runtime is the right thing to use there.
+
+NOT in scope for patch19
+------------------------
+populateModelPoolWithListModels (line 902) and the matching boot-time
+loop at line 1530 still iterate s.Config.Providers and call
+s.Client.ListModelsRequest. These are boot-time bulk-discovery
+passes. With patch18 subfix A excluding default-tenant rows at boot,
+s.Config.Providers in strict-MT mode contains only non-default
+provider rows (collapsed by name) — these loops attempt discovery
+against whoever's config won the collapse. That's structurally
+wrong for MT mode but doesn't matter in practice: the per-tenant
+runtime discovery path (the one patch19 fixes) re-runs discovery on
+admin write, and inference itself routes through the tenant runtime,
+not the boot-populated catalog. The boot loops are best treated as a
+separate cleanup (patch20 candidate) — they could iterate tenants
+explicitly + acquire each runtime, or just be skipped in strict-MT
+mode.
+
+Why no unit test
+----------------
+ReloadProvider needs a fully-wired BifrostHTTPServer (ConfigStore +
+ModelCatalog + Manager + Client) to test end-to-end. Mocking the
+manager.Acquire path requires interface refactoring that's out of
+scope for a targeted fix. The live cluster smoke test is the
+verification: seed shaun's qwen + key, hit /v1/chat/completions with
+the tenant header, observe that discovery populated the catalog and
+auto-resolve works.
+
+Depends on patches 1, 2, 3, 4, 7 (multitenant package + runtime
+isolation + dispatcher), patch17 (catalog upsert accepts bare IDs —
+without it the just-discovered qwen3.6-coder still gets dropped),
+patch18 B2 (preserves tenant ctx into the timeout context — without
+B2 tid would be empty here and we'd fall back to root runtime,
+defeating the whole patch).
+
+Ref: https://jira.f5net.com/browse/XC-25496
+---
+ transports/bifrost-http/server/server.go | 30 ++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/transports/bifrost-http/server/server.go b/transports/bifrost-http/server/server.go
+index ffa1bba3a..024dd76c8 100644
+--- a/transports/bifrost-http/server/server.go
++++ b/transports/bifrost-http/server/server.go
+@@ -615,6 +615,32 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
+ 	bfCtx.SetValue(schemas.BifrostContextKeyValidateKeys, true) // Validate keys during provider add/update
+ 	defer bfCtx.Cancel()
+ 
++	// f5xc-overlay (patch19): route ListModelsRequest through the
++	// tenant runtime instead of the root bifrost client. The root
++	// client's account reads the shared in-memory c.Providers map,
++	// which is keyed by provider name only and gets clobbered
++	// cross-tenant on every admin write — making discovery against
++	// the root client fail with "no keys found for provider X" for
++	// whichever tenant didn't write last. The per-tenant runtime
++	// (multitenant.Manager) is built from a tenant-scoped
++	// StaticAccount via TenantLoader, so its account has the right
++	// keys + URL by construction.
++	//
++	// Single-tenant fallback: BifrostFor returns s.Client + a no-op
++	// release when the ctx has no tenant id, preserving OSS behaviour
++	// unchanged. Pairs with patch18 subfix B2 which preserves the
++	// tenant id from the request ctx through attemptModelDiscovery's
++	// timeout-wrapping — without B2 the tid would be empty here and
++	// we'd fall back to the root runtime anyway.
++	tid := ""
++	if v := ctx.Value(multitenant.BifrostContextKeyTenantID); v != nil {
++		if s, ok := v.(string); ok {
++			tid = s
++		}
++	}
++	bfClient, release := s.BifrostFor(ctx, tid)
++	defer release()
++
+ 	// Run filtered and unfiltered model listing concurrently
+ 	var (
+ 		allModels        *schemas.BifrostListModelsResponse
+@@ -626,13 +652,13 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
+ 	listWg.Add(2)
+ 	go func() {
+ 		defer listWg.Done()
+-		allModels, bifrostErr = s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
++		allModels, bifrostErr = bfClient.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
+ 			Provider: provider,
+ 		})
+ 	}()
+ 	go func() {
+ 		defer listWg.Done()
+-		unfilteredModels, listModelsErr = s.Client.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
++		unfilteredModels, listModelsErr = bfClient.ListModelsRequest(bfCtx, &schemas.BifrostListModelsRequest{
+ 			Provider:   provider,
+ 			Unfiltered: true,
+ 		})
+-- 
+2.51.0
+
